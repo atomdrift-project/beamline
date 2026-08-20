@@ -1,0 +1,11 @@
+name = "beamline"
+main = "beamline.js"
+compatibility_date = "2026-08-19"
+
+# 200s are stored in caches.default (Cloudflare Cache API) by beamline.js.
+# HOPPER_URL, SCAN_URL, and the tunnel UUID are not stored here.
+# make deploy-cf passes them from the environment.
+
+[vars]
+MAX_BYTES = "16777216"
+SCAN_TIMEOUT_MS = "1800000"

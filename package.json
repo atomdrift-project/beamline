@@ -1,0 +1,10 @@
+{
+  "name": "beamline",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node local.js",
+    "test": "node --test",
+    "stress": "node stress.js"
+  }
+}
