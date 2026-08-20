@@ -285,7 +285,7 @@ async function gunzip(u8) {
 
 const ALLOWED_200 = new Set(["sha", "purl", "lvl", "eng", "why", "hits"]);
 const ALLOWED_HIT = new Set(["id", "crit", "file", "pkg", "desc"]);
-const SOURCES = new Set(["cache", "bloom", "hopper", "scan"]);
+const SOURCES = new Set(["cache", "scan-cache", "bloom", "hopper", "scan"]);
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DOC_STATUS = new Set([200, 202, 400, 401, 413, 415, 422, 404, 429, 503, 504, 500]);
 

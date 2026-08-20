@@ -75,7 +75,7 @@ test("accepted token is forwarded to hopper and scan", async () => {
     assert.ok(sent.length > 0);
     assert.ok(sent.every((h) => h === "Bearer beta"));
     const paths = backend.auths.map((a) => a.path);
-    assert.ok(paths.some((p) => p === "/_/bloom"));
+    assert.ok(paths.some((p) => p.startsWith("/sha256/")));
     assert.ok(paths.some((p) => p.startsWith("/api/sample")));
     assert.ok(paths.some((p) => p === "/analyze"));
   } finally {
@@ -83,7 +83,7 @@ test("accepted token is forwarded to hopper and scan", async () => {
   }
 });
 
-test("cache hit short-circuits bloom and hopper", async () => {
+test("cache hit short-circuits the scan lookup and hopper", async () => {
   const backend = await mockBackend({
     bloom: "unknown",
     sample: (sha) => ({ status: 200, sha, body: envelope(sha) }),
@@ -107,6 +107,65 @@ test("cache hit short-circuits bloom and hopper", async () => {
   } finally {
     await backend.close();
   }
+});
+
+test("a stored scan verdict answers before hopper is asked", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    verdict: () => ({
+      sha: HELLO_SHA,
+      lvl: 3,
+      eng: "2.8.0",
+      why: "Postinstall launches a reverse shell.",
+      hits: [{ id: "objectives/execution/shell/bash", crit: 5, file: "lib/install.js", desc: "…" }],
+    }),
+  });
+  try {
+    const res = await handle(
+      new Request(`http://beamline/sha256/${HELLO_SHA}`),
+      testEnv(backend.url),
+      noopCtx(),
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
+    assert.equal(res.headers.get("x-sha256"), HELLO_SHA);
+    const body = await res.json();
+    // The real verdict, not the lvl:-1 stub a bare filter hit produces.
+    assert.equal(body.lvl, 3);
+    assert.equal(body.hits.length, 1);
+    assert.equal(body.why, "Postinstall launches a reverse shell.");
+    // `bloom` is our upstream's business, not part of this API.
+    assert.equal(body.bloom, undefined);
+    assert.equal(backend.hits.sample, 0, "a stored verdict never reaches hopper");
+    assert.equal(backend.hits.analyze, 0);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a stored verdict is preferred over the filter's benign stub", async () => {
+  const backend = await mockBackend({
+    bloom: "skip",
+    verdict: () => ({ sha: HELLO_SHA, lvl: 0, eng: "2.8.0" }),
+  });
+  try {
+    const res = await handle(
+      new Request(`http://beamline/sha256/${HELLO_SHA}`),
+      testEnv(backend.url),
+      noopCtx(),
+    );
+    const body = await res.json();
+    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
+    assert.equal(body.lvl, 0, "an analysis outranks a known-good filter hit");
+  } finally {
+    await backend.close();
+  }
+});
+
+test("/_/health answers alongside /healthz", async () => {
+  const res = await handle(new Request("http://beamline/_/health"), {}, {});
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { status: "ok" });
 });
 
 test("bloom skip never calls hopper", async () => {
@@ -320,7 +379,7 @@ test("PURL hopper miss with scan down is 503, not a miss", async () => {
   }
 });
 
-test("bloom 404 does not disable /analyze", async () => {
+test("an unavailable lookup does not disable /analyze", async () => {
   const scanned = envelope(HELLO_SHA, { eng: "scan" });
   const backend = await mockBackend({
     bloomStatus: 404,
@@ -1755,6 +1814,48 @@ test("a worker with an open breaker is skipped while the others keep serving", a
   }
 });
 
+test("a peer's stored verdict is worth waiting out an unknown for", async () => {
+  const hopper = await mockBackend({ sample: () => ({ status: 404 }) });
+  // Nothing to say, and quick about it.
+  const quick = await mockBackend({ bloom: "unknown" });
+  // Holds the analysis, and is the slower of the two.
+  const holder = await mockBackend({
+    bloom: "unknown",
+    bloomDelayMs: 60,
+    verdict: () => ({ sha: HELLO_SHA, lvl: 2, eng: "2.8.0" }),
+    analyze: () => envelope(HELLO_SHA, { eng: "should-not-run" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${quick.url},${holder.url}` });
+  try {
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, waitCtx().ctx);
+    assert.equal(res.status, 200);
+    // A verdict lives only on the worker that ran the analysis, so one peer
+    // answering "unknown sample" first must not end the race.
+    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
+    assert.equal((await res.json()).lvl, 2);
+    assert.equal(holder.hits.analyze, 0, "the stored verdict is the answer");
+    assert.equal(hopper.hits.sample, 0, "and hopper is never asked");
+  } finally {
+    await Promise.all([hopper.close(), quick.close(), holder.close()]);
+  }
+});
+
+test("a definite filter decision still ends the race immediately", async () => {
+  const hopper = await mockBackend({ sample: () => ({ status: 404 }) });
+  const quick = await mockBackend({ bloom: "skip" });
+  const sluggish = await mockBackend({ bloom: "unknown", bloomDelayMs: 400 });
+  const env = testEnv(hopper.url, { SCAN_URL: `${sluggish.url},${quick.url}` });
+  try {
+    const t0 = Date.now();
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, waitCtx().ctx);
+    const ms = Date.now() - t0;
+    assert.equal(res.headers.get("x-beamline-source"), "bloom");
+    assert.ok(ms < 300, `waited ${ms}ms; a skip needs no second opinion`);
+  } finally {
+    await Promise.all([hopper.close(), quick.close(), sluggish.close()]);
+  }
+});
+
 test("bloom is raced and the first answer wins, slow worker dropped", async () => {
   const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
   const quick = await mockBackend({ bloom: "skip" });
@@ -1884,11 +1985,18 @@ function mockBackend(opts) {
         rid: req.headers["x-request-id"] || "",
       });
       const body = await readReq(req);
-      if (url.pathname === "/_/bloom") {
+      if (url.pathname.startsWith("/sha256/") || url.pathname === "/purl") {
         hits.bloom += 1;
         if (opts.bloomDelayMs) await new Promise((r) => setTimeout(r, opts.bloomDelayMs));
         const decision = typeof opts.bloom === "function" ? opts.bloom(url) : opts.bloom || "unknown";
-        return send(res, opts.bloomStatus || 200, { decision });
+        const stored = typeof opts.verdict === "function" ? opts.verdict(url) : opts.verdict;
+        if (opts.bloomStatus && opts.bloomStatus !== 200 && opts.bloomStatus !== 404) {
+          return send(res, opts.bloomStatus, { error: "unavailable" });
+        }
+        if (stored) {
+          return send(res, 200, { ...stored, bloom: decision });
+        }
+        return send(res, 404, { error: "unknown sample", bloom: decision });
       }
       if (url.pathname.startsWith("/api/sample")) {
         hits.sample += 1;

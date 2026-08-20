@@ -1,4 +1,4 @@
-// Beamline: cache → bloom → hopper, with scan as a hedge. Zero dependencies.
+// Beamline: cache → scan lookup → hopper, with scan as a hedge. Zero deps.
 // Cloudflare Worker and `node local.js` share this fetch handler.
 //
 // Hopper GET /api/sample can hang. Wait HOPPER_HEDGE_MS for a 200, then start
@@ -8,7 +8,7 @@
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
 const DEFAULT_SCAN_TIMEOUT_MS = 1_800_000;
-const BLOOM_TIMEOUT_MS = 500;
+const LOOKUP_TIMEOUT_MS = 500;
 const HOPPER_HEDGE_MS = 1_000;
 const HOPPER_LOOKUP_MS = 15_000;
 const HOPPER_RPC_MS = 2_000;
@@ -69,7 +69,9 @@ async function dispatch(request, env, ctx) {
   if (request.signal && !ctx.signal) ctx.signal = request.signal;
 
   const url = new URL(request.url);
-  if (url.pathname === "/healthz" && request.method === "GET") {
+  // /_/health is the name every service in this stack answers to; /healthz
+  // stays because the Makefile and the stress harness probe it.
+  if ((url.pathname === "/healthz" || url.pathname === "/_/health") && request.method === "GET") {
     return json({ status: "ok" }, 200);
   }
 
@@ -183,8 +185,17 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
   const lookupMs = numEnv(env, "HOPPER_LOOKUP_MS", HOPPER_LOOKUP_MS);
   const ids = idFields(ctx, input);
 
-  const bloom = await bloomDecide(env, ctx, input);
-  if (bloom === "skip") {
+  // Scan answers "have you already analyzed this" and "does a filter vouch for
+  // it" in one round trip. A stored verdict is a real answer with findings, so
+  // it beats the hopper hedge outright; a bare `skip` is the filter's word for
+  // known-good, which we serve as a benign stub the way we always have.
+  const known = await scanKnown(env, ctx, input);
+  if (known.verdict) {
+    const res = verdictResponse(env, known.verdict, input, 86400);
+    logLine("lookup", { src: "scan-cache", status: 200, ms: Date.now() - t0, ...ids });
+    return serveHit(ctx, cache, cacheKey, res);
+  }
+  if (known.bloom === "skip") {
     const res = bloomStub(env, input.sha, input.purl);
     logLine("lookup", { src: "bloom", status: 200, ms: Date.now() - t0, ...ids });
     return serveHit(ctx, cache, cacheKey, res);
@@ -408,68 +419,111 @@ async function queueAndWait(env, ctx, hopper, input, bytes, scanned) {
   return null;
 }
 
-// Raced across every healthy worker; the first answer wins, skip included.
-// The workers run identical builds, so whichever replies first is as good an
-// authority as any. Losing connections are dropped as soon as one answers.
-async function bloomDecide(env, ctx, input) {
+// What scan already holds for this key, raced across every healthy worker: the
+// stored verdict when one has it, and the bloom decision either way — a 404
+// still carries the filter's opinion, which is what the separate bloom probe
+// used to fetch. Never asks scan to analyze; this sits in front of hopper and
+// has to stay cheap.
+//
+// Any definite answer ends the race: a stored verdict, or a filter decision
+// that is not "unknown". Only a worker that has neither keeps us waiting —
+// unlike the filters, which are published sets every worker loads identically,
+// a verdict lives solely on the worker that ran the analysis, so one peer's
+// "unknown sample" says nothing about what the others hold. Bounded by
+// LOOKUP_TIMEOUT_MS either way.
+async function scanKnown(env, ctx, input) {
+  const miss = { verdict: null, bloom: "unknown" };
   const workers = scanWorkers(env);
-  if (!workers.length) return "unknown";
+  if (!workers.length) return miss;
   const ids = idFields(ctx, input);
-  const q = input.sha ? `sha256=${input.sha}` : `purl=${encodeURIComponent(input.purl)}`;
+  const path = input.sha ? `/sha256/${input.sha}` : `/purl?purl=${encodeURIComponent(input.purl)}`;
   const t0 = Date.now();
   const controls = workers.map(() => new AbortController());
-  const arms = workers.map((base, i) => watch(bloomAsk(env, ctx, q, base, controls[i])));
+  const arms = workers.map((base, i) => watch(lookupAsk(env, ctx, path, base, controls[i])));
+
+  const drop = () => {
+    for (const [i, arm] of arms.entries()) {
+      if (!arm.done) controls[i].abort();
+    }
+  };
 
   for (;;) {
-    const answer = arms.find((arm) => arm.value?.decision);
-    if (answer) {
-      for (const [i, arm] of arms.entries()) {
-        if (!arm.done) controls[i].abort();
-      }
-      logLine("bloom", {
-        decision: answer.value.decision,
-        worker: answer.value.worker,
+    // A verdict outranks a decision: it is an analysis of these exact bytes,
+    // not a filter's opinion of the key.
+    const hit = arms.find((arm) => arm.value?.verdict);
+    if (hit) {
+      drop();
+      logLine("lookup_known", {
+        src: "verdict",
+        worker: hit.value.worker,
         ms: Date.now() - t0,
         raced: workers.length,
         ...ids,
       });
-      return answer.value.decision;
+      return { verdict: hit.value.verdict, bloom: hit.value.bloom || "unknown" };
+    }
+    const decided = arms.find((arm) => arm.value?.bloom && arm.value.bloom !== "unknown");
+    if (decided) {
+      drop();
+      logLine("lookup_known", {
+        src: "bloom",
+        decision: decided.value.bloom,
+        worker: decided.value.worker,
+        ms: Date.now() - t0,
+        raced: workers.length,
+        ...ids,
+      });
+      return { verdict: null, bloom: decided.value.bloom };
     }
     if (arms.every((arm) => arm.done)) break;
     await Promise.race(arms.filter((arm) => !arm.done).map((arm) => arm.settled));
   }
 
   if (clientAborted(ctx)) throw new DOMException("Aborted", "AbortError");
-  logLine("bloom", { decision: "unknown", ms: Date.now() - t0, raced: workers.length, silent: workers.length, ...ids });
-  return "unknown";
+  const silent = arms.filter((arm) => !arm.value?.bloom).length;
+  logLine("lookup_known", {
+    src: "bloom",
+    decision: "unknown",
+    ms: Date.now() - t0,
+    raced: workers.length,
+    silent,
+    ...ids,
+  });
+  return miss;
 }
 
-// One worker's bloom answer. An empty decision means it could not give one, so
-// the race keeps waiting on whoever is left.
-async function bloomAsk(env, ctx, q, base, control) {
+// One worker's answer. An empty `bloom` means it could not give one, so the
+// race keeps waiting on whoever is left.
+async function lookupAsk(env, ctx, path, base, control) {
   const worker = hostOf(base);
   const askCtx = { ...ctx, signal: mergeAbort(ctx.signal, control.signal) };
   try {
-    const decision = await fetchTimeout(
-      `${base}/_/bloom?${q}`,
+    const answer = await fetchTimeout(
+      `${base}${path}`,
       { method: "GET", headers: backendHeaders(env, ctx) },
-      BLOOM_TIMEOUT_MS,
+      LOOKUP_TIMEOUT_MS,
       askCtx,
       async (resp) => {
-        if (!resp.ok) {
+        // 200 is a stored verdict, 404 is "unknown sample" with the filter's
+        // decision attached. Anything else is a worker that cannot answer.
+        if (resp.status !== 200 && resp.status !== 404) {
           await drain(resp);
-          return "";
+          return null;
         }
         const body = await resp.json().catch(() => null);
-        return (body && body.decision) || "unknown";
+        if (!body || typeof body !== "object") return null;
+        return {
+          verdict: resp.status === 200 ? body : null,
+          bloom: (typeof body.bloom === "string" && body.bloom) || "unknown",
+        };
       },
     );
-    return { worker, decision };
+    return answer ? { worker, ...answer } : { worker, verdict: null, bloom: "" };
   } catch (err) {
     // `ctx`, not `askCtx`: a loser we dropped ourselves is not a client abort.
     if (clientAborted(ctx)) throw err;
-    logLine("bloom_failed", { worker, err: errText(err) });
-    return { worker, decision: "" };
+    logLine("lookup_failed", { worker, err: errText(err) });
+    return { worker, verdict: null, bloom: "" };
   }
 }
 
@@ -849,6 +903,26 @@ function tokenEq(a, b) {
   let x = 0;
   for (let i = 0; i < a.length; i++) x |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return x === 0;
+}
+
+// Scan's lookup answers in the same shape we serve, so the body passes
+// through untouched but for `bloom`, which is our upstream's business and not
+// part of this API. Never re-derive it through customerView: there is no
+// envelope here to derive from.
+function verdictResponse(env, verdict, input, maxAge) {
+  const view = {};
+  for (const [k, v] of Object.entries(verdict)) {
+    if (k !== "bloom" && v !== null && v !== undefined) view[k] = v;
+  }
+  if (!view.sha && input.sha) view.sha = input.sha;
+  if (!view.purl && input.purl) view.purl = input.purl;
+  const headers = {
+    "content-type": "application/json",
+    "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
+    "x-beamline-source": "scan-cache",
+  };
+  if (view.sha) headers["x-sha256"] = view.sha;
+  return new Response(JSON.stringify(view), { status: 200, headers });
 }
 
 function bloomStub(env, sha, purl) {
@@ -1243,6 +1317,7 @@ function unreachableStatus(status) {
 
 export const _test = {
   bloomStub,
+  verdictResponse,
   shaFromEnvelope,
   customerView,
   topHits,
@@ -1251,6 +1326,7 @@ export const _test = {
   HOPPER_HEDGE_MS,
   HOPPER_LOOKUP_MS,
   HOPPER_RPC_MS,
+  LOOKUP_TIMEOUT_MS,
   MEMORY_CACHE_MAX,
   BREAKER_FAILS,
   makeBreaker,

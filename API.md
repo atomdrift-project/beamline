@@ -1,7 +1,7 @@
 # Beamline API
 
 ```
-GET  /healthz
+GET  /healthz            (also /_/health)
 GET  /sha256/{64hex}
 GET  /purl/{purl}
 POST /
@@ -61,7 +61,7 @@ artifact. `pkg` is the component. `desc` is one line.
 
 ```
 X-SHA256: …                              same as body.sha
-X-Beamline-Source: cache|bloom|hopper|scan
+X-Beamline-Source: cache|scan-cache|bloom|hopper|scan
 Cache-Control: public, max-age=…         private if authenticated
 Content-Encoding: gzip                   applied by the edge, if requested
 Retry-After: 3-8                         on 202, jittered
