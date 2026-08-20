@@ -14,7 +14,6 @@ const HOPPER_LOOKUP_MS = 15_000;
 const HOPPER_RPC_MS = 2_000;
 const FILE_TIMEOUT_MS = 30_000;
 const HEDGE = Symbol("hedge");
-const HELD = Symbol("held");
 const HOPPER_POLL_MS = 500;
 const BREAKER_FAILS = 5;
 const BREAKER_COOL_MS = 10_000;
@@ -27,12 +26,9 @@ const SCAN_RETRY_BASE_MS = 1_000;
 const SCAN_RETRY_MAX_MS = 30_000;
 const SCAN_RACE_DELAY_MS = 0;
 const EDGE_TIMEOUT = 524;
-const HOLD_MS = 10_000;
 const MISS_MAX_AGE = 60;
 const RETRY_AFTER_MIN_S = 3;
 const RETRY_AFTER_MAX_S = 8;
-const SUBMIT_TRIES = 4;
-const SUBMIT_BASE_MS = 500;
 
 // Per isolate, not global: on Workers each isolate counts its own failures and
 // loses them when it is recycled, so a backend outage costs BREAKER_FAILS
@@ -87,8 +83,8 @@ async function dispatch(request, env, ctx) {
   }
 
   try {
-    if (request.method === "POST" && url.pathname === "/") {
-      return await handlePost(request, env, ctx, url);
+    if (request.method === "POST" && url.pathname === "/analyze") {
+      return await handleAnalyze(request, env, ctx, url);
     }
     if (request.method === "GET" && url.pathname === "/lookup") {
       const sha = (url.searchParams.get("sha256") || "").trim();
@@ -141,7 +137,22 @@ function normalizePurl(raw) {
   return `pkg:${body.slice(0, slash).toLowerCase()}${body.slice(slash)}`;
 }
 
-async function handlePost(request, env, ctx, url) {
+// POST /analyze?sha256=…&purl=… with the artifact as the raw body.
+//
+// The sha rides in the query string so it arrives with the request line, ahead
+// of a single byte of body: the lookup race starts against hopper and every
+// scan worker while the upload is still streaming, and a hit answers without
+// the bytes ever mattering. `purl` is an optional hint that lets scan graft
+// registry provenance onto the report.
+//
+// The body is optional. Without it the artifact is fetched from hopper
+// instead — correct, but a round trip slower. Sending the bytes is the fast
+// path, and the only path that works for something hopper has never seen.
+async function handleAnalyze(request, env, ctx, url) {
+  const sha = (url.searchParams.get("sha256") || "").trim().toLowerCase();
+  if (!SHA_RE.test(sha)) return json({ error: "invalid sha256" }, 400);
+  const purl = normalizePurl(url.searchParams.get("purl") || "");
+
   const ct = (request.headers.get("content-type") || "").toLowerCase();
   if (ct.includes("multipart/") || ct.includes("application/x-www-form-urlencoded")) {
     return json({ error: "unsupported media type" }, 415);
@@ -149,11 +160,21 @@ async function handlePost(request, env, ctx, url) {
   const maxBytes = maxBody(env);
   const cl = Number(request.headers.get("content-length"));
   if (Number.isFinite(cl) && cl > maxBytes) return json({ error: "too large" }, 413);
-  const bytes = await request.arrayBuffer();
-  if (!bytes.byteLength) return json({ error: "empty body" }, 400);
-  if (bytes.byteLength > maxBytes) return json({ error: "too large" }, 413);
-  const sha = await sha256Hex(bytes);
-  return await lookup(env, ctx, url.origin, { sha, bytes, purl: null, filename: "upload.bin" });
+
+  const body = await request.arrayBuffer();
+  if (body.byteLength > maxBytes) return json({ error: "too large" }, 413);
+  const bytes = body.byteLength ? body : null;
+
+  // Bytes that do not hash to the sha they claim must never be analyzed. The
+  // verdict would be filed under the wrong key in beamline's cache, in every
+  // scan worker's cache, and in hopper — three tiers poisoned at once, and
+  // every later honest lookup for that sha would get this answer.
+  if (bytes && (await sha256Hex(bytes)) !== sha) {
+    logLine("sha_mismatch", { rid: ctx.rid, sha, bytes: bytes.byteLength });
+    return json({ error: "body does not match sha256" }, 400);
+  }
+
+  return await lookup(env, ctx, url.origin, { sha, bytes, purl: purl || null, filename: sha });
 }
 
 async function lookup(env, ctx, origin, input) {
@@ -182,18 +203,12 @@ async function lookup(env, ctx, origin, input) {
     waitUntil(ctx, work.finally(() => inflight.delete(flightKey)));
   }
 
-  // A scan may legitimately run for half an hour. A client may not be made to
-  // wait for it: past HOLD_MS we hand back 202 and let the work finish.
-  const hold = deadline(numEnv(env, "HOLD_MS", HOLD_MS), ctx, HELD);
-  let res;
-  try {
-    res = await Promise.race([work, hold.fired]);
-  } finally {
-    hold.cancel();
-  }
-  if (res !== HELD) return res.clone();
-  logLine("lookup", { src: "hold", status: 202, ms: Date.now() - t0, ...idFields(ctx, input) });
-  return pending();
+  // The API is synchronous: a caller waits for its answer. Workers put no
+  // wall-clock limit on a request and waiting on a subrequest is not CPU time,
+  // so holding costs nothing — while handing back an early 202 would cap the
+  // remaining work at the 30s `waitUntil` budget and throw away anything
+  // slower. `SCAN_TIMEOUT_MS` is the one budget that bounds a lookup.
+  return (await work).clone();
 }
 
 // A timer the winner puts out. Without the cancel, every hedge and every hold
@@ -206,92 +221,100 @@ function deadline(ms, ctx, token) {
   return { fired, cancel: () => ctl.abort() };
 }
 
+// Every cheap source is asked at once — hopper's index and every scan worker's
+// — and the first non-miss wins, so a slow or dead backend costs nothing but
+// its own silence. Analysis is the expensive arm and joins only when it has to:
+// after HOPPER_HEDGE_MS, or the moment every cheap source has missed.
 async function runLookup(env, ctx, cache, cacheKey, input, t0) {
   const hedgeMs = numEnv(env, "HOPPER_HEDGE_MS", HOPPER_HEDGE_MS);
   const lookupMs = numEnv(env, "HOPPER_LOOKUP_MS", HOPPER_LOOKUP_MS);
   const ids = idFields(ctx, input);
 
-  // Scan answers "have you already analyzed this" and "does a filter vouch for
-  // it" in one round trip. A stored verdict is a real answer with findings, so
-  // it beats the hopper hedge outright; a bare `skip` is the filter's word for
-  // known-good, which we serve as a benign stub the way we always have.
-  const known = await scanKnown(env, ctx, input);
-  if (known.verdict) {
-    const res = verdictResponse(env, known.verdict, input, 86400);
-    logLine("lookup", { src: "scan-cache", status: 200, ms: Date.now() - t0, ...ids });
-    return serveHit(ctx, cache, cacheKey, res);
-  }
-  if (known.bloom === "skip") {
-    const res = bloomStub(env, input.sha, input.purl);
-    logLine("lookup", { src: "bloom", status: 200, ms: Date.now() - t0, ...ids });
-    return serveHit(ctx, cache, cacheKey, res);
-  }
-
   const hopperCtl = new AbortController();
-  const hopperP = hopperSample(env, ctx, input, lookupMs, hopperCtl.signal);
+  const knownCtl = new AbortController();
+  const hopper = watch(hopperSample(env, ctx, input, lookupMs, hopperCtl.signal));
+  const known = watch(scanKnown(env, ctx, input, knownCtl.signal));
   const hedge = deadline(hedgeMs, ctx, HEDGE);
-  let hopper;
-  try {
-    hopper = await Promise.race([hopperP, hedge.fired]);
-  } finally {
+
+  let scan = null;
+  let scanCtl = null;
+  let hedged = false;
+  const analyze = (why) => {
+    if (scan) return;
     hedge.cancel();
-  }
-  const hedged = hopper === HEDGE;
-  if (hedged) {
-    hopper = undefined;
-    logLine("hedge", { ms: Date.now() - t0, hedge_ms: hedgeMs, ...ids });
-  }
-
-  if (hopper?.status === 200) {
-    return replyHopper(env, ctx, cache, cacheKey, input, hopper, t0, false);
-  }
-
-  const scanCtl = new AbortController();
-  const scanP = scanLookup(env, ctx, input, scanCtl);
-
-  if (!hedged) {
-    const pack = await scanP;
-    return settle(env, ctx, cache, cacheKey, input, hopper, pack.bytes, pack.scanned, t0, false);
-  }
-
-  const won = await raceUseful(hopperP, scanP);
-  if (won.winner === "hopper") {
-    scanCtl.abort();
-    waitUntil(ctx, scanP.catch(() => {}));
-    logLine("abort", { target: "scan", why: "hopper_hit", ms: Date.now() - t0, ...ids });
-    return replyHopper(env, ctx, cache, cacheKey, input, won.hopper, t0, true);
-  }
-  if (won.winner === "scan") {
-    hopperCtl.abort();
-    waitUntil(ctx, hopperP.catch(() => {}));
-    logLine("abort", { target: "hopper", why: "scan_hit", ms: Date.now() - t0, ...ids });
-    return replyScan(env, ctx, cache, cacheKey, input, won.hopper, won.bytes, won.scanned, t0, true);
-  }
-  return settle(env, ctx, cache, cacheKey, input, won.hopper, won.bytes, won.scanned, t0, true);
-}
-
-// Hopper 200 and a scan envelope are the only results the client can use
-// immediately. 404/204/errors are not a win; the other arm keeps running.
-async function raceUseful(hopperP, scanP) {
-  const hopper = watch(hopperP);
-  const scan = watch(scanP);
-  for (;;) {
-    const pack = scan.value;
-    const both = { hopper: hopper.value, bytes: pack?.bytes, scanned: pack?.scanned };
-    if (hopper.value?.status === 200) return { winner: "hopper", ...both };
-    if (pack?.scanned?.env) return { winner: "scan", ...both };
-    if (hopper.done && scan.done) {
-      if (hopper.err || scan.err) throw hopper.err || scan.err;
-      return { winner: "", ...both };
+    hedged = why === "hedge";
+    logLine(why === "hedge" ? "hedge" : "analyze", { ms: Date.now() - t0, why, hedge_ms: hedgeMs, ...ids });
+    scanCtl = new AbortController();
+    scan = watch(scanLookup(env, ctx, input, scanCtl));
+  };
+  // Drop whatever is still in the air, and say what was dropped. Nothing in
+  // flight means nothing to report: an instant answer should not log an abort.
+  const stop = (why) => {
+    hedge.cancel();
+    const dropped = [];
+    if (!hopper.done) {
+      hopperCtl.abort();
+      dropped.push("hopper");
     }
-    const wait = [];
-    if (!hopper.done) wait.push(hopper.settled);
-    if (!scan.done) wait.push(scan.settled);
-    await Promise.race(wait);
+    if (!known.done) {
+      knownCtl.abort();
+      dropped.push("scan-index");
+    }
+    if (scan && !scan.done) {
+      scanCtl.abort();
+      dropped.push("analysis");
+    }
+    if (dropped.length) {
+      logLine("abort", { target: dropped.join(","), why, ms: Date.now() - t0, ...ids });
+    }
+  };
+
+  for (;;) {
+    // A stored verdict is an analysis of these exact bytes; hopper's row is the
+    // same thing from the other index. Either outranks a filter's opinion.
+    if (hopper.value?.status === 200) {
+      stop("hopper_hit");
+      return replyHopper(env, ctx, cache, cacheKey, input, hopper.value, t0, hedged);
+    }
+    if (known.value?.verdict) {
+      stop("index_hit");
+      const res = verdictResponse(env, known.value.verdict, input, 86400);
+      logLine("lookup", { src: "scan-cache", status: 200, ms: Date.now() - t0, ...ids });
+      return serveHit(ctx, cache, cacheKey, res);
+    }
+    // `skip` is the filter's word for known-good, served as a benign stub.
+    if (known.value?.bloom === "skip") {
+      stop("bloom_hit");
+      const res = bloomStub(env, input.sha, input.purl);
+      logLine("lookup", { src: "bloom", status: 200, ms: Date.now() - t0, ...ids });
+      return serveHit(ctx, cache, cacheKey, res);
+    }
+    if (scan?.value?.scanned?.env) {
+      stop("scan_hit");
+      const pack = scan.value;
+      return replyScan(env, ctx, cache, cacheKey, input, hopper.value, pack.bytes, pack.scanned, t0, hedged);
+    }
+
+    // Nothing cheap is left to wait on, so stop waiting out the hedge.
+    if (hopper.done && known.done) analyze("cheap_sources_missed");
+
+    const waits = [];
+    if (!hopper.done) waits.push(hopper.settled);
+    if (!known.done) waits.push(known.settled);
+    if (scan && !scan.done) waits.push(scan.settled);
+    if (!scan) waits.push(hedge.fired);
+    if (!waits.length) break;
+    if ((await Promise.race(waits)) === HEDGE) analyze("hedge");
   }
+
+  hedge.cancel();
+  const failure = hopper.err || known.err || scan?.err;
+  if (failure) throw failure;
+  const pack = scan?.value;
+  return settle(env, ctx, cache, cacheKey, input, hopper.value, pack?.bytes, pack?.scanned, t0, hedged);
 }
 
-// The losing arm keeps running after raceUseful returns, so whatever it ends
+// A losing arm keeps running after the race is decided, so whatever it ends
 // up doing lands here instead of escaping as an unhandled rejection.
 function watch(p) {
   const w = { done: false };
@@ -363,10 +386,17 @@ function replyScan(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0,
     hopper_status: hopper?.status,
     ...idFields(ctx, input),
   });
-  // Background work outlives the reply, so a client hanging up must not cancel
-  // it; the write is still bounded by its own timeout and retry count.
-  const bg = { ...ctx, signal: undefined };
-  waitUntil(ctx, submitHopper(env, bg, sha, bytes, scanned.env, scanned.ms, hopper?.status !== 204));
+  // The verdict is not ours to file: the scan worker that produced it renews
+  // it on hopper itself, so it survives even when nobody is left waiting here.
+  //
+  // The bytes are ours. Hopper is the artifact store, and only the caller's
+  // upload can reach it — an artifact hopper has never seen cannot be fetched
+  // for a later analysis. Bytes we pulled *from* hopper are not sent back.
+  // A 204 means hopper already holds this artifact and has it queued, so
+  // sending it again would be pure duplication.
+  if (input.bytes && hopper?.status !== 204) {
+    waitUntil(ctx, hopperUpload(env, { ...ctx, signal: undefined }, sha, input.bytes, input.filename || sha));
+  }
   return serveHit(ctx, cache, cacheKey, res);
 }
 
@@ -457,16 +487,18 @@ async function queueAndWait(env, ctx, hopper, input, bytes, scanned) {
 // a verdict lives solely on the worker that ran the analysis, so one peer's
 // "unknown sample" says nothing about what the others hold. Bounded by
 // LOOKUP_TIMEOUT_MS either way.
-async function scanKnown(env, ctx, input) {
+async function scanKnown(env, ctx, input, cancelSignal) {
   const miss = { verdict: null, bloom: "unknown" };
   const workers = scanWorkers(env);
-  if (!workers.length) return miss;
+  if (!workers.length || cancelSignal?.aborted) return miss;
   const ids = idFields(ctx, input);
   const path = input.sha
     ? `/lookup?sha256=${input.sha}`
     : `/lookup?purl=${encodeURIComponent(input.purl)}`;
   const t0 = Date.now();
   const controls = workers.map(() => new AbortController());
+  // Another source answered first: drop every arm still in the air.
+  cancelSignal?.addEventListener("abort", () => controls.forEach((c) => c.abort()), { once: true });
   const arms = workers.map((base, i) => watch(lookupAsk(env, ctx, path, base, controls[i])));
 
   const drop = () => {
@@ -550,7 +582,10 @@ async function lookupAsk(env, ctx, path, base, control) {
   } catch (err) {
     // `ctx`, not `askCtx`: a loser we dropped ourselves is not a client abort.
     if (clientAborted(ctx)) throw err;
-    logLine("lookup_failed", { worker, err: errText(err) });
+    // Dropped because another source answered first. Not a failure, and not
+    // worth a line — `abort` already records why the race ended.
+    if (control.signal.aborted) return { worker, verdict: null, bloom: "" };
+    logLine("lookup_failed", { rid: ctx.rid, worker, err: errText(err) });
     return { worker, verdict: null, bloom: "" };
   }
 }
@@ -891,37 +926,6 @@ async function waitForHopper(env, ctx, sha) {
 function backoff(base, attempt, cap) {
   const ceiling = Math.min(base * 2 ** Math.min(attempt, 10), cap);
   return ceiling <= base ? base : base + Math.random() * (ceiling - base);
-}
-
-async function submitHopper(env, ctx, sha, bytes, envelope, durationMs, needUpload) {
-  const base = trimSlash(env.HOPPER_URL);
-  if (!base || !sha || !SHA_RE.test(sha)) return;
-  try {
-    if (needUpload && bytes && !(await hopperUpload(env, ctx, sha, bytes, sha))) return;
-    const payload = {
-      sha256: sha,
-      worker: "beamline",
-      duration_ms: durationMs || 0,
-      ml: envelope.ml,
-      raw: envelope.raw,
-    };
-    if (envelope.llm) payload.llm = envelope.llm;
-    const opts = {
-      method: "POST",
-      headers: { ...backendHeaders(env, ctx), "content-type": "application/json" },
-      body: JSON.stringify(payload),
-    };
-    // The client already has its answer, but dropping this write costs the
-    // next caller a full re-scan, so a busy hopper is worth waiting out.
-    for (let attempt = 0; attempt < SUBMIT_TRIES; attempt++) {
-      const status = await fetchTimeout(`${base}/api/result`, opts, FILE_TIMEOUT_MS, ctx, readStatus);
-      if (!unreachableStatus(status)) return;
-      if (attempt + 1 < SUBMIT_TRIES) await sleep(backoff(SUBMIT_BASE_MS, attempt, POLL_MAX_MS), ctx);
-    }
-    logLine("submit_failed", { rid: ctx.rid, sha });
-  } catch {
-    // Client already has the answer.
-  }
 }
 
 function backendHeaders(env, ctx) {
@@ -1398,7 +1402,6 @@ export const _test = {
   verdictResponse,
   normalizePurl,
   hitLocation,
-  normalizePurl,
   shaFromEnvelope,
   customerView,
   topHits,
