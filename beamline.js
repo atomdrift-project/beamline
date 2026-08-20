@@ -89,20 +89,13 @@ async function dispatch(request, env, ctx) {
     if (request.method === "POST" && url.pathname === "/") {
       return await handlePost(request, env, ctx, url);
     }
-    if (request.method === "GET" && url.pathname.startsWith("/sha256/")) {
-      const sha = url.pathname.slice("/sha256/".length).toLowerCase();
-      if (!SHA_RE.test(sha)) return json({ error: "invalid sha256" }, 400);
-      return await lookup(env, ctx, url.origin, { sha, bytes: null, purl: null });
-    }
-    if (request.method === "GET" && url.pathname.startsWith("/purl/")) {
-      let purl;
-      try {
-        purl = decodeURIComponent(url.pathname.slice("/purl/".length));
-      } catch {
-        return json({ error: "invalid purl" }, 400);
+    if (request.method === "GET" && url.pathname === "/lookup") {
+      const sha = (url.searchParams.get("sha256") || "").trim();
+      const purl = (url.searchParams.get("purl") || "").trim();
+      if (!!sha === !!purl) {
+        return json({ error: "provide exactly one of sha256 or purl" }, 400);
       }
-      if (!purl.trim()) return json({ error: "missing purl" }, 400);
-      return await lookup(env, ctx, url.origin, { sha: null, bytes: null, purl: purl.trim() });
+      return await lookupKey(env, ctx, url.origin, sha, purl);
     }
     return json({ error: "not found" }, 404);
   } catch (err) {
@@ -113,6 +106,38 @@ async function dispatch(request, env, ctx) {
     logLine("error", { rid: ctx.rid, method: request.method, path: url.pathname, err: errText(err) });
     return json({ error: "internal" }, 500);
   }
+}
+
+// Validate and canonicalize one key, then look it up. Shared by /lookup and
+// the path aliases so a PURL means the same thing however it arrived.
+async function lookupKey(env, ctx, origin, sha, purl) {
+  if (sha) {
+    const hex = sha.trim().toLowerCase();
+    if (!SHA_RE.test(hex)) return json({ error: "invalid sha256" }, 400);
+    return lookup(env, ctx, origin, { sha: hex, bytes: null, purl: null });
+  }
+  // Anything non-empty goes upstream: scan decides what is a PURL.
+  const canonical = normalizePurl(purl);
+  if (!canonical) return json({ error: "missing purl" }, 400);
+  return lookup(env, ctx, origin, { sha: null, bytes: null, purl: canonical });
+}
+
+// `pkg:` is optional, as it is on scan's own routes, and the scheme and type
+// are case-insensitive per the PURL spec. Everything after the type is left
+// exactly as sent: npm grandfathered in mixed-case names, so folding the rest
+// would merge packages that are genuinely distinct. Scan canonicalizes the
+// remainder its own way; this only has to make the two spellings of one key
+// agree on the cache entry.
+function normalizePurl(raw) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return "";
+  const body = trimmed.replace(/^pkg:/i, "");
+  const slash = body.indexOf("/");
+  // Nothing recognizable to canonicalize: pass it upstream unchanged rather
+  // than rejecting it here. fletch's parser is the authority on what a PURL
+  // is, and a second rule in this file would eventually disagree with it.
+  if (slash <= 0 || slash === body.length - 1) return trimmed;
+  return `pkg:${body.slice(0, slash).toLowerCase()}${body.slice(slash)}`;
 }
 
 async function handlePost(request, env, ctx, url) {
@@ -133,8 +158,8 @@ async function handlePost(request, env, ctx, url) {
 async function lookup(env, ctx, origin, input) {
   const t0 = Date.now();
   const cacheKey = input.sha
-    ? new Request(`${origin}/sha256/${input.sha}`)
-    : new Request(`${origin}/purl/${encodeURIComponent(input.purl)}`);
+    ? new Request(`${origin}/lookup?sha256=${input.sha}`)
+    : new Request(`${origin}/lookup?purl=${encodeURIComponent(input.purl)}`);
   const flightKey = input.sha ? `sha:${input.sha}` : `purl:${input.purl}`;
   const cache = await getCache(env);
 
@@ -436,7 +461,9 @@ async function scanKnown(env, ctx, input) {
   const workers = scanWorkers(env);
   if (!workers.length) return miss;
   const ids = idFields(ctx, input);
-  const path = input.sha ? `/sha256/${input.sha}` : `/purl?purl=${encodeURIComponent(input.purl)}`;
+  const path = input.sha
+    ? `/lookup?sha256=${input.sha}`
+    : `/lookup?purl=${encodeURIComponent(input.purl)}`;
   const t0 = Date.now();
   const controls = workers.map(() => new AbortController());
   const arms = workers.map((base, i) => watch(lookupAsk(env, ctx, path, base, controls[i])));
@@ -914,6 +941,11 @@ function verdictResponse(env, verdict, input, maxAge) {
   for (const [k, v] of Object.entries(verdict)) {
     if (k !== "bloom" && v !== null && v !== undefined) view[k] = v;
   }
+  // Benign artifacts routinely carry notable findings, and scan stores them.
+  // `hits` is documented as present only when `lvl != -1`, so drop them here
+  // the way customerView does on every other path — one artifact must not
+  // change shape depending on which layer answered.
+  if (view.lvl === -1) delete view.hits;
   if (!view.sha && input.sha) view.sha = input.sha;
   if (!view.purl && input.purl) view.purl = input.purl;
   const headers = {
@@ -983,6 +1015,11 @@ function topHits(raw, purl) {
       const crit = Number(t && t.crit);
       const id = t && t.id;
       if (!id || !Number.isFinite(crit) || crit < HIT_MIN_CRIT) continue;
+      // Native matches only. A finding with `from` is the same match reported
+      // again on an enclosing archive — the member's own copy carries the real
+      // path and offset, and we walk every file — or a cross-file composite,
+      // which has no single place to point at.
+      if (Array.isArray(t.from) && t.from.length) continue;
       const pkg = (t.dep && t.dep.locator) || purl || ident || "";
       const key = `${id}\0${file}\0${pkg}`;
       if (seen.has(key)) continue;
@@ -991,11 +1028,35 @@ function topHits(raw, purl) {
       if (t.desc) hit.desc = t.desc;
       if (file) hit.file = file;
       if (pkg) hit.pkg = pkg;
+      const at = hitLocation(f, id, t);
+      if (at.off != null) hit.off = at.off;
+      if (at.line != null) hit.line = at.line;
       rows.push(hit);
     }
   }
   rows.sort((a, b) => b.crit - a.crit || a.id.localeCompare(b.id));
   return rows.slice(0, HIT_LIMIT);
+}
+
+// Where a match fired. The context windows carry a note per match holding its
+// exact byte offset; the window's `line` labels its first byte, which is the
+// line to quote for a match inside it. Binary windows have no line structure.
+// A report whose context was trimmed falls back to the finding's own first
+// evidence span, which locates it without naming a line.
+function hitLocation(file, id, trait) {
+  for (const w of (file && file.ctx) || []) {
+    for (const n of (w && w.n) || []) {
+      if (n && n.i === id) {
+        return { off: num(n.o), line: num(w.line) };
+      }
+    }
+  }
+  const span = trait && Array.isArray(trait.spans) && trait.spans[0];
+  return { off: Array.isArray(span) ? num(span[0]) : null, line: null };
+}
+
+function num(v) {
+  return Number.isFinite(Number(v)) ? Number(v) : null;
 }
 
 function hitFile(path) {
@@ -1318,6 +1379,9 @@ function unreachableStatus(status) {
 export const _test = {
   bloomStub,
   verdictResponse,
+  normalizePurl,
+  hitLocation,
+  normalizePurl,
   shaFromEnvelope,
   customerView,
   topHits,

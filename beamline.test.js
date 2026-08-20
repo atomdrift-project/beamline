@@ -41,11 +41,11 @@ test("BEAMLINE_TOKEN is required except on /healthz", async () => {
   const open = await handle(new Request("http://beamline/healthz"), env, {});
   assert.equal(open.status, 200);
 
-  const denied = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, {});
+  const denied = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, {});
   assert.equal(denied.status, 401);
 
   const wrong = await handle(
-    new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers: { authorization: "Bearer nope" } }),
+    new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { authorization: "Bearer nope" } }),
     env,
     {},
   );
@@ -75,7 +75,7 @@ test("accepted token is forwarded to hopper and scan", async () => {
     assert.ok(sent.length > 0);
     assert.ok(sent.every((h) => h === "Bearer beta"));
     const paths = backend.auths.map((a) => a.path);
-    assert.ok(paths.some((p) => p.startsWith("/sha256/")));
+    assert.ok(paths.some((p) => p === "/lookup"));
     assert.ok(paths.some((p) => p.startsWith("/api/sample")));
     assert.ok(paths.some((p) => p === "/analyze"));
   } finally {
@@ -91,14 +91,14 @@ test("cache hit short-circuits the scan lookup and hopper", async () => {
   const env = testEnv(backend.url);
   const ctx = waitCtx();
   try {
-    const first = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, ctx.ctx);
+    const first = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
     assert.equal(first.status, 200);
     assert.equal(first.headers.get("x-beamline-source"), "hopper");
     assert.equal(backend.hits.bloom, 1);
     assert.equal(backend.hits.sample, 1);
     await ctx.flush();
 
-    const second = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(second.status, 200);
     assert.equal(second.headers.get("x-beamline-source"), "cache");
     assert.equal(backend.hits.bloom, 1);
@@ -122,7 +122,7 @@ test("a stored scan verdict answers before hopper is asked", async () => {
   });
   try {
     const res = await handle(
-      new Request(`http://beamline/sha256/${HELLO_SHA}`),
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
       testEnv(backend.url),
       noopCtx(),
     );
@@ -150,7 +150,7 @@ test("a stored verdict is preferred over the filter's benign stub", async () => 
   });
   try {
     const res = await handle(
-      new Request(`http://beamline/sha256/${HELLO_SHA}`),
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
       testEnv(backend.url),
       noopCtx(),
     );
@@ -177,7 +177,7 @@ test("bloom skip never calls hopper", async () => {
   });
   const env = testEnv(backend.url);
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "bloom");
     const body = await res.json();
@@ -202,7 +202,7 @@ test("hopper 200 passes the envelope through", async () => {
   });
   const env = testEnv(backend.url);
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal(res.headers.get("x-sha256"), HELLO_SHA);
@@ -267,7 +267,7 @@ test("PURL miss posts /analyze-purl", async () => {
   const ctx = waitCtx();
   try {
     const res = await handle(
-      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       ctx.ctx,
     );
@@ -294,7 +294,7 @@ test("scan down still serves a hopper hit", async () => {
   });
   const env = testEnv(backend.url, { SCAN_URL: DEAD });
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal((await res.json()).eng, "hopper-only");
@@ -335,7 +335,7 @@ test("hopper down still scans a PURL", async () => {
   const env = testEnv(backend.url, { HOPPER_URL: DEAD });
   try {
     const res = await handle(
-      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       waitCtx().ctx,
     );
@@ -351,7 +351,7 @@ test("hopper down without bytes is 503, not a miss", async () => {
   const backend = await mockBackend({ bloom: "unknown" });
   const env = testEnv(backend.url, { HOPPER_URL: DEAD });
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 503);
     assert.equal((await res.json()).error, "unavailable");
     assert.equal(backend.hits.analyze, 0);
@@ -368,7 +368,7 @@ test("PURL hopper miss with scan down is 503, not a miss", async () => {
   const env = testEnv(backend.url, { SCAN_URL: DEAD });
   try {
     const res = await handle(
-      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       noopCtx(),
     );
@@ -441,7 +441,7 @@ test("scan down on a pending hopper sample waits for the worker", async () => {
   });
   const env = testEnv(backend.url, { SCAN_URL: DEAD });
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal(backend.hits.upload, 0);
@@ -458,7 +458,7 @@ test("scan down wait timeout returns 202 pending", async () => {
   });
   const env = testEnv(backend.url, { SCAN_URL: DEAD, SCAN_TIMEOUT_MS: "80" });
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 202);
     // Jittered to spread the retry herd; the contract is a whole number of
     // seconds inside the advertised window, not one fixed value.
@@ -502,7 +502,7 @@ test("hopper miss without bytes is unknown sample", async () => {
   });
   const env = testEnv(backend.url);
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 404);
     assert.equal((await res.json()).error, "unknown sample");
     assert.equal(backend.hits.analyze, 0);
@@ -703,7 +703,7 @@ test("hedged PURL: slow hopper 200 beats analyze-purl and does not submit", asyn
   const ctx = waitCtx();
   try {
     const res = await handle(
-      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       ctx.ctx,
     );
@@ -734,7 +734,7 @@ test("hedged PURL: scan wins if hopper stays silent", async () => {
   try {
     const t0 = Date.now();
     const res = await handle(
-      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       ctx.ctx,
     );
@@ -762,7 +762,7 @@ test("SHA GET: slow hopper 200 still wins after hedge started a file fetch", asy
   const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
   const ctx = waitCtx();
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, ctx.ctx);
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal((await res.json()).eng, "hopper-sha");
@@ -789,7 +789,7 @@ test("SHA GET: hedge scans hopper bytes if hopper sample stays silent", async ()
   const ctx = waitCtx();
   try {
     const t0 = Date.now();
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, ctx.ctx);
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "scan");
     assert.equal((await res.json()).eng, "from-file");
@@ -875,7 +875,7 @@ test("hedged hopper 204 with scan down still waits for the hopper worker", async
   });
   const env = testEnv(backend.url, { SCAN_URL: DEAD, HOPPER_HEDGE_MS: "20" });
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal((await res.json()).eng, "hopper-worker");
@@ -905,7 +905,7 @@ test("scan win populates cache; late hopper does not change it", async () => {
     assert.equal(first.headers.get("x-beamline-source"), "scan");
     await ctx.flush();
     const second = await handle(
-      new Request(`http://beamline/sha256/${HELLO_SHA}`),
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
       env,
       noopCtx(),
     );
@@ -940,7 +940,7 @@ test("hopper win after hedge populates cache with hopper", async () => {
     assert.equal(first.headers.get("x-beamline-source"), "hopper");
     await ctx.flush();
     const second = await handle(
-      new Request(`http://beamline/sha256/${HELLO_SHA}`),
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
       env,
       noopCtx(),
     );
@@ -966,7 +966,7 @@ test("response is not blocked on the cache write", async () => {
   };
   try {
     const t0 = Date.now();
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     const ms = Date.now() - t0;
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
@@ -995,7 +995,7 @@ test("cache put failure does not fail the lookup", async () => {
   const ctx = waitCtx();
   _test.muteLogs(false);
   try {
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, ctx.ctx);
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
     assert.equal(res.status, 200);
     await ctx.flush();
     assert.ok(logs.rows.some((r) => r.event === "wait_error"));
@@ -1057,7 +1057,7 @@ test("aborting hopper on scan win does not trip the hopper breaker", async () =>
       await ctx.flush();
     }
     const res = await handle(
-      new Request(`http://beamline/sha256/${HELLO_SHA}`),
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
       { ...env, cache: _test.memoryCache() },
       noopCtx(),
     );
@@ -1120,11 +1120,11 @@ test("hopper lookup timeout trips the breaker", async () => {
   const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "5", HOPPER_LOOKUP_MS: "40" });
   try {
     for (let i = 0; i < _test.BREAKER_FAILS; i++) {
-      const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+      const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
       assert.equal(res.status, 503);
     }
     const before = backend.hits.sample;
-    const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 503);
     assert.equal(backend.hits.sample, before);
   } finally {
@@ -1252,7 +1252,7 @@ test("scan 400 on a PURL passes through, not 404", async () => {
   });
   const env = testEnv(backend.url);
   try {
-    const res = await handle(new Request("http://beamline/purl/not-a-purl"), env, noopCtx());
+    const res = await handle(new Request("http://beamline/lookup?purl=not-a-purl"), env, noopCtx());
     assert.equal(res.status, 400);
     assert.equal((await res.json()).error, "not a package URL");
     assert.equal(backend.hits.analyze, 0);
@@ -1273,7 +1273,7 @@ test("scan 504 without hopper bytes is a timeout, not unavailable", async () => 
   const env = testEnv(backend.url);
   try {
     const res = await handle(
-      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       noopCtx(),
     );
@@ -1296,7 +1296,7 @@ test("scan 429 without hopper bytes passes through", async () => {
   const env = testEnv(backend.url);
   try {
     const res = await handle(
-      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       noopCtx(),
     );
@@ -1322,6 +1322,129 @@ test("scan down does not wait when hopper rejects the upload", async () => {
     );
     assert.equal(res.status, 503);
     assert.equal(backend.hits.rescan, 0);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("hits carry the byte offset and line the match fired on", () => {
+  const envl = {
+    ml: { lvl: 3, eng: "2.8.0" },
+    raw: {
+      files: [
+        {
+          path: "evil.tgz!!lib/install.js",
+          traits: [
+            { id: "objectives/execution/shell/bash", crit: 5, desc: "Spawns bash" },
+            { id: "objectives/exfil", crit: 4, desc: "POSTs env", spans: [[512, 20]] },
+          ],
+          ctx: [
+            { ln: 100, line: 10, n: [{ i: "objectives/execution/shell/bash", o: 109, z: 4 }] },
+          ],
+        },
+      ],
+    },
+  };
+  const view = _test.customerView(envl, HELLO_SHA, "pkg:npm/evil@1.0.0");
+  // The note holds the exact byte; the window it sits in names the line.
+  assert.equal(view.hits[0].off, 109);
+  assert.equal(view.hits[0].line, 10);
+  // No note for this one, so its own evidence span locates it — with no line
+  // to claim, rather than a guessed one.
+  assert.equal(view.hits[1].off, 512);
+  assert.equal(view.hits[1].line, undefined);
+});
+
+test("an inherited finding is not repeated as its own hit", () => {
+  const envl = {
+    ml: { lvl: 4, eng: "2.8.0" },
+    raw: {
+      files: [
+        {
+          // The archive reports the member's finding a second time, pointing
+          // back at it — the same match, without the path or offset.
+          path: "evil.tgz",
+          traits: [{ id: "objectives/exfil", crit: 4, desc: "POSTs env", from: [{ file: 2 }] }],
+        },
+        {
+          path: "evil.tgz!!lib/install.js",
+          traits: [{ id: "objectives/exfil", crit: 4, desc: "POSTs env", spans: [[512, 20]] }],
+        },
+      ],
+    },
+  };
+  const view = _test.customerView(envl, HELLO_SHA, "pkg:npm/evil@1.0.0");
+  assert.equal(view.hits.length, 1, "one match, reported once");
+  assert.equal(view.hits[0].file, "lib/install.js", "the member that actually matched");
+  assert.equal(view.hits[0].off, 512);
+});
+
+test("PURLs normalize so the pkg: prefix and type case are not two keys", () => {
+  const canonical = "pkg:npm/left-pad@1.3.0";
+  assert.equal(_test.normalizePurl("pkg:npm/left-pad@1.3.0"), canonical);
+  assert.equal(_test.normalizePurl("npm/left-pad@1.3.0"), canonical, "pkg: is optional");
+  assert.equal(_test.normalizePurl("PKG:NPM/left-pad@1.3.0"), canonical, "scheme and type fold");
+  assert.equal(_test.normalizePurl("  npm/left-pad@1.3.0  "), canonical);
+  // The name keeps its case: npm grandfathered in mixed-case package names.
+  assert.equal(_test.normalizePurl("npm/Left-Pad@1.3.0"), "pkg:npm/Left-Pad@1.3.0");
+  // Qualifiers and subpaths ride along untouched.
+  assert.equal(
+    _test.normalizePurl("generic/x@1?download_url=https://e.test/x.tgz#sub"),
+    "pkg:generic/x@1?download_url=https://e.test/x.tgz#sub",
+  );
+  // Unrecognizable input is scan's call to make, not ours.
+  assert.equal(_test.normalizePurl("not-a-purl"), "not-a-purl");
+  assert.equal(_test.normalizePurl("   "), "");
+});
+
+test("/lookup takes exactly one key", async () => {
+  const backend = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const env = testEnv(backend.url);
+  try {
+    const both = await handle(
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}&purl=pkg:npm/x@1`),
+      env,
+      noopCtx(),
+    );
+    assert.equal(both.status, 400);
+    assert.equal((await both.json()).error, "provide exactly one of sha256 or purl");
+
+    const neither = await handle(new Request("http://beamline/lookup"), env, noopCtx());
+    assert.equal(neither.status, 400);
+
+    const bad = await handle(new Request("http://beamline/lookup?sha256=nope"), env, noopCtx());
+    assert.equal(bad.status, 400);
+    assert.equal((await bad.json()).error, "invalid sha256");
+
+    // The path forms /lookup replaced are gone, not quietly still serving.
+    for (const gone of [`http://beamline/sha256/${HELLO_SHA}`, "http://beamline/purl/pkg:npm/x@1"]) {
+      const res = await handle(new Request(gone), env, noopCtx());
+      assert.equal(res.status, 404, `${gone} should no longer route`);
+    }
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a PURL asked for two ways shares one cache entry", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    verdict: () => ({ sha: HELLO_SHA, lvl: -1, eng: "2.8.0" }),
+  });
+  const env = testEnv(backend.url);
+  const ctx = waitCtx();
+  try {
+    // Canonical, then bare, then bare with the type in caps.
+    for (const uri of [
+      "http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0",
+      "http://beamline/lookup?purl=npm%2Fleft-pad%401.3.0",
+      "http://beamline/lookup?purl=NPM%2Fleft-pad%401.3.0",
+    ]) {
+      const res = await handle(new Request(uri), env, ctx.ctx);
+      assert.equal(res.status, 200);
+    }
+    await ctx.flush();
+    assert.equal(backend.hits.bloom, 1, "one spelling reached scan; the rest were cached");
   } finally {
     await backend.close();
   }
@@ -1407,7 +1530,7 @@ test("the handler never encodes the body itself", async () => {
   try {
     for (const accept of ["gzip", "identity", "gzip, deflate, br"]) {
       const res = await handle(
-        new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers: { "accept-encoding": accept } }),
+        new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { "accept-encoding": accept } }),
         { ...env, cache: _test.memoryCache() },
         noopCtx(),
       );
@@ -1442,14 +1565,14 @@ test("a token-protected reply is private to the client but still cacheable by us
   const headers = { authorization: "Bearer alpha" };
   const ctx = waitCtx();
   try {
-    const first = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers }), env, ctx.ctx);
+    const first = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers }), env, ctx.ctx);
     assert.equal(first.status, 200);
     assert.match(first.headers.get("cache-control"), /^private,/);
     await ctx.flush();
     assert.equal(stored.length, 1);
     assert.ok(!stored[0].includes("private"), `stored as ${stored[0]}`);
 
-    const second = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers }), env, noopCtx());
+    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers }), env, noopCtx());
     assert.equal(second.status, 200);
     assert.equal(second.headers.get("x-beamline-source"), "cache");
     assert.equal(backend.hits.sample, 1);
@@ -1463,11 +1586,11 @@ test("a definite miss is cached, so a hot unknown sha stops replaying the pipeli
   const env = testEnv(backend.url);
   const ctx = waitCtx();
   try {
-    const first = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, ctx.ctx);
+    const first = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
     assert.equal(first.status, 404);
     await ctx.flush();
 
-    const second = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
     assert.equal(second.status, 404);
     assert.equal(second.headers.get("x-beamline-source"), "cache");
     assert.equal((await second.json()).error, "unknown sample");
@@ -1517,7 +1640,7 @@ test("one request id reaches every backend and every log line", async () => {
   _test.muteLogs(false);
   try {
     await handle(
-      new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers: { "cf-ray": "abc123-SJC" } }),
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { "cf-ray": "abc123-SJC" } }),
       env,
       noopCtx(),
     );
@@ -1542,7 +1665,7 @@ test("a caller's own request id is honored, filtered, and bounded", async () => 
   const env = testEnv(backend.url);
   try {
     await handle(
-      new Request(`http://beamline/sha256/${HELLO_SHA}`, {
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, {
         headers: { "x-request-id": "mine-42", "cf-ray": "ignored" },
       }),
       env,
@@ -1552,7 +1675,7 @@ test("a caller's own request id is honored, filtered, and bounded", async () => 
 
     backend.auths.length = 0;
     await handle(
-      new Request(`http://beamline/sha256/${HELLO_SHA.replace(/.$/, "a")}`, {
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA.replace(/.$/, "a")}`, {
         headers: { "x-request-id": `bad/id@ ${"x".repeat(200)}` },
       }),
       { ...env, cache: _test.memoryCache() },
@@ -1623,7 +1746,7 @@ test("scan reporting its own analysis timeout is not retried", async () => {
   const env = testEnv(backend.url);
   try {
     const res = await handle(
-      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       noopCtx(),
     );
@@ -1742,7 +1865,7 @@ test("a PURL lookup races the same way", async () => {
   const env = testEnv(hopper.url, { SCAN_URL: `${slow.url},${fast.url}` });
   try {
     const t0 = Date.now();
-    const res = await handle(new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"), env, waitCtx().ctx);
+    const res = await handle(new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"), env, waitCtx().ctx);
     assert.equal(res.status, 200);
     assert.equal((await res.json()).eng, "fast");
     assert.ok(Date.now() - t0 < 300);
@@ -1985,7 +2108,7 @@ function mockBackend(opts) {
         rid: req.headers["x-request-id"] || "",
       });
       const body = await readReq(req);
-      if (url.pathname.startsWith("/sha256/") || url.pathname === "/purl") {
+      if (url.pathname === "/lookup") {
         hits.bloom += 1;
         if (opts.bloomDelayMs) await new Promise((r) => setTimeout(r, opts.bloomDelayMs));
         const decision = typeof opts.bloom === "function" ? opts.bloom(url) : opts.bloom || "unknown";
