@@ -7,6 +7,11 @@ import { handle, _test } from "./beamline.js";
 const HELLO = new TextEncoder().encode("hello");
 const HELLO_SHA = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
+// Node's fetch stalls a second concurrent request to a backend until the event
+// loop wakes (up to ~200ms), which the hedge timings below would otherwise
+// race against. local.js does the same while it has work in flight.
+setInterval(() => {}, 1).unref();
+
 beforeEach(() => {
   _test.muteLogs(true);
 });
@@ -23,34 +28,6 @@ test("GET /healthz", async () => {
   const res = await handle(new Request("http://beamline/healthz"), {}, {});
   assert.equal(res.status, 200);
   assert.equal((await res.json()).status, "ok");
-});
-
-test("TUNNEL.fetch is used for hopper when bound", async () => {
-  const seen = [];
-  const env = {
-    HOPPER_URL: "http://hopper.internal:8081",
-    SCAN_URL: "http://scan.internal:49999",
-    cache: _test.memoryCache(),
-    TUNNEL: {
-      fetch(url) {
-        const u = String(url);
-        seen.push(u);
-        const headers = { "content-type": "application/json" };
-        if (u.includes("/_/bloom")) {
-          return new Response(JSON.stringify({ decision: "unknown" }), { status: 200, headers });
-        }
-        if (u.includes("/api/sample")) {
-          return new Response(JSON.stringify(envelope(HELLO_SHA)), { status: 200, headers });
-        }
-        return new Response("no", { status: 404 });
-      },
-    },
-  };
-  const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
-  assert.equal(res.status, 200);
-  assert.equal(res.headers.get("x-beamline-source"), "hopper");
-  assert.ok(seen.some((u) => u.startsWith("http://hopper.internal:8081/api/sample/")));
-  assert.ok(seen.some((u) => u.startsWith("http://scan.internal:49999/_/bloom")));
 });
 
 test("BEAMLINE_TOKEN accepts a comma-separated list", () => {
@@ -424,7 +401,10 @@ test("scan down wait timeout returns 202 pending", async () => {
   try {
     const res = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
     assert.equal(res.status, 202);
-    assert.equal(res.headers.get("retry-after"), "5");
+    // Jittered to spread the retry herd; the contract is a whole number of
+    // seconds inside the advertised window, not one fixed value.
+    const retry = Number(res.headers.get("retry-after"));
+    assert.ok(Number.isInteger(retry) && retry >= 3 && retry <= 8, `retry-after ${retry}`);
     assert.deepEqual(await res.json(), { state: "pending" });
   } finally {
     await backend.close();
@@ -1356,27 +1336,448 @@ test("clean samples have no hits even if traits are present", () => {
   assert.equal(view.why, undefined);
 });
 
-test("gzip when the client asks", async () => {
-  if (typeof CompressionStream !== "function" || typeof DecompressionStream !== "function") return;
-  const stored = envelope(HELLO_SHA, { lvl: -1, eng: "hopper-only" });
+test("the handler never encodes the body itself", async () => {
+  // Cloudflare's edge compresses Worker responses. A Worker that also
+  // compresses double-encodes: gzip-in-gzip for a client that asked for gzip,
+  // and a gzip body with no Content-Encoding for one that asked for identity.
   const backend = await mockBackend({
     bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: stored }),
+    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "plain" }) }),
+  });
+  const env = testEnv(backend.url);
+  try {
+    for (const accept of ["gzip", "identity", "gzip, deflate, br"]) {
+      const res = await handle(
+        new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers: { "accept-encoding": accept } }),
+        { ...env, cache: _test.memoryCache() },
+        noopCtx(),
+      );
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get("content-encoding"), null, `encoded for accept-encoding: ${accept}`);
+      // Readable as-is, with no decompression step.
+      assert.equal((await res.json()).eng, "plain");
+    }
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a token-protected reply is private to the client but still cacheable by us", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
+  });
+  const inner = _test.memoryCache();
+  const stored = [];
+  const env = {
+    ...testEnv(backend.url),
+    BEAMLINE_TOKEN: "alpha",
+    cache: {
+      match: (req) => inner.match(req),
+      put: (req, res) => {
+        stored.push(res.headers.get("cache-control"));
+        return inner.put(req, res);
+      },
+    },
+  };
+  const headers = { authorization: "Bearer alpha" };
+  const ctx = waitCtx();
+  try {
+    const first = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers }), env, ctx.ctx);
+    assert.equal(first.status, 200);
+    assert.match(first.headers.get("cache-control"), /^private,/);
+    await ctx.flush();
+    assert.equal(stored.length, 1);
+    assert.ok(!stored[0].includes("private"), `stored as ${stored[0]}`);
+
+    const second = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers }), env, noopCtx());
+    assert.equal(second.status, 200);
+    assert.equal(second.headers.get("x-beamline-source"), "cache");
+    assert.equal(backend.hits.sample, 1);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a definite miss is cached, so a hot unknown sha stops replaying the pipeline", async () => {
+  const backend = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const env = testEnv(backend.url);
+  const ctx = waitCtx();
+  try {
+    const first = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, ctx.ctx);
+    assert.equal(first.status, 404);
+    await ctx.flush();
+
+    const second = await handle(new Request(`http://beamline/sha256/${HELLO_SHA}`), env, noopCtx());
+    assert.equal(second.status, 404);
+    assert.equal(second.headers.get("x-beamline-source"), "cache");
+    assert.equal((await second.json()).error, "unknown sample");
+    assert.equal(backend.hits.bloom, 1);
+    assert.equal(backend.hits.sample, 1);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a client is not held past HOLD_MS and the work finishes behind it", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyze: async () => {
+      await delay(150);
+      return envelope(HELLO_SHA, { eng: "slow-scan" });
+    },
+  });
+  const env = testEnv(backend.url, { HOLD_MS: "30" });
+  const ctx = waitCtx();
+  try {
+    const t0 = Date.now();
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, ctx.ctx);
+    const ms = Date.now() - t0;
+    assert.equal(res.status, 202);
+    assert.deepEqual(await res.json(), { state: "pending" });
+    assert.ok(ms < 120, `held for ${ms}ms`);
+
+    // The scan was not abandoned: it finishes and its verdict reaches hopper,
+    // so the client's retry is cheap.
+    await ctx.flush();
+    assert.equal(backend.hits.analyze, 1);
+    assert.equal(backend.hits.result, 1);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("one request id reaches every backend and every log line", async () => {
+  const logs = captureLogs();
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA) }),
+  });
+  const env = testEnv(backend.url);
+  _test.muteLogs(false);
+  try {
+    await handle(
+      new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers: { "cf-ray": "abc123-SJC" } }),
+      env,
+      noopCtx(),
+    );
+    assert.ok(backend.auths.length > 0);
+    assert.ok(
+      backend.auths.every((a) => a.rid === "abc123-SJC"),
+      JSON.stringify(backend.auths),
+    );
+    assert.ok(logs.rows.length > 0);
+    assert.ok(logs.rows.every((r) => r.rid === "abc123-SJC"), JSON.stringify(logs.rows));
+  } finally {
+    logs.restore();
+    await backend.close();
+  }
+});
+
+test("a caller's own request id is honored, filtered, and bounded", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA) }),
+  });
+  const env = testEnv(backend.url);
+  try {
+    await handle(
+      new Request(`http://beamline/sha256/${HELLO_SHA}`, {
+        headers: { "x-request-id": "mine-42", "cf-ray": "ignored" },
+      }),
+      env,
+      noopCtx(),
+    );
+    assert.ok(backend.auths.every((a) => a.rid === "mine-42"), JSON.stringify(backend.auths));
+
+    backend.auths.length = 0;
+    await handle(
+      new Request(`http://beamline/sha256/${HELLO_SHA.replace(/.$/, "a")}`, {
+        headers: { "x-request-id": `bad/id@ ${"x".repeat(200)}` },
+      }),
+      { ...env, cache: _test.memoryCache() },
+      noopCtx(),
+    );
+    const seen = backend.auths[0].rid;
+    assert.match(seen, /^badidx+$/, seen);
+    assert.equal(seen.length, 64);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a scan that never reached a verdict is retried until it does", async () => {
+  let calls = 0;
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyze: () => {
+      calls += 1;
+      if (calls === 1) return { status: 503, body: { error: "unavailable" } };
+      if (calls === 2) return { status: 429, body: { error: "At capacity (4/4 active analyses)" } };
+      if (calls === 3) return { status: 524, body: { error: "edge timeout" } };
+      return envelope(HELLO_SHA, { eng: "eventually" });
+    },
+  });
+  const env = testEnv(backend.url);
+  const ctx = waitCtx();
+  try {
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, ctx.ctx);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-beamline-source"), "scan");
+    assert.equal((await res.json()).eng, "eventually");
+    assert.equal(calls, 4, "three transient failures, then the answer");
+    await ctx.flush();
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a rejection is an answer, so it is not retried", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyze: () => ({ status: 415, body: { error: "unsupported file type" } }),
   });
   const env = testEnv(backend.url);
   try {
     const res = await handle(
-      new Request(`http://beamline/sha256/${HELLO_SHA}`, { headers: { "accept-encoding": "gzip" } }),
+      new Request("http://beamline/", { method: "POST", body: HELLO }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 415);
+    assert.equal((await res.json()).error, "unsupported file type");
+    assert.equal(backend.hits.analyze, 1, "a verdict must not be asked for twice");
+  } finally {
+    await backend.close();
+  }
+});
+
+test("scan reporting its own analysis timeout is not retried", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyzePurl: () => ({ status: 504, body: { error: "analysis timeout", timeout_secs: 1800 } }),
+  });
+  const env = testEnv(backend.url);
+  try {
+    const res = await handle(
+      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       noopCtx(),
     );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("content-encoding"), "gzip");
-    const body = await new Response(res.body.pipeThrough(new DecompressionStream("gzip"))).json();
-    assert.equal(body.eng, "hopper-only");
-    assert.equal(body.lvl, -1);
+    assert.equal(res.status, 504);
+    assert.deepEqual(await res.json(), { error: "analysis timeout", timeout_secs: 1800 });
+    // Re-running a sample scan already gave up on spends the budget twice.
+    assert.equal(backend.hits.analyzePurl, 1);
   } finally {
     await backend.close();
+  }
+});
+
+test("retries stop once the breaker opens rather than burning attempts", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyze: () => ({ status: 500, body: { error: "boom" } }),
+    // Refuse the upload so the lookup ends here instead of going on to wait on
+    // a hopper worker; this test is only about how often scan is asked.
+    uploadStatus: 500,
+  });
+  const env = testEnv(backend.url, { SCAN_RETRIES: "50" });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, ctx.ctx);
+    assert.equal(res.status, 503);
+    // BREAKER_FAILS consecutive failures open the circuit; the loop stops there
+    // instead of running all 50 attempts against a backend known to be down.
+    assert.ok(
+      backend.hits.analyze <= _test.BREAKER_FAILS + 1,
+      `kept asking an open circuit: ${backend.hits.analyze} calls`,
+    );
+    await ctx.flush();
+  } finally {
+    await backend.close();
+  }
+});
+
+test("concurrent lookups of one sample share a single retry sequence", async () => {
+  let calls = 0;
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: async () => {
+      await delay(20);
+      return { status: 404 };
+    },
+    analyze: async () => {
+      calls += 1;
+      await delay(20);
+      if (calls <= 2) return { status: 503, body: { error: "unavailable" } };
+      return envelope(HELLO_SHA, { eng: "shared" });
+    },
+  });
+  const env = testEnv(backend.url);
+  const ctx = waitCtx();
+  try {
+    const answers = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, ctx.ctx),
+      ),
+    );
+    for (const res of answers) {
+      assert.equal(res.status, 200);
+      assert.equal((await res.json()).eng, "shared");
+    }
+    // Five clients, one flight: two failures and one success, not five of each.
+    assert.equal(calls, 3, `retries fanned out: ${calls} scan calls`);
+    assert.equal(backend.hits.sample, 1);
+    await ctx.flush();
+  } finally {
+    await backend.close();
+  }
+});
+
+test("the fastest worker wins, the loser is dropped, and hopper is told once", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const fast = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "fast" }) });
+  const slow = await mockBackend({
+    bloom: "unknown",
+    analyze: async () => {
+      await delay(400);
+      return envelope(HELLO_SHA, { eng: "slow" });
+    },
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${slow.url},${fast.url}` });
+  const ctx = waitCtx();
+  try {
+    const t0 = Date.now();
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, ctx.ctx);
+    const ms = Date.now() - t0;
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "fast", "the slower worker must not decide the answer");
+    assert.ok(ms < 300, `waited ${ms}ms for a loser we should have dropped`);
+
+    await ctx.flush();
+    // Both workers ran, but only the winner's verdict is written back.
+    assert.equal(slow.hits.analyze, 1);
+    assert.equal(fast.hits.analyze, 1);
+    assert.equal(hopper.hits.result, 1, "hopper must hear one result, not one per worker");
+    assert.equal(hopper.results[0].ml.eng, "fast");
+  } finally {
+    await Promise.all([hopper.close(), fast.close(), slow.close()]);
+  }
+});
+
+test("a PURL lookup races the same way", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const fast = await mockBackend({ bloom: "unknown", analyzePurl: () => envelope(HELLO_SHA, { eng: "fast" }) });
+  const slow = await mockBackend({
+    bloom: "unknown",
+    analyzePurl: async () => {
+      await delay(400);
+      return envelope(HELLO_SHA, { eng: "slow" });
+    },
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${slow.url},${fast.url}` });
+  try {
+    const t0 = Date.now();
+    const res = await handle(new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"), env, waitCtx().ctx);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "fast");
+    assert.ok(Date.now() - t0 < 300);
+  } finally {
+    await Promise.all([hopper.close(), fast.close(), slow.close()]);
+  }
+});
+
+test("a dead worker does not stop the race", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const alive = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "alive" }) });
+  const env = testEnv(hopper.url, { SCAN_URL: `${DEAD},${alive.url}` });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, ctx.ctx);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "alive");
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), alive.close()]);
+  }
+});
+
+test("a stagger lets the first worker answer before the next is asked", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const first = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "first" }) });
+  const second = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "second" }) });
+  const env = testEnv(hopper.url, {
+    SCAN_URL: `${first.url},${second.url}`,
+    SCAN_RACE_DELAY_MS: "5000",
+  });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, ctx.ctx);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "first");
+    // The second worker was never asked, so the race cost one slot, not two.
+    assert.equal(second.hits.analyze, 0);
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), first.close(), second.close()]);
+  }
+});
+
+test("a worker with an open breaker is skipped while the others keep serving", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const sick = await mockBackend({ bloom: "unknown", analyze: () => ({ status: 500, body: { error: "boom" } }) });
+  const well = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "well" }) });
+  const env = testEnv(hopper.url, { SCAN_URL: `${sick.url},${well.url}` });
+  try {
+    for (let i = 0; i < _test.BREAKER_FAILS + 2; i++) {
+      const res = await handle(
+        new Request("http://beamline/", { method: "POST", body: new TextEncoder().encode(`sample-${i}`) }),
+        { ...env, cache: _test.memoryCache() },
+        waitCtx().ctx,
+      );
+      assert.equal(res.status, 200, `lookup ${i} should still be served by the healthy worker`);
+      assert.equal((await res.json()).eng, "well");
+    }
+    // Once its breaker opened the sick worker stops being asked; the healthy
+    // one carries every lookup.
+    assert.ok(
+      sick.hits.analyze <= _test.BREAKER_FAILS,
+      `kept asking a tripped worker: ${sick.hits.analyze} calls`,
+    );
+    assert.equal(well.hits.analyze, _test.BREAKER_FAILS + 2);
+  } finally {
+    await Promise.all([hopper.close(), sick.close(), well.close()]);
+  }
+});
+
+test("bloom is raced and the first answer wins, slow worker dropped", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const quick = await mockBackend({ bloom: "skip" });
+  const sluggish = await mockBackend({
+    bloom: () => "unknown",
+    bloomDelayMs: 400,
+    analyze: () => envelope(HELLO_SHA, { eng: "should-not-run" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${sluggish.url},${quick.url}` });
+  try {
+    const t0 = Date.now();
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, waitCtx().ctx);
+    const ms = Date.now() - t0;
+    assert.equal(res.status, 200);
+    // The quick worker said skip first, so that is the answer and nothing is
+    // analyzed at all.
+    assert.equal(res.headers.get("x-beamline-source"), "bloom");
+    assert.equal((await res.json()).lvl, -1);
+    assert.ok(ms < 300, `waited ${ms}ms on the slow worker's bloom`);
+    assert.equal(sluggish.hits.analyze, 0);
+    assert.equal(hopper.hits.sample, 0, "a skip must not reach hopper");
+  } finally {
+    await Promise.all([hopper.close(), quick.close(), sluggish.close()]);
   }
 });
 
@@ -1432,6 +1833,12 @@ function testEnv(url, extra = {}) {
     SCAN_TIMEOUT_MS: extra.SCAN_TIMEOUT_MS,
     HOPPER_HEDGE_MS: extra.HOPPER_HEDGE_MS,
     HOPPER_LOOKUP_MS: extra.HOPPER_LOOKUP_MS,
+    HOLD_MS: extra.HOLD_MS,
+    // Retries are real behaviour worth exercising, but not at a real clock:
+    // 5ms base keeps a full backoff sequence under a fifth of a second.
+    SCAN_RETRIES: extra.SCAN_RETRIES,
+    SCAN_RETRY_BASE_MS: extra.SCAN_RETRY_BASE_MS ?? "5",
+    SCAN_RACE_DELAY_MS: extra.SCAN_RACE_DELAY_MS,
     cache: extra.cache ?? _test.memoryCache(),
   };
 }
@@ -1448,8 +1855,9 @@ function waitCtx() {
         jobs.push(Promise.resolve(p));
       },
     },
-    flush() {
-      return Promise.all(jobs);
+    // Background work registers more background work, so drain until quiet.
+    async flush() {
+      while (jobs.length) await Promise.all(jobs.splice(0));
     },
   };
 }
@@ -1470,10 +1878,15 @@ function mockBackend(opts) {
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url || "/", "http://127.0.0.1");
-      auths.push({ path: url.pathname, authorization: req.headers.authorization || "" });
+      auths.push({
+        path: url.pathname,
+        authorization: req.headers.authorization || "",
+        rid: req.headers["x-request-id"] || "",
+      });
       const body = await readReq(req);
       if (url.pathname === "/_/bloom") {
         hits.bloom += 1;
+        if (opts.bloomDelayMs) await new Promise((r) => setTimeout(r, opts.bloomDelayMs));
         const decision = typeof opts.bloom === "function" ? opts.bloom(url) : opts.bloom || "unknown";
         return send(res, opts.bloomStatus || 200, { decision });
       }

@@ -2,6 +2,11 @@ SHELL := /bin/sh
 
 # Backends and the Cloudflare Tunnel UUID come from the environment.
 # Nothing below bakes a host or address into the tree.
+# Pinned so a deploy is reproducible and a compromised release upstream cannot
+# walk into the deploy path. Bump deliberately.
+WRANGLER    ?= wrangler@4.124.0
+OXLINT      ?= oxlint@1.79.0
+
 PORT        ?= 8080
 N           ?= 6
 SAMPLES     ?=
@@ -11,7 +16,15 @@ STRESS_OUT  ?=
 BEAMLINE_URL ?=
 BEAMLINE_TOKEN ?=
 
-.PHONY: test stress-test deploy-cf
+.PHONY: lint test stress-test deploy-cf
+
+# Parse every file, then oxlint. No lint config is checked in: the defaults
+# are the standard, and the tree stays free of npm packages.
+lint:
+	@for f in beamline.js local.js stress.js beamline.test.js stress.test.js; do \
+	  node --check "$$f" || exit 1; \
+	done
+	npx --yes $(OXLINT) --deny-warnings beamline.js local.js stress.js beamline.test.js stress.test.js
 
 test:
 	node --test
@@ -60,17 +73,15 @@ stress-test:
 	exit $$st
 
 # Publish beamline.js as a Cloudflare Worker. 200s land in caches.default.
-# HOPPER_URL and SCAN_URL are the URLs as seen from the cloudflared host
-# (private IP or internal DNS). CF_TUNNEL_ID is that tunnel's UUID.
-# The Worker calls env.TUNNEL.fetch() so those URLs never leave the tunnel.
+# HOPPER_URL and SCAN_URL are the public hostnames of the Cloudflare Tunnels
+# in front of hopper and scan; the Worker reaches them over ordinary fetch and
+# the edge routes into the tunnel. They carry their own authentication.
+# SCAN_URL may list several workers, comma-separated, to race them:
+#   SCAN_URL=https://scan-a.example,https://scan-b.example make deploy-cf
 # Token: npx wrangler secret put BEAMLINE_TOKEN
 deploy-cf:
 	@test -n "$(HOPPER_URL)" || { echo "HOPPER_URL is required"; exit 1; }
 	@test -n "$(SCAN_URL)" || { echo "SCAN_URL is required"; exit 1; }
-	@test -n "$(CF_TUNNEL_ID)" || { echo "CF_TUNNEL_ID is required"; exit 1; }
-	@cfg=$$(mktemp ./wrangler.XXXXXX); \
-	{ cat wrangler.toml; printf '\n[[vpc_networks]]\nbinding = "TUNNEL"\ntunnel_id = "%s"\nremote = true\n' "$(CF_TUNNEL_ID)"; } > "$$cfg"; \
-	npx --yes wrangler deploy --config "$$cfg" \
+	npx --yes $(WRANGLER) deploy \
 	  --var "HOPPER_URL:$(HOPPER_URL)" \
-	  --var "SCAN_URL:$(SCAN_URL)"; \
-	st=$$?; rm -f "$$cfg"; exit $$st
+	  --var "SCAN_URL:$(SCAN_URL)"

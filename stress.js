@@ -20,7 +20,8 @@ const samples = Math.max(0, Number(process.env.SAMPLES) || 0);
 const concurrency = Math.max(1, Number(process.env.CONCURRENCY) || DEFAULT_CONCURRENCY);
 const beamlineUrl = trimSlash(process.env.BEAMLINE_URL);
 const token = (process.env.BEAMLINE_TOKEN || "").trim();
-const scanUrl = trimSlash(process.env.SCAN_URL);
+// SCAN_URL may list several interchangeable workers; probe the first.
+const scanUrl = trimSlash((process.env.SCAN_URL || "").split(",")[0]);
 const hopperUrl = trimSlash(process.env.HOPPER_URL);
 const outPath = process.env.STRESS_OUT || "";
 const timeoutMs = Number(process.env.SCAN_TIMEOUT_MS) || 1_800_000;
@@ -575,7 +576,7 @@ function percentile(sorted, p) {
 }
 
 async function pool(items, width, fn) {
-  const out = new Array(items.length);
+  const out = Array.from({ length: items.length });
   let i = 0;
   async function worker() {
     while (i < items.length) {

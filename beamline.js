@@ -14,15 +14,33 @@ const HOPPER_LOOKUP_MS = 15_000;
 const HOPPER_RPC_MS = 2_000;
 const FILE_TIMEOUT_MS = 30_000;
 const HEDGE = Symbol("hedge");
+const HELD = Symbol("held");
 const HOPPER_POLL_MS = 500;
 const BREAKER_FAILS = 5;
 const BREAKER_COOL_MS = 10_000;
 const MEMORY_CACHE_MAX = 1024;
 const HIT_LIMIT = 3;
 const HIT_MIN_CRIT = 3;
+const POLL_MAX_MS = 5_000;
+const SCAN_RETRIES = 5;
+const SCAN_RETRY_BASE_MS = 1_000;
+const SCAN_RETRY_MAX_MS = 30_000;
+const SCAN_RACE_DELAY_MS = 0;
+const HOLD_MS = 10_000;
+const MISS_MAX_AGE = 60;
+const RETRY_AFTER_MIN_S = 3;
+const RETRY_AFTER_MAX_S = 8;
+const SUBMIT_TRIES = 4;
+const SUBMIT_BASE_MS = 500;
 
+// Per isolate, not global: on Workers each isolate counts its own failures and
+// loses them when it is recycled, so a backend outage costs BREAKER_FAILS
+// requests per live isolate, not five in total. Same for inflight — it collapses
+// duplicate work within one isolate; the cache and hopper do it across them.
 const hopperBreaker = makeBreaker();
-const scanBreaker = makeBreaker();
+// One breaker per scan worker, keyed by base URL. A single shared breaker would
+// let one sick worker disable scanning altogether.
+const scanBreakers = new Map();
 const inflight = new Map();
 
 export default {
@@ -31,13 +49,24 @@ export default {
   },
 };
 
-export async function handle(request, env, ctx) {
-  return maybeGzip(request, await dispatch(request, env, ctx));
+// Responses go out uncompressed. Cloudflare's edge compresses them itself, and
+// a Worker that also compresses double-encodes: the body arrives gzipped twice
+// when the client asked for gzip, and gzipped with no `Content-Encoding` at all
+// when it asked for identity. `node local.js` has no edge in front of it, so it
+// does its own compression.
+export function handle(request, env, ctx) {
+  return dispatch(request, env, ctx);
 }
 
 async function dispatch(request, env, ctx) {
-  ctx = ctx || {};
-  if (request.signal && !ctx.signal) ctx = { ...ctx, signal: request.signal };
+  // One id for the whole request, logged on every line and sent to hopper and
+  // scan, so a slow lookup can be followed across all three services. A caller
+  // may bring its own; it reaches our logs and outbound headers, so it is
+  // filtered and bounded first.
+  const rid =
+    cleanId(request.headers.get("x-request-id")) || cleanId(request.headers.get("cf-ray")) || crypto.randomUUID();
+  ctx = { ...ctx, rid };
+  if (request.signal && !ctx.signal) ctx.signal = request.signal;
 
   const url = new URL(request.url);
   if (url.pathname === "/healthz" && request.method === "GET") {
@@ -46,7 +75,8 @@ async function dispatch(request, env, ctx) {
 
   const allowed = tokenList(env.BEAMLINE_TOKEN);
   if (allowed.length) {
-    const got = bearerToken(request);
+    const bearer = /^Bearer\s+(\S+)/i.exec((request.headers.get("authorization") || "").trim());
+    const got = bearer ? bearer[1] : "";
     if (!allowed.some((t) => tokenEq(got, t))) {
       return json({ error: "unauthorized" }, 401);
     }
@@ -74,7 +104,11 @@ async function dispatch(request, env, ctx) {
     }
     return json({ error: "not found" }, 404);
   } catch (err) {
-    if (clientAborted(ctx)) return json({ error: "canceled" }, 499);
+    if (clientAborted(ctx)) {
+      logLine("canceled", { rid: ctx.rid, method: request.method, path: url.pathname });
+      return json({ error: "canceled" }, 499);
+    }
+    logLine("error", { rid: ctx.rid, method: request.method, path: url.pathname, err: errText(err) });
     return json({ error: "internal" }, 500);
   }
 }
@@ -84,11 +118,11 @@ async function handlePost(request, env, ctx, url) {
   if (ct.includes("multipart/") || ct.includes("application/x-www-form-urlencoded")) {
     return json({ error: "unsupported media type" }, 415);
   }
-  const maxBytes = Number(env.MAX_BYTES) || DEFAULT_MAX_BYTES;
+  const maxBytes = maxBody(env);
   const cl = Number(request.headers.get("content-length"));
   if (Number.isFinite(cl) && cl > maxBytes) return json({ error: "too large" }, 413);
-  const bytes = await readBody(request, maxBytes);
-  if (!bytes) return json({ error: "empty body" }, 400);
+  const bytes = await request.arrayBuffer();
+  if (!bytes.byteLength) return json({ error: "empty body" }, 400);
   if (bytes.byteLength > maxBytes) return json({ error: "too large" }, 413);
   const sha = await sha256Hex(bytes);
   return await lookup(env, ctx, url.origin, { sha, bytes, purl: null, filename: "upload.bin" });
@@ -100,35 +134,54 @@ async function lookup(env, ctx, origin, input) {
     ? new Request(`${origin}/sha256/${input.sha}`)
     : new Request(`${origin}/purl/${encodeURIComponent(input.purl)}`);
   const flightKey = input.sha ? `sha:${input.sha}` : `purl:${input.purl}`;
-
   const cache = await getCache(env);
-  if (inflight.has(flightKey)) {
-    const res = await inflight.get(flightKey);
-    return res.clone();
+
+  let work = inflight.get(flightKey);
+  if (!work) {
+    work = (async () => {
+      const hit = await cache.match(cacheKey);
+      if (hit) {
+        const res = new Response(hit.body, hit);
+        res.headers.set("X-Beamline-Source", "cache");
+        logLine("lookup", { src: "cache", status: hit.status, ms: Date.now() - t0, ...idFields(ctx, input) });
+        return res;
+      }
+      return runLookup(env, ctx, cache, cacheKey, input, t0);
+    })();
+    inflight.set(flightKey, work);
+    // Runs to completion even if every waiter walks away, so the answer still
+    // reaches the cache and hopper for whoever asks next.
+    waitUntil(ctx, work.finally(() => inflight.delete(flightKey)));
   }
-  const p = (async () => {
-    const hit = await cache.match(cacheKey);
-    if (hit) {
-      const res = new Response(hit.body, hit);
-      res.headers.set("X-Beamline-Source", "cache");
-      logLine("lookup", { src: "cache", status: 200, ms: Date.now() - t0, ...idFields(input) });
-      return res;
-    }
-    return runLookup(env, ctx, cache, cacheKey, input, t0);
-  })();
-  inflight.set(flightKey, p);
+
+  // A scan may legitimately run for half an hour. A client may not be made to
+  // wait for it: past HOLD_MS we hand back 202 and let the work finish.
+  const hold = deadline(numEnv(env, "HOLD_MS", HOLD_MS), ctx, HELD);
+  let res;
   try {
-    const res = await p;
-    return res.clone();
+    res = await Promise.race([work, hold.fired]);
   } finally {
-    inflight.delete(flightKey);
+    hold.cancel();
   }
+  if (res !== HELD) return res.clone();
+  logLine("lookup", { src: "hold", status: 202, ms: Date.now() - t0, ...idFields(ctx, input) });
+  return pending();
+}
+
+// A timer the winner puts out. Without the cancel, every hedge and every hold
+// would keep a timer — and its abort listeners — alive for the full duration
+// after the race was already decided, one per in-flight request.
+function deadline(ms, ctx, token) {
+  const ctl = new AbortController();
+  const fired = sleep(ms, { ...ctx, signal: mergeAbort(ctx.signal, ctl.signal) }).then(() => token);
+  fired.catch(() => {});
+  return { fired, cancel: () => ctl.abort() };
 }
 
 async function runLookup(env, ctx, cache, cacheKey, input, t0) {
   const hedgeMs = numEnv(env, "HOPPER_HEDGE_MS", HOPPER_HEDGE_MS);
   const lookupMs = numEnv(env, "HOPPER_LOOKUP_MS", HOPPER_LOOKUP_MS);
-  const ids = idFields(input);
+  const ids = idFields(ctx, input);
 
   const bloom = await bloomDecide(env, ctx, input);
   if (bloom === "skip") {
@@ -139,7 +192,13 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
 
   const hopperCtl = new AbortController();
   const hopperP = hopperSample(env, ctx, input, lookupMs, hopperCtl.signal);
-  let hopper = await Promise.race([hopperP, sleep(hedgeMs, ctx).then(() => HEDGE)]);
+  const hedge = deadline(hedgeMs, ctx, HEDGE);
+  let hopper;
+  try {
+    hopper = await Promise.race([hopperP, hedge.fired]);
+  } finally {
+    hedge.cancel();
+  }
   const hedged = hopper === HEDGE;
   if (hedged) {
     hopper = undefined;
@@ -147,7 +206,7 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
   }
 
   if (hopper?.status === 200) {
-    return replyHopper(env, ctx, cache, cacheKey, input, hopper, t0, { hedged: false });
+    return replyHopper(env, ctx, cache, cacheKey, input, hopper, t0, false);
   }
 
   const scanCtl = new AbortController();
@@ -155,7 +214,7 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
 
   if (!hedged) {
     const pack = await scanP;
-    return settle(env, ctx, cache, cacheKey, input, hopper, pack.bytes, pack.scanned, t0, { hedged: false });
+    return settle(env, ctx, cache, cacheKey, input, hopper, pack.bytes, pack.scanned, t0, false);
   }
 
   const won = await raceUseful(hopperP, scanP);
@@ -163,131 +222,170 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
     scanCtl.abort();
     waitUntil(ctx, scanP.catch(() => {}));
     logLine("abort", { target: "scan", why: "hopper_hit", ms: Date.now() - t0, ...ids });
-    return replyHopper(env, ctx, cache, cacheKey, input, won.hopper, t0, { hedged: true });
+    return replyHopper(env, ctx, cache, cacheKey, input, won.hopper, t0, true);
   }
   if (won.winner === "scan") {
     hopperCtl.abort();
     waitUntil(ctx, hopperP.catch(() => {}));
     logLine("abort", { target: "hopper", why: "scan_hit", ms: Date.now() - t0, ...ids });
-    return replyScan(env, ctx, cache, cacheKey, input, won.hopper, won.bytes, won.scanned, t0, { hedged: true });
+    return replyScan(env, ctx, cache, cacheKey, input, won.hopper, won.bytes, won.scanned, t0, true);
   }
-  return settle(env, ctx, cache, cacheKey, input, won.hopper, won.bytes, won.scanned, t0, { hedged: true });
+  return settle(env, ctx, cache, cacheKey, input, won.hopper, won.bytes, won.scanned, t0, true);
 }
 
 // Hopper 200 and a scan envelope are the only results the client can use
 // immediately. 404/204/errors are not a win; the other arm keeps running.
 async function raceUseful(hopperP, scanP) {
-  let hopper;
-  let pack;
-  let hopperDone = false;
-  let scanDone = false;
-  const hp = hopperP.then((v) => {
-    hopperDone = true;
-    hopper = v;
-  });
-  const sp = scanP.then((v) => {
-    scanDone = true;
-    pack = v;
-  });
+  const hopper = watch(hopperP);
+  const scan = watch(scanP);
   for (;;) {
-    if (hopper?.status === 200) {
-      return { winner: "hopper", hopper, bytes: pack && pack.bytes, scanned: pack && pack.scanned };
-    }
-    if (pack && pack.scanned && pack.scanned.env) {
-      return { winner: "scan", hopper, bytes: pack.bytes, scanned: pack.scanned };
-    }
-    if (hopperDone && scanDone) {
-      return { winner: "", hopper, bytes: pack && pack.bytes, scanned: pack && pack.scanned };
+    const pack = scan.value;
+    const both = { hopper: hopper.value, bytes: pack?.bytes, scanned: pack?.scanned };
+    if (hopper.value?.status === 200) return { winner: "hopper", ...both };
+    if (pack?.scanned?.env) return { winner: "scan", ...both };
+    if (hopper.done && scan.done) {
+      if (hopper.err || scan.err) throw hopper.err || scan.err;
+      return { winner: "", ...both };
     }
     const wait = [];
-    if (!hopperDone) wait.push(hp);
-    if (!scanDone) wait.push(sp);
+    if (!hopper.done) wait.push(hopper.settled);
+    if (!scan.done) wait.push(scan.settled);
     await Promise.race(wait);
   }
 }
 
+// The losing arm keeps running after raceUseful returns, so whatever it ends
+// up doing lands here instead of escaping as an unhandled rejection.
+function watch(p) {
+  const w = { done: false };
+  w.settled = p.then(
+    (value) => {
+      w.value = value;
+      w.done = true;
+    },
+    (err) => {
+      w.err = err;
+      w.done = true;
+    },
+  );
+  return w;
+}
+
 async function scanLookup(env, ctx, input, scanCtl) {
-  const scanCtx = { ...ctx, signal: mergeAbort(ctx && ctx.signal, scanCtl && scanCtl.signal) };
+  const scanCtx = { ...ctx, signal: mergeAbort(ctx.signal, scanCtl.signal) };
+  const cancelled = { bytes: null, scanned: { cancelled: true } };
+  const ids = idFields(ctx, input);
   try {
     let bytes = input.bytes || null;
     if (!bytes && input.sha) bytes = await hopperFile(env, scanCtx, input.sha);
-    if (scanCtl && scanCtl.signal.aborted) return { bytes: null, scanned: { cancelled: true } };
+    if (scanCtl.signal.aborted) return cancelled;
     if (bytes) {
-      return { bytes, scanned: await scanBytes(env, scanCtx, bytes, input.filename || input.sha) };
+      const name = input.filename || input.sha;
+      const scanned = await retryScan(env, scanCtx, ids, () =>
+        raceScan(env, scanCtx, ids, (base, armCtx) => scanBytes(env, armCtx, base, bytes, name)),
+      );
+      return { bytes, scanned };
     }
-    if (input.purl) return { bytes: null, scanned: await scanPurl(env, scanCtx, input.purl) };
+    if (input.purl) {
+      const scanned = await retryScan(env, scanCtx, ids, () =>
+        raceScan(env, scanCtx, ids, (base, armCtx) => scanPurl(env, armCtx, base, input.purl)),
+      );
+      return { bytes: null, scanned };
+    }
     return { bytes: null, scanned: null };
   } catch (err) {
-    if (clientAborted(ctx)) throw err;
-    if (scanCtl && scanCtl.signal.aborted) return { bytes: null, scanned: { cancelled: true } };
-    throw err;
+    // Hopper winning the race aborts scan mid-flight; that is not an error.
+    if (clientAborted(ctx) || !scanCtl.signal.aborted) throw err;
+    return cancelled;
   }
 }
 
-async function replyHopper(env, ctx, cache, cacheKey, input, hopper, t0, extra) {
-  const res = envelopeResponse(env, await hopper.resp.json(), hopper.sha, "hopper", 86400, null, input.purl);
+function replyHopper(env, ctx, cache, cacheKey, input, hopper, t0, hedged) {
+  const res = envelopeResponse(env, hopper.body, hopper.sha, "hopper", 86400, null, input.purl);
   logLine("lookup", {
     src: "hopper",
     status: 200,
     ms: Date.now() - t0,
-    hedged: !!extra.hedged,
+    hedged,
     hopper_status: 200,
-    ...idFields(input),
+    ...idFields(ctx, input),
   });
   return serveHit(ctx, cache, cacheKey, res);
 }
 
-function replyScan(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0, extra) {
+function replyScan(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0, hedged) {
   const sha = input.sha || scanned.sha || shaFromEnvelope(scanned.env);
   const res = envelopeResponse(env, scanned.env, sha, "scan", 86400, scanned.totalMs, input.purl);
   logLine("lookup", {
     src: "scan",
     status: 200,
     ms: Date.now() - t0,
-    hedged: !!extra.hedged,
+    hedged,
+    worker: scanned.worker,
+    scan_ms: scanned.ms,
     hopper_status: hopper?.status,
-    ...idFields(input),
+    ...idFields(ctx, input),
   });
-  waitUntil(ctx, submitHopper(env, ctx, sha, bytes, scanned.env, scanned.ms, hopper?.status !== 204));
+  // Background work outlives the reply, so a client hanging up must not cancel
+  // it; the write is still bounded by its own timeout and retry count.
+  const bg = { ...ctx, signal: undefined };
+  waitUntil(ctx, submitHopper(env, bg, sha, bytes, scanned.env, scanned.ms, hopper?.status !== 204));
   return serveHit(ctx, cache, cacheKey, res);
 }
 
-async function settle(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0, extra) {
-  const ids = idFields(input);
-  const hedged = !!extra.hedged;
-  if (scanned?.env) return replyScan(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0, extra);
+async function settle(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0, hedged) {
+  if (scanned?.env) return replyScan(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0, hedged);
+
+  const note = (src, status, more) =>
+    logLine("lookup", {
+      src,
+      status,
+      ms: Date.now() - t0,
+      hedged,
+      hopper_status: hopper?.status,
+      ...more,
+      ...idFields(ctx, input),
+    });
 
   const queued = await queueAndWait(env, ctx, hopper, input, bytes, scanned);
   if (queued?.env) {
+    note("hopper", 200, { queued: true });
     const res = envelopeResponse(env, queued.env, queued.sha, "hopper", 86400, null, input.purl);
-    logLine("lookup", { src: "hopper", status: 200, ms: Date.now() - t0, queued: true, hedged, hopper_status: hopper?.status, ...ids });
     return serveHit(ctx, cache, cacheKey, res);
   }
   if (queued?.failed) {
-    logLine("lookup", { src: "hopper", status: 503, ms: Date.now() - t0, hedged, err: "upload", ...ids });
+    note("hopper", 503, { err: "upload" });
     return json({ error: "unavailable" }, 503);
   }
   if (queued?.pending) {
-    logLine("lookup", { src: "hopper", status: 202, ms: Date.now() - t0, hedged, hopper_status: hopper?.status, ...ids });
+    note("hopper", 202);
     return pending();
   }
-
   if (scanned?.rejected) {
-    const res = scanError(scanned);
-    logLine("lookup", { src: "scan", status: res.status, ms: Date.now() - t0, hedged, hopper_status: hopper?.status, ...ids });
+    const res = scanClientResponse(scanned.status || 400, scanned);
+    note("scan", res.status);
     return res;
   }
   if (!bytes && hopper == null) {
-    logLine("lookup", { src: "hopper", status: 503, ms: Date.now() - t0, hedged, err: "unavailable", ...ids });
+    note("hopper", 503, { err: "unavailable" });
     return json({ error: "unavailable" }, 503);
   }
   if (scanned?.unavailable) {
-    const res = scanUnavailable(scanned);
-    logLine("lookup", { src: "scan", status: res.status, ms: Date.now() - t0, hedged, hopper_status: hopper?.status, ...ids });
+    const res =
+      scanned.status === 504 || scanned.status === 429
+        ? scanClientResponse(scanned.status, scanned)
+        : json({ error: "unavailable" }, 503);
+    note("scan", res.status);
     return res;
   }
-  logLine("lookup", { src: "hopper", status: 404, ms: Date.now() - t0, hedged, hopper_status: hopper?.status, ...ids });
-  return json({ error: "unknown sample" }, 404);
+  // A definite miss is an answer. Cache it briefly so a hot unknown sha does
+  // not replay bloom, hopper, and scan on every request.
+  note("hopper", 404);
+  const miss = new Response(JSON.stringify({ error: "unknown sample" }), {
+    status: 404,
+    headers: { "content-type": "application/json", "cache-control": `${cacheScope(env)}, max-age=${MISS_MAX_AGE}` },
+  });
+  return serveHit(ctx, cache, cacheKey, miss);
 }
 
 // Scan down, or hopper already has the bytes: upload if needed, promote, wait.
@@ -295,7 +393,7 @@ async function queueAndWait(env, ctx, hopper, input, bytes, scanned) {
   const shouldWait = scanned?.unavailable || hopper?.status === 204;
   if (!shouldWait) return null;
 
-  let sha = (hopper?.sha && SHA_RE.test(hopper.sha) && hopper.sha) || input.sha || "";
+  let sha = hopper?.sha || input.sha || "";
   if (bytes && hopper?.status !== 204) {
     sha = sha || (await sha256Hex(bytes));
     if (!(await hopperUpload(env, ctx, sha, bytes, input.filename || sha))) {
@@ -310,18 +408,68 @@ async function queueAndWait(env, ctx, hopper, input, bytes, scanned) {
   return null;
 }
 
+// Raced across every healthy worker; the first answer wins, skip included.
+// The workers run identical builds, so whichever replies first is as good an
+// authority as any. Losing connections are dropped as soon as one answers.
 async function bloomDecide(env, ctx, input) {
-  const base = trimSlash(env.SCAN_URL);
-  if (!base) return "unknown";
+  const workers = scanWorkers(env);
+  if (!workers.length) return "unknown";
+  const ids = idFields(ctx, input);
   const q = input.sha ? `sha256=${input.sha}` : `purl=${encodeURIComponent(input.purl)}`;
+  const t0 = Date.now();
+  const controls = workers.map(() => new AbortController());
+  const arms = workers.map((base, i) => watch(bloomAsk(env, ctx, q, base, controls[i])));
+
+  for (;;) {
+    const answer = arms.find((arm) => arm.value?.decision);
+    if (answer) {
+      for (const [i, arm] of arms.entries()) {
+        if (!arm.done) controls[i].abort();
+      }
+      logLine("bloom", {
+        decision: answer.value.decision,
+        worker: answer.value.worker,
+        ms: Date.now() - t0,
+        raced: workers.length,
+        ...ids,
+      });
+      return answer.value.decision;
+    }
+    if (arms.every((arm) => arm.done)) break;
+    await Promise.race(arms.filter((arm) => !arm.done).map((arm) => arm.settled));
+  }
+
+  if (clientAborted(ctx)) throw new DOMException("Aborted", "AbortError");
+  logLine("bloom", { decision: "unknown", ms: Date.now() - t0, raced: workers.length, silent: workers.length, ...ids });
+  return "unknown";
+}
+
+// One worker's bloom answer. An empty decision means it could not give one, so
+// the race keeps waiting on whoever is left.
+async function bloomAsk(env, ctx, q, base, control) {
+  const worker = hostOf(base);
+  const askCtx = { ...ctx, signal: mergeAbort(ctx.signal, control.signal) };
   try {
-    const resp = await fetchTimeout(env, `${base}/_/bloom?${q}`, { method: "GET", headers: authHeaders(env) }, BLOOM_TIMEOUT_MS, ctx);
-    if (!resp.ok) return "unknown";
-    const body = await resp.json();
-    return body.decision === "skip" ? "skip" : body.decision || "unknown";
+    const decision = await fetchTimeout(
+      `${base}/_/bloom?${q}`,
+      { method: "GET", headers: backendHeaders(env, ctx) },
+      BLOOM_TIMEOUT_MS,
+      askCtx,
+      async (resp) => {
+        if (!resp.ok) {
+          await drain(resp);
+          return "";
+        }
+        const body = await resp.json().catch(() => null);
+        return (body && body.decision) || "unknown";
+      },
+    );
+    return { worker, decision };
   } catch (err) {
+    // `ctx`, not `askCtx`: a loser we dropped ourselves is not a client abort.
     if (clientAborted(ctx)) throw err;
-    return "unknown";
+    logLine("bloom_failed", { worker, err: errText(err) });
+    return { worker, decision: "" };
   }
 }
 
@@ -334,21 +482,25 @@ async function hopperSample(env, ctx, input, timeoutMs, cancelSignal) {
   const ms = timeoutMs == null ? HOPPER_RPC_MS : timeoutMs;
   const fetchCtx = cancelSignal ? { ...ctx, signal: mergeAbort(ctx && ctx.signal, cancelSignal) } : ctx;
   try {
-    const resp = await fetchTimeout(env, url, { method: "GET", headers: authHeaders(env) }, ms, fetchCtx);
-    if (resp.status === 404) {
-      hopperBreaker.ok();
-      return { status: 404, sha: input.sha, resp };
-    }
-    if (resp.status === 204) {
-      hopperBreaker.ok();
-      return { status: 204, sha: resp.headers.get("X-SHA256") || input.sha, resp };
-    }
-    if (!resp.ok) {
+    // The envelope is read here so it stays inside the request timeout, and
+    // null — anything but a usable 200, 404, or 204 — trips the breaker.
+    const got = await fetchTimeout(url, { method: "GET", headers: backendHeaders(env, ctx) }, ms, fetchCtx, async (resp) => {
+      const hex = String(resp.headers.get("x-sha256") || "").trim().toLowerCase();
+      const sha = (SHA_RE.test(hex) && hex) || input.sha;
+      if (resp.status === 200) {
+        const body = await resp.json().catch(() => null);
+        return body && { status: 200, sha, body };
+      }
+      await drain(resp);
+      if (resp.status === 404 || resp.status === 204) return { status: resp.status, sha };
+      return null;
+    });
+    if (!got) {
       hopperBreaker.fail();
       return null;
     }
     hopperBreaker.ok();
-    return { status: 200, sha: resp.headers.get("X-SHA256") || input.sha, resp };
+    return got;
   } catch (err) {
     if (clientAborted(ctx)) throw err;
     if (cancelSignal && cancelSignal.aborted) return null;
@@ -360,17 +512,29 @@ async function hopperSample(env, ctx, input, timeoutMs, cancelSignal) {
 async function hopperFile(env, ctx, sha) {
   const base = trimSlash(env.HOPPER_URL);
   if (!base || hopperBreaker.open() || !SHA_RE.test(sha)) return null;
+  const max = maxBody(env);
   try {
-    const resp = await fetchTimeout(env, `${base}/api/file/${sha}`, { method: "GET", headers: authHeaders(env) }, FILE_TIMEOUT_MS, ctx);
-    if (unreachableStatus(resp.status)) {
-      hopperBreaker.fail();
-      return null;
-    }
-    if (!resp.ok) return null;
+    const buf = await fetchTimeout(
+            `${base}/api/file/${sha}`,
+      { method: "GET", headers: backendHeaders(env, ctx) },
+      FILE_TIMEOUT_MS,
+      ctx,
+      async (resp) => {
+        const len = Number(resp.headers.get("content-length"));
+        if (!resp.ok || (Number.isFinite(len) && len > max)) {
+          if (unreachableStatus(resp.status)) hopperBreaker.fail();
+          await drain(resp);
+          return null;
+        }
+        const bytes = await resp.arrayBuffer();
+        return bytes.byteLength > max ? null : bytes;
+      },
+    );
+    if (!buf) return null;
     hopperBreaker.ok();
-    const buf = await resp.arrayBuffer();
-    const got = await sha256Hex(buf);
-    return got === sha ? buf : null;
+    // Hopper is a cache, not an authority: only bytes that hash to the key we
+    // asked for are worth scanning.
+    return (await sha256Hex(buf)) === sha ? buf : null;
   } catch (err) {
     if (clientAborted(ctx)) throw err;
     hopperBreaker.fail();
@@ -378,54 +542,172 @@ async function hopperFile(env, ctx, sha) {
   }
 }
 
-async function scanPurl(env, ctx, purl) {
-  const base = trimSlash(env.SCAN_URL);
-  if (!base || scanBreaker.open()) return { unavailable: true };
-  const timeout = Number(env.SCAN_TIMEOUT_MS) || DEFAULT_SCAN_TIMEOUT_MS;
+// A scan that never reached a verdict is worth asking again: a 5xx, a 429 at
+// capacity, an edge timeout at 120s, a dropped connection — none of those are
+// answers, and a moment later they may not hold. A rejection is an answer
+// (bad bytes, unsupported type), so repeating it would only burn a slot.
+//
+// Only one of these loops runs per sample. `lookup` collapses concurrent
+// identical requests into a single flight before this is ever reached, and
+// scan de-duplicates by sha and purl across isolates, so a retry joins the
+// analysis already running rather than starting a second one — which is what
+// makes retrying an edge timeout worth doing at all.
+// Every healthy worker gets the same sample and the first real verdict wins.
+// The losers are aborted the moment it lands, which drops their connection; on
+// the scan side that releases their attachment, cancels the analysis, and frees
+// the slot, so a loser never finishes and never posts a result of its own to
+// hopper. Exactly one envelope leaves here, and it is the winner's.
+//
+// Workers start SCAN_RACE_DELAY_MS apart. At 0, the default, it is a flat race
+// and costs one analysis slot per worker per sample; raise it to give a fast
+// worker the chance to answer before the next one is ever asked.
+async function raceScan(env, ctx, ids, run) {
+  const workers = scanWorkers(env);
+  if (!workers.length) return { unavailable: true };
+  const stagger = numEnv(env, "SCAN_RACE_DELAY_MS", SCAN_RACE_DELAY_MS);
+  const t0 = Date.now();
+  const controls = workers.map(() => new AbortController());
+  const arms = workers.map((base, i) => watch(scanArm(env, ctx, ids, run, base, i * stagger, controls[i])));
+
+  const dropLosers = () => {
+    const dropped = [];
+    for (const [i, arm] of arms.entries()) {
+      if (arm.done || controls[i].signal.aborted) continue;
+      controls[i].abort();
+      dropped.push(hostOf(workers[i]));
+    }
+    return dropped;
+  };
+
+  for (;;) {
+    const won = arms.find((arm) => arm.value?.scanned?.env);
+    if (won) {
+      const dropped = dropLosers();
+      logLine("scan_race", {
+        winner: hostOf(won.value.base),
+        ms: Date.now() - t0,
+        scan_ms: won.value.scanned.ms,
+        raced: workers.length,
+        dropped: dropped.length ? dropped.join(",") : undefined,
+        ...ids,
+      });
+      return won.value.scanned;
+    }
+    if (arms.every((arm) => arm.done)) {
+      if (clientAborted(ctx)) throw new DOMException("Aborted", "AbortError");
+      const settled = arms.map((arm) => arm.value?.scanned).filter(Boolean);
+      // A rejection is a verdict about the sample; prefer it over "nobody could
+      // answer", which only says something about the workers.
+      const answer =
+        settled.find((s) => s.rejected) || settled.find((s) => s.unavailable) || settled[0] || { unavailable: true };
+      logLine("scan_race", {
+        winner: "",
+        ms: Date.now() - t0,
+        raced: workers.length,
+        outcome: answer.rejected ? "rejected" : "unavailable",
+        status: answer.status,
+        ...ids,
+      });
+      return answer;
+    }
+    await Promise.race(arms.filter((arm) => !arm.done).map((arm) => arm.settled));
+  }
+}
+
+// One worker's run at the sample, held back by `waitMs` so a staggered race
+// need not start everything at once.
+async function scanArm(env, ctx, ids, run, base, waitMs, control) {
+  const armCtx = { ...ctx, signal: mergeAbort(ctx.signal, control.signal) };
+  const worker = hostOf(base);
+  if (waitMs > 0) {
+    try {
+      await sleep(waitMs, armCtx);
+    } catch {
+      logLine("scan_arm", { worker, outcome: "never_started", ...ids });
+      return { base, scanned: { cancelled: true, worker } };
+    }
+  }
+  if (control.signal.aborted) {
+    logLine("scan_arm", { worker, outcome: "never_started", ...ids });
+    return { base, scanned: { cancelled: true, worker } };
+  }
+  const t0 = Date.now();
+  logLine("scan_arm_start", { worker, held_ms: waitMs || undefined, ...ids });
+  const scanned = await run(base, armCtx);
+  logLine("scan_arm", {
+    worker,
+    ms: Date.now() - t0,
+    scan_ms: scanned?.totalMs,
+    status: scanned?.status,
+    outcome: scanned?.env ? "answered" : scanned?.rejected ? "rejected" : "unavailable",
+    ...ids,
+  });
+  return { base, scanned };
+}
+
+async function retryScan(env, ctx, ids, run) {
+  const tries = numEnv(env, "SCAN_RETRIES", SCAN_RETRIES);
+  const base = numEnv(env, "SCAN_RETRY_BASE_MS", SCAN_RETRY_BASE_MS);
+  for (let attempt = 0; ; attempt++) {
+    const scanned = await run();
+    if (!scanned?.unavailable || attempt >= tries) return scanned;
+    // Scan reporting its own analysis timeout is a verdict about the sample:
+    // it is too slow. Running it again just spends the budget twice.
+    if (scanned.body?.timeout_secs != null) return scanned;
+    // Every worker tripped: more attempts would just burn the budget.
+    if (!scanWorkers(env).length) return scanned;
+    const wait = backoff(base, attempt, SCAN_RETRY_MAX_MS);
+    logLine("scan_retry", { attempt: attempt + 1, of: tries, status: scanned.status, wait_ms: Math.round(wait), ...ids });
+    await sleep(wait, ctx);
+  }
+}
+
+async function scanPurl(env, ctx, base, purl) {
+  const breaker = breakerFor(base);
+  if (breaker.open()) return { unavailable: true, worker: hostOf(base) };
+  const timeout = numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS);
   const start = Date.now();
   try {
-    const resp = await fetchTimeout(
-      env,
+    return await fetchTimeout(
       `${base}/analyze-purl`,
       {
         method: "POST",
-        headers: { ...authHeaders(env), "content-type": "application/json" },
+        headers: { ...backendHeaders(env, ctx), "content-type": "application/json" },
         body: JSON.stringify({ purl }),
       },
       timeout,
       ctx,
+      (resp) => readScan(resp, start, breaker, hostOf(base)),
     );
-    return await readScan(resp, start);
   } catch (err) {
     if (clientAborted(ctx)) throw err;
-    scanBreaker.fail();
-    return { unavailable: true };
+    breaker.fail();
+    return { unavailable: true, worker: hostOf(base) };
   }
 }
 
-async function scanBytes(env, ctx, bytes, filename) {
-  const base = trimSlash(env.SCAN_URL);
-  if (!base || scanBreaker.open()) return { unavailable: true };
-  const timeout = Number(env.SCAN_TIMEOUT_MS) || DEFAULT_SCAN_TIMEOUT_MS;
+async function scanBytes(env, ctx, base, bytes, filename) {
+  const breaker = breakerFor(base);
+  if (breaker.open()) return { unavailable: true, worker: hostOf(base) };
+  const timeout = numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS);
   const start = Date.now();
   try {
     const body = multipart([{ name: "file", filename: filename || "upload.bin", body: new Uint8Array(bytes) }]);
-    const resp = await fetchTimeout(
-      env,
+    return await fetchTimeout(
       `${base}/analyze`,
-      { method: "POST", headers: { ...authHeaders(env), "content-type": body.contentType }, body: body.body },
+      { method: "POST", headers: { ...backendHeaders(env, ctx), "content-type": body.contentType }, body: body.body },
       timeout,
       ctx,
+      (resp) => readScan(resp, start, breaker, hostOf(base)),
     );
-    return await readScan(resp, start);
   } catch (err) {
     if (clientAborted(ctx)) throw err;
-    scanBreaker.fail();
-    return { unavailable: true };
+    breaker.fail();
+    return { unavailable: true, worker: hostOf(base) };
   }
 }
 
-async function readScan(resp, start) {
+async function readScan(resp, start, breaker, worker) {
   const totalMs = resp.headers.get("x-total-ms");
   let body = null;
   try {
@@ -435,12 +717,12 @@ async function readScan(resp, start) {
   }
   const ms = Date.now() - start;
   if (unreachableStatus(resp.status)) {
-    scanBreaker.fail();
-    return { unavailable: true, status: resp.status, body, ms, totalMs };
+    breaker.fail();
+    return { unavailable: true, status: resp.status, body, ms, totalMs, worker };
   }
-  if (!resp.ok) return { rejected: true, status: resp.status, body, ms, totalMs };
-  scanBreaker.ok();
-  return { env: body, sha: shaFromEnvelope(body), ms, totalMs };
+  if (!resp.ok) return { rejected: true, status: resp.status, body, ms, totalMs, worker };
+  breaker.ok();
+  return { env: body, sha: shaFromEnvelope(body), ms, totalMs, worker };
 }
 
 async function hopperUpload(env, ctx, sha, bytes, filename) {
@@ -457,19 +739,20 @@ async function hopperUpload(env, ctx, sha, bytes, filename) {
     { name: "file", filename: name, body: new Uint8Array(bytes) },
   ]);
   try {
-    const resp = await fetchTimeout(
-      env,
-      `${base}/api/upload`,
-      { method: "POST", headers: { ...authHeaders(env), "content-type": body.contentType }, body: body.body },
+    const status = await fetchTimeout(
+            `${base}/api/upload`,
+      { method: "POST", headers: { ...backendHeaders(env, ctx), "content-type": body.contentType }, body: body.body },
       FILE_TIMEOUT_MS,
       ctx,
+      readStatus,
     );
-    if (unreachableStatus(resp.status)) {
+    if (unreachableStatus(status)) {
       hopperBreaker.fail();
       return false;
     }
-    if (resp.ok) hopperBreaker.ok();
-    return resp.ok;
+    const ok = status >= 200 && status < 300;
+    if (ok) hopperBreaker.ok();
+    return ok;
   } catch (err) {
     if (clientAborted(ctx)) throw err;
     hopperBreaker.fail();
@@ -481,7 +764,7 @@ async function hopperRescan(env, ctx, sha) {
   const base = trimSlash(env.HOPPER_URL);
   if (!base || hopperBreaker.open() || !SHA_RE.test(sha)) return;
   try {
-    await fetchTimeout(env, `${base}/api/rescan/${sha}`, { method: "POST", headers: authHeaders(env) }, HOPPER_RPC_MS, ctx);
+    await fetchTimeout(`${base}/api/rescan/${sha}`, { method: "POST", headers: backendHeaders(env, ctx) }, HOPPER_RPC_MS, ctx, readStatus);
   } catch (err) {
     if (clientAborted(ctx)) throw err;
   }
@@ -489,20 +772,27 @@ async function hopperRescan(env, ctx, sha) {
 
 async function waitForHopper(env, ctx, sha) {
   if (!sha || !SHA_RE.test(sha)) return null;
-  const budget = Number(env.SCAN_TIMEOUT_MS) || DEFAULT_SCAN_TIMEOUT_MS;
-  const poll = Number(env.HOPPER_POLL_MS) || HOPPER_POLL_MS;
+  const budget = numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS);
+  const poll = numEnv(env, "HOPPER_POLL_MS", HOPPER_POLL_MS);
   const deadline = Date.now() + budget;
   await hopperRescan(env, ctx, sha);
-  while (Date.now() < deadline) {
-    if (ctx && ctx.signal && ctx.signal.aborted) return null;
+  for (let attempt = 0; Date.now() < deadline; attempt++) {
+    if (clientAborted(ctx)) return null;
     const row = await hopperSample(env, ctx, { sha, bytes: null, purl: null });
-    if (row?.status === 200) return { env: await row.resp.json(), sha: row.sha || sha };
+    if (row?.status === 200) return { env: row.body, sha: row.sha || sha };
     if (row == null && hopperBreaker.open()) return null;
-    const wait = Math.min(poll, Math.max(0, deadline - Date.now()));
+    const wait = Math.min(backoff(poll, attempt, POLL_MAX_MS), Math.max(0, deadline - Date.now()));
     if (wait <= 0) break;
     await sleep(wait, ctx);
   }
   return null;
+}
+
+// Exponential with full jitter, capped: a burst of waiters on the same sample
+// spreads out instead of polling hopper in lockstep.
+function backoff(base, attempt, cap) {
+  const ceiling = Math.min(base * 2 ** Math.min(attempt, 10), cap);
+  return ceiling <= base ? base : base + Math.random() * (ceiling - base);
 }
 
 async function submitHopper(env, ctx, sha, bytes, envelope, durationMs, needUpload) {
@@ -518,25 +808,29 @@ async function submitHopper(env, ctx, sha, bytes, envelope, durationMs, needUplo
       raw: envelope.raw,
     };
     if (envelope.llm) payload.llm = envelope.llm;
-    await fetchTimeout(
-      env,
-      `${base}/api/result`,
-      {
-        method: "POST",
-        headers: { ...authHeaders(env), "content-type": "application/json" },
-        body: JSON.stringify(payload),
-      },
-      FILE_TIMEOUT_MS,
-      ctx,
-    );
+    const opts = {
+      method: "POST",
+      headers: { ...backendHeaders(env, ctx), "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    };
+    // The client already has its answer, but dropping this write costs the
+    // next caller a full re-scan, so a busy hopper is worth waiting out.
+    for (let attempt = 0; attempt < SUBMIT_TRIES; attempt++) {
+      const status = await fetchTimeout(`${base}/api/result`, opts, FILE_TIMEOUT_MS, ctx, readStatus);
+      if (!unreachableStatus(status)) return;
+      if (attempt + 1 < SUBMIT_TRIES) await sleep(backoff(SUBMIT_BASE_MS, attempt, POLL_MAX_MS), ctx);
+    }
+    logLine("submit_failed", { rid: ctx.rid, sha });
   } catch {
     // Client already has the answer.
   }
 }
 
-function authHeaders(env) {
+function backendHeaders(env, ctx) {
   const tok = (env.BEAMLINE_TOKEN || "").trim();
-  return tok ? { authorization: `Bearer ${tok}` } : {};
+  const headers = { "x-request-id": ctx.rid };
+  if (tok) headers.authorization = `Bearer ${tok}`;
+  return headers;
 }
 
 function tokenList(raw) {
@@ -544,12 +838,6 @@ function tokenList(raw) {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-}
-
-function bearerToken(request) {
-  const got = (request.headers.get("authorization") || "").trim();
-  const m = /^Bearer\s+(\S+)/i.exec(got);
-  return m ? m[1] : "";
 }
 
 function clientAborted(ctx) {
@@ -569,15 +857,20 @@ function bloomStub(env, sha, purl) {
 
 function envelopeResponse(env, envelope, sha, source, maxAge, totalMs, purl) {
   const view = customerView(envelope, sha, purl);
-  const scope = (env.BEAMLINE_TOKEN || "").trim() ? "private" : "public";
   const headers = {
     "content-type": "application/json",
-    "cache-control": `${scope}, max-age=${maxAge}`,
+    "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
     "x-beamline-source": source,
   };
   if (view.sha) headers["x-sha256"] = view.sha;
   if (totalMs != null && totalMs !== "") headers["x-total-ms"] = String(totalMs);
   return new Response(JSON.stringify(view), { status: 200, headers });
+}
+
+// Authenticated answers are private to everything between us and the client.
+// Our own cache is a different matter — see serveHit.
+function cacheScope(env) {
+  return (env.BEAMLINE_TOKEN || "").trim() ? "private" : "public";
 }
 
 function customerView(envelope, sha, purl) {
@@ -645,29 +938,6 @@ function identPkg(f) {
   return ident.version ? `${ident.name}@${ident.version}` : ident.name;
 }
 
-function maybeGzip(request, res) {
-  if (typeof CompressionStream !== "function") return res;
-  const ae = (request.headers.get("accept-encoding") || "").toLowerCase();
-  if (!ae.split(",").some((p) => p.trim().startsWith("gzip"))) return res;
-  if (res.headers.get("content-encoding")) return res;
-  if (!res.body) return res;
-  const headers = new Headers(res.headers);
-  headers.set("content-encoding", "gzip");
-  headers.delete("content-length");
-  headers.append("vary", "accept-encoding");
-  return new Response(res.body.pipeThrough(new CompressionStream("gzip")), { status: res.status, headers });
-}
-
-function scanError(scanned) {
-  return scanClientResponse(scanned.status || 400, scanned);
-}
-
-function scanUnavailable(scanned) {
-  if (scanned.status === 504) return scanClientResponse(504, scanned);
-  if (scanned.status === 429) return scanClientResponse(429, scanned);
-  return json({ error: "unavailable" }, 503);
-}
-
 function scanClientResponse(status, scanned) {
   const src = scanned.body && typeof scanned.body === "object" ? scanned.body : {};
   const body = {
@@ -685,14 +955,9 @@ function shaFromEnvelope(body) {
   return typeof sha === "string" ? sha.toLowerCase() : "";
 }
 
-async function readBody(request, maxBytes) {
-  const buf = await request.arrayBuffer();
-  if (buf.byteLength > maxBytes) return buf;
-  return buf.byteLength ? buf : null;
-}
-
 function multipart(fields) {
-  const boundary = "----beamline-" + Math.random().toString(16).slice(2);
+  // Random enough that no artifact can contain its own boundary by accident.
+  const boundary = `----beamline-${crypto.randomUUID()}`;
   const enc = new TextEncoder();
   const chunks = [];
   let len = 0;
@@ -727,7 +992,13 @@ async function sha256Hex(buf) {
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function fetchTimeout(env, url, opts, ms, ctx) {
+// Hopper and scan are reached over ordinary fetch: each sits behind a
+// Cloudflare Tunnel with a public hostname, so the edge does the routing.
+//
+// `read` runs inside the timeout and the client's abort, because a backend
+// that sends headers promptly can still stall mid-body. Nothing may touch the
+// Response after fetchTimeout returns.
+async function fetchTimeout(url, opts, ms, ctx, read) {
   const ac = new AbortController();
   const outer = ctx && ctx.signal;
   if (outer && outer.aborted) {
@@ -737,21 +1008,25 @@ async function fetchTimeout(env, url, opts, ms, ctx) {
   if (outer) outer.addEventListener("abort", onAbort, { once: true });
   const t = setTimeout(() => ac.abort(), ms);
   try {
-    return await backendFetch(env, url, { ...opts, signal: ac.signal });
+    return await read(await fetch(url, { ...opts, signal: ac.signal }));
   } finally {
     clearTimeout(t);
     if (outer) outer.removeEventListener("abort", onAbort);
   }
 }
 
-// Hopper and scan sit on a private network. On Cloudflare, TUNNEL is a
-// Workers VPC binding to a Cloudflare Tunnel; fetch then goes through
-// that tunnel. Off Cloudflare (node local.js, tests) TUNNEL is absent
-// and this is ordinary fetch.
-function backendFetch(env, url, opts) {
-  const tunnel = env && env.TUNNEL;
-  if (tunnel && typeof tunnel.fetch === "function") return tunnel.fetch(url, opts);
-  return fetch(url, opts);
+// A body nobody reads pins its connection until the collector notices.
+async function readStatus(resp) {
+  await drain(resp);
+  return resp.status;
+}
+
+async function drain(resp) {
+  try {
+    await resp.body?.cancel();
+  } catch {
+    // The peer is gone; the connection is going away with it.
+  }
 }
 
 async function getCache(env) {
@@ -778,7 +1053,7 @@ function memoryCache() {
       }
       map.delete(id);
       map.set(id, row);
-      return new Response(row.body, { status: 200, headers: row.headers });
+      return new Response(row.body, { status: row.status, headers: row.headers });
     },
     async put(req, res) {
       const cc = res.headers.get("cache-control") || "";
@@ -787,6 +1062,7 @@ function memoryCache() {
       while (map.size >= MEMORY_CACHE_MAX) map.delete(map.keys().next().value);
       map.set(cacheId(req), {
         body: await res.clone().arrayBuffer(),
+        status: res.status,
         headers: [...res.headers],
         exp: Date.now() + maxAge * 1000,
       });
@@ -798,18 +1074,22 @@ function cacheId(req) {
   return typeof req === "string" ? req : req.url;
 }
 
-async function putCache(cache, key, res) {
-  await cache.put(key, res.clone());
-}
-
 function serveHit(ctx, cache, cacheKey, res) {
-  waitUntil(ctx, putCache(cache, cacheKey, res.clone()));
+  const copy = res.clone();
+  // Cloudflare will not store a `private` response, which would silently leave
+  // every token-protected deployment with no cache at all. Our cache sits
+  // behind the 401 and every valid token gets the same answer, so the stored
+  // copy drops the directive that the client's copy keeps.
+  const cc = copy.headers.get("cache-control") || "";
+  if (cc.startsWith("private")) copy.headers.set("cache-control", cc.replace("private", "public"));
+  // A cache that throws, synchronously or not, must not fail the lookup.
+  waitUntil(ctx, Promise.resolve().then(() => cache.put(cacheKey, copy)));
   return res;
 }
 
 function waitUntil(ctx, p) {
   const q = Promise.resolve(p).catch((err) => {
-    logLine("wait_error", { err: String(err && err.message ? err.message : err) });
+    logLine("wait_error", { err: errText(err) });
   });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(q);
 }
@@ -818,11 +1098,15 @@ function mergeAbort(a, b) {
   if (!a) return b;
   if (!b) return a;
   const ac = new AbortController();
-  const fwd = () => ac.abort();
   if (a.aborted || b.aborted) {
     ac.abort();
     return ac.signal;
   }
+  const fwd = () => {
+    a.removeEventListener("abort", fwd);
+    b.removeEventListener("abort", fwd);
+    ac.abort();
+  };
   a.addEventListener("abort", fwd, { once: true });
   b.addEventListener("abort", fwd, { once: true });
   return ac.signal;
@@ -834,8 +1118,20 @@ function numEnv(env, key, fallback) {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-function idFields(input) {
-  const out = {};
+function cleanId(s) {
+  return String(s || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 64);
+}
+
+function errText(err) {
+  return String((err && err.message) || err);
+}
+
+function maxBody(env) {
+  return Number(env.MAX_BYTES) || DEFAULT_MAX_BYTES;
+}
+
+function idFields(ctx, input) {
+  const out = { rid: ctx.rid };
   if (input && input.sha) out.sha = input.sha;
   if (input && input.purl) out.purl = input.purl;
   return out;
@@ -851,6 +1147,36 @@ function logLine(event, fields) {
     console.log(JSON.stringify(row));
   } catch {
     // Logging must never fail a lookup.
+  }
+}
+
+function breakerFor(base) {
+  let breaker = scanBreakers.get(base);
+  if (!breaker) {
+    breaker = makeBreaker();
+    scanBreakers.set(base, breaker);
+  }
+  return breaker;
+}
+
+// SCAN_URL is one URL or a comma-separated list of interchangeable workers.
+function urlList(raw) {
+  return tokenList(raw).map(trimSlash).filter(Boolean);
+}
+
+// Workers worth asking right now. Empty means every one of them is tripped,
+// and the caller should fail fast rather than pile on.
+function scanWorkers(env) {
+  return urlList(env.SCAN_URL).filter((base) => !breakerFor(base).open());
+}
+
+// Host only: enough to tell workers apart in a log line, without spilling the
+// full internal URL into every record.
+function hostOf(base) {
+  try {
+    return new URL(base).host;
+  } catch {
+    return base;
   }
 }
 
@@ -882,31 +1208,28 @@ function json(obj, status) {
   });
 }
 
+// Jittered: a flat Retry-After brings every client parked during an incident
+// back in the same second, forever.
 function pending() {
+  const secs = RETRY_AFTER_MIN_S + Math.floor(Math.random() * (RETRY_AFTER_MAX_S - RETRY_AFTER_MIN_S + 1));
   return new Response(JSON.stringify({ state: "pending" }), {
     status: 202,
-    headers: { "content-type": "application/json", "retry-after": "5" },
+    headers: { "content-type": "application/json", "retry-after": String(secs) },
   });
 }
 
 function sleep(ms, ctx) {
+  const outer = ctx && ctx.signal;
+  if (outer && outer.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
   return new Promise((resolve, reject) => {
-    const t = setTimeout(resolve, ms);
-    const outer = ctx && ctx.signal;
-    if (!outer) return;
-    if (outer.aborted) {
+    const settle = (fn, arg) => {
       clearTimeout(t);
-      reject(new DOMException("Aborted", "AbortError"));
-      return;
-    }
-    outer.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(t);
-        reject(new DOMException("Aborted", "AbortError"));
-      },
-      { once: true },
-    );
+      if (outer) outer.removeEventListener("abort", onAbort);
+      fn(arg);
+    };
+    const onAbort = () => settle(reject, new DOMException("Aborted", "AbortError"));
+    const t = setTimeout(() => settle(resolve), ms);
+    if (outer) outer.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -937,7 +1260,7 @@ export const _test = {
   numEnv,
   reset() {
     hopperBreaker.reset();
-    scanBreaker.reset();
+    scanBreakers.clear();
     inflight.clear();
     getCache.memory = null;
     logLine.mute = false;

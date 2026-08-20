@@ -63,11 +63,14 @@ artifact. `pkg` is the component. `desc` is one line.
 X-SHA256: …                              same as body.sha
 X-Beamline-Source: cache|bloom|hopper|scan
 Cache-Control: public, max-age=…         private if authenticated
-Content-Encoding: gzip                   if requested
-Retry-After: 5                           on 202
+Content-Encoding: gzip                   applied by the edge, if requested
+Retry-After: 3-8                         on 202, jittered
 ```
 
 `X-Beamline-Source` is for operators. Do not branch on it.
+
+Every request carries an `X-Request-Id`, taken from `CF-Ray` when present, into
+hopper and scan and onto every log line. Send your own to correlate with ours.
 
 ## Errors
 
@@ -79,7 +82,7 @@ Retry-After: 5                           on 202
 
 | code | |
 | --- | --- |
-| 202 | `{"state":"pending"}`. Honor `Retry-After`. |
+| 202 | `{"state":"pending"}`. Honor `Retry-After`; it is jittered, so do not pin it. The analysis is still running and the retry is usually cheap. |
 | 400 | Bad sha256 or PURL. |
 | 401 | Bad bearer token. |
 | 413 | Too large. |
