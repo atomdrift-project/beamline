@@ -26,6 +26,7 @@ const SCAN_RETRIES = 5;
 const SCAN_RETRY_BASE_MS = 1_000;
 const SCAN_RETRY_MAX_MS = 30_000;
 const SCAN_RACE_DELAY_MS = 0;
+const EDGE_TIMEOUT = 524;
 const HOLD_MS = 10_000;
 const MISS_MAX_AGE = 60;
 const RETRY_AFTER_MIN_S = 3;
@@ -714,7 +715,17 @@ async function scanArm(env, ctx, ids, run, base, waitMs, control) {
   }
   const t0 = Date.now();
   logLine("scan_arm_start", { worker, held_ms: waitMs || undefined, ...ids });
-  const scanned = await run(base, armCtx);
+  let scanned;
+  try {
+    scanned = await run(base, armCtx);
+  } catch (err) {
+    // Dropped mid-request because another worker answered first. Report how
+    // far behind it was: that margin is the whole picture of which worker is
+    // slow, and it is invisible if a loser just disappears.
+    if (!control.signal.aborted) throw err;
+    logLine("scan_arm", { worker, ms: Date.now() - t0, outcome: "dropped", ...ids });
+    return { base, scanned: { cancelled: true, worker } };
+  }
   logLine("scan_arm", {
     worker,
     ms: Date.now() - t0,
@@ -732,9 +743,15 @@ async function retryScan(env, ctx, ids, run) {
   for (let attempt = 0; ; attempt++) {
     const scanned = await run();
     if (!scanned?.unavailable || attempt >= tries) return scanned;
-    // Scan reporting its own analysis timeout is a verdict about the sample:
-    // it is too slow. Running it again just spends the budget twice.
-    if (scanned.body?.timeout_secs != null) return scanned;
+    // Two of these are verdicts about the sample rather than accidents, and
+    // asking again only spends the budget twice:
+    //   - scan's own 504, meaning it gave up on this sample as too slow;
+    //   - a 524, meaning the edge stopped waiting. Cloudflare tears the origin
+    //     connection down at that point, which scan reads as a client hangup
+    //     and cancels on, so a retry restarts the whole analysis on every
+    //     worker and walks into the same ceiling. Measured against two live
+    //     workers: 125s, 524, retry, 125s, 524.
+    if (scanned.body?.timeout_secs != null || scanned.status === EDGE_TIMEOUT) return scanned;
     // Every worker tripped: more attempts would just burn the budget.
     if (!scanWorkers(env).length) return scanned;
     const wait = backoff(base, attempt, SCAN_RETRY_MAX_MS);

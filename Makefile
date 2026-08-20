@@ -15,6 +15,9 @@ DRAIN_S     ?= 5
 STRESS_OUT  ?=
 BEAMLINE_URL ?=
 BEAMLINE_TOKEN ?=
+HOLD_MS ?=
+SCAN_RACE_DELAY_MS ?=
+SCAN_RETRIES ?=
 
 .PHONY: lint test stress-test deploy-cf
 
@@ -43,6 +46,7 @@ stress-test:
 	  else \
 	    echo "starting beamline on :$(PORT)"; \
 	    SCAN_URL="$(SCAN_URL)" HOPPER_URL="$(HOPPER_URL)" PORT="$(PORT)" BEAMLINE_TOKEN="$(BEAMLINE_TOKEN)" \
+	      HOLD_MS="$(HOLD_MS)" SCAN_RACE_DELAY_MS="$(SCAN_RACE_DELAY_MS)" SCAN_RETRIES="$(SCAN_RETRIES)" \
 	      node local.js & started=$$!; \
 	    i=0; \
 	    while [ $$i -lt 25 ]; do \

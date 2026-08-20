@@ -14,13 +14,24 @@ const MAX_BYTES = Number(process.env.MAX_BYTES) || 16 * 1024 * 1024;
 // memory ceiling — 512MB at the defaults. Raise them together, or not at all.
 const MAX_INFLIGHT = Number(process.env.MAX_INFLIGHT) || 32;
 
-const env = {
-  HOPPER_URL: process.env.HOPPER_URL || "",
-  SCAN_URL: process.env.SCAN_URL || "",
-  BEAMLINE_TOKEN: process.env.BEAMLINE_TOKEN || "",
-  MAX_BYTES: process.env.MAX_BYTES || "",
-  SCAN_TIMEOUT_MS: process.env.SCAN_TIMEOUT_MS || "",
-};
+// Every knob beamline.js reads, so a local run is tunable the same way a
+// deployed Worker is. Anything absent falls back to the built-in default.
+const TUNABLES = [
+  "HOPPER_URL",
+  "SCAN_URL",
+  "BEAMLINE_TOKEN",
+  "MAX_BYTES",
+  "SCAN_TIMEOUT_MS",
+  "HOLD_MS",
+  "HOPPER_HEDGE_MS",
+  "HOPPER_LOOKUP_MS",
+  "HOPPER_POLL_MS",
+  "SCAN_RETRIES",
+  "SCAN_RETRY_BASE_MS",
+  "SCAN_RACE_DELAY_MS",
+];
+
+const env = Object.fromEntries(TUNABLES.map((k) => [k, process.env[k] || ""]));
 
 // Workaround, not design. On Node 26 fetch does not dispatch a second
 // concurrent request to a backend until the event loop wakes, costing a hedged

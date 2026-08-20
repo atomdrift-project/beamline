@@ -1698,7 +1698,7 @@ test("a scan that never reached a verdict is retried until it does", async () =>
       calls += 1;
       if (calls === 1) return { status: 503, body: { error: "unavailable" } };
       if (calls === 2) return { status: 429, body: { error: "At capacity (4/4 active analyses)" } };
-      if (calls === 3) return { status: 524, body: { error: "edge timeout" } };
+      if (calls === 3) return { status: 502, body: { error: "bad gateway" } };
       return envelope(HELLO_SHA, { eng: "eventually" });
     },
   });
@@ -2002,6 +2002,26 @@ test("bloom is raced and the first answer wins, slow worker dropped", async () =
     assert.equal(hopper.hits.sample, 0, "a skip must not reach hopper");
   } finally {
     await Promise.all([hopper.close(), quick.close(), sluggish.close()]);
+  }
+});
+
+test("an edge timeout is not retried into the same ceiling", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }), HOPPER_POLL_MS: "5" });
+  // What Cloudflare returns when the origin outruns its proxy read timeout.
+  const stalled = await mockBackend({ bloom: "unknown", analyze: () => ({ status: 524, body: { error: "origin timeout" } }) });
+  const env = testEnv(hopper.url, { SCAN_URL: stalled.url, SCAN_TIMEOUT_MS: "60" });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(new Request("http://beamline/", { method: "POST", body: HELLO }), env, ctx.ctx);
+    // Straight to the hopper queue instead of a retry storm: pending, not a
+    // quarter hour of re-analysis.
+    assert.equal(res.status, 202);
+    assert.deepEqual(await res.json(), { state: "pending" });
+    // Retrying costs a full analysis per worker and hits the same wall.
+    assert.equal(stalled.hits.analyze, 1);
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), stalled.close()]);
   }
 });
 
