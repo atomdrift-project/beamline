@@ -243,7 +243,7 @@ async function fetchGo(limit) {
 }
 
 async function submit(item) {
-  const url = `${beamlineUrl}/?purl=${encodeURIComponent(item.purl)}`;
+  const url = `${beamlineUrl}/purl/${encodeURIComponent(item.purl)}`;
   const headers = { "accept-encoding": "gzip" };
   if (token) headers.authorization = `Bearer ${token}`;
   const t0 = Date.now();

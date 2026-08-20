@@ -231,7 +231,7 @@ test("PURL miss posts /analyze-purl", async () => {
   const ctx = waitCtx();
   try {
     const res = await handle(
-      new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"),
+      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       ctx.ctx,
     );
@@ -299,7 +299,7 @@ test("hopper down still scans a PURL", async () => {
   const env = testEnv(backend.url, { HOPPER_URL: DEAD });
   try {
     const res = await handle(
-      new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"),
+      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       waitCtx().ctx,
     );
@@ -332,7 +332,7 @@ test("PURL hopper miss with scan down is 503, not a miss", async () => {
   const env = testEnv(backend.url, { SCAN_URL: DEAD });
   try {
     const res = await handle(
-      new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"),
+      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       noopCtx(),
     );
@@ -435,6 +435,25 @@ test("unknown route is 404 not found", async () => {
   const res = await handle(new Request("http://beamline/analyze"), {}, {});
   assert.equal(res.status, 404);
   assert.equal((await res.json()).error, "not found");
+});
+
+test("query purl is not a route", async () => {
+  const res = await handle(new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"), {}, {});
+  assert.equal(res.status, 404);
+});
+
+test("multipart POST is 415", async () => {
+  const res = await handle(
+    new Request("http://beamline/", {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data; boundary=x" },
+      body: "--x--",
+    }),
+    {},
+    {},
+  );
+  assert.equal(res.status, 415);
+  assert.equal((await res.json()).error, "unsupported media type");
 });
 
 test("hopper miss without bytes is unknown sample", async () => {
@@ -645,7 +664,7 @@ test("hedged PURL: slow hopper 200 beats analyze-purl and does not submit", asyn
   const ctx = waitCtx();
   try {
     const res = await handle(
-      new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"),
+      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       ctx.ctx,
     );
@@ -676,7 +695,7 @@ test("hedged PURL: scan wins if hopper stays silent", async () => {
   try {
     const t0 = Date.now();
     const res = await handle(
-      new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"),
+      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       ctx.ctx,
     );
@@ -1194,7 +1213,7 @@ test("scan 400 on a PURL passes through, not 404", async () => {
   });
   const env = testEnv(backend.url);
   try {
-    const res = await handle(new Request("http://beamline/?purl=not-a-purl"), env, noopCtx());
+    const res = await handle(new Request("http://beamline/purl/not-a-purl"), env, noopCtx());
     assert.equal(res.status, 400);
     assert.equal((await res.json()).error, "not a package URL");
     assert.equal(backend.hits.analyze, 0);
@@ -1215,7 +1234,7 @@ test("scan 504 without hopper bytes is a timeout, not unavailable", async () => 
   const env = testEnv(backend.url);
   try {
     const res = await handle(
-      new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"),
+      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       noopCtx(),
     );
@@ -1238,7 +1257,7 @@ test("scan 429 without hopper bytes passes through", async () => {
   const env = testEnv(backend.url);
   try {
     const res = await handle(
-      new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"),
+      new Request("http://beamline/purl/pkg%3Anpm%2Fleft-pad%401.3.0"),
       env,
       noopCtx(),
     );

@@ -62,10 +62,10 @@ async function dispatch(request, env, ctx) {
       if (!SHA_RE.test(sha)) return json({ error: "invalid sha256" }, 400);
       return await lookup(env, ctx, url.origin, { sha, bytes: null, purl: null });
     }
-    if (request.method === "GET" && (url.pathname.startsWith("/purl/") || url.searchParams.has("purl"))) {
+    if (request.method === "GET" && url.pathname.startsWith("/purl/")) {
       let purl;
       try {
-        purl = url.searchParams.get("purl") || decodeURIComponent(url.pathname.slice("/purl/".length));
+        purl = decodeURIComponent(url.pathname.slice("/purl/".length));
       } catch {
         return json({ error: "invalid purl" }, 400);
       }
@@ -80,14 +80,18 @@ async function dispatch(request, env, ctx) {
 }
 
 async function handlePost(request, env, ctx, url) {
+  const ct = (request.headers.get("content-type") || "").toLowerCase();
+  if (ct.includes("multipart/") || ct.includes("application/x-www-form-urlencoded")) {
+    return json({ error: "unsupported media type" }, 415);
+  }
   const maxBytes = Number(env.MAX_BYTES) || DEFAULT_MAX_BYTES;
   const cl = Number(request.headers.get("content-length"));
   if (Number.isFinite(cl) && cl > maxBytes) return json({ error: "too large" }, 413);
-  const { bytes, filename } = await readBody(request, maxBytes);
+  const bytes = await readBody(request, maxBytes);
   if (!bytes) return json({ error: "empty body" }, 400);
   if (bytes.byteLength > maxBytes) return json({ error: "too large" }, 413);
   const sha = await sha256Hex(bytes);
-  return await lookup(env, ctx, url.origin, { sha, bytes, purl: null, filename });
+  return await lookup(env, ctx, url.origin, { sha, bytes, purl: null, filename: "upload.bin" });
 }
 
 async function lookup(env, ctx, origin, input) {
@@ -682,17 +686,9 @@ function shaFromEnvelope(body) {
 }
 
 async function readBody(request, maxBytes) {
-  const ct = (request.headers.get("content-type") || "").toLowerCase();
-  if (ct.includes("multipart/form-data")) {
-    const form = await request.formData();
-    const file = form.get("file") || [...form.values()].find((v) => v && typeof v.arrayBuffer === "function");
-    if (!file || typeof file.arrayBuffer !== "function") return { bytes: null, filename: "" };
-    const buf = await file.arrayBuffer();
-    return { bytes: buf, filename: file.name || "upload.bin" };
-  }
   const buf = await request.arrayBuffer();
-  if (buf.byteLength > maxBytes) return { bytes: buf, filename: "upload.bin" };
-  return { bytes: buf.byteLength ? buf : null, filename: "upload.bin" };
+  if (buf.byteLength > maxBytes) return buf;
+  return buf.byteLength ? buf : null;
 }
 
 function multipart(fields) {

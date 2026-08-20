@@ -1,22 +1,18 @@
 # Beamline API
 
-Ask about a package or a file. Get a number, and if it is hostile, a short
-list of why. That is the whole interface.
-
 ```
 GET  /healthz
 GET  /sha256/{64hex}
-GET  /purl/{purl}          also ?purl=
-POST /                     raw bytes, or multipart field `file`
+GET  /purl/{purl}
+POST /
 ```
 
-Same JSON on every 200. Send `Accept-Encoding: gzip` if you want it compressed.
-If `BEAMLINE_TOKEN` is set, send `Authorization: Bearer …` on every route except
-`/healthz`.
+`POST /` is the raw file. Encode the PURL in the path.
+
+If `BEAMLINE_TOKEN` is set, every route except `/healthz` requires
+`Authorization: Bearer …`.
 
 ## 200
-
-Clean:
 
 ```json
 {
@@ -27,8 +23,7 @@ Clean:
 }
 ```
 
-`purl` is omitted when unknown. `eng` is the scanner build — enough to file a
-ticket.
+`purl` is omitted when unknown. `eng` is the scanner build.
 
 Hostile:
 
@@ -51,69 +46,46 @@ Hostile:
 }
 ```
 
-Empty strings are omitted, not sent.
+Empty strings are omitted.
 
-### `lvl`
+`lvl` is the tightest false-positive budget per 100 million at which the
+sample is hostile. Lower is worse. `-1` never fires. Gate on `lvl`.
 
-The tightest false-positive budget (per 100 million) at which this sample is
-hostile. Lower is worse. `-1` means it never fires.
+`hits` is present only when `lvl != -1`. At most three. `crit` is 3 notable,
+4 suspicious, 5 hostile. `id` is stable. `file` is the path inside the
+artifact. `pkg` is the component. `desc` is one line.
 
-A typical gate is `lvl != -1 && lvl <= 50`. Do not invent a second threshold
-from other fields; there aren't any.
-
-### `hits`
-
-Present only when `lvl != -1`. At most three. Only notable or worse
-(`crit` 3, 4, or 5).
-
-| field | meaning |
-| --- | --- |
-| `id` | Stable finding id. Use it as a check id. |
-| `crit` | 3 notable, 4 suspicious, 5 hostile. |
-| `file` | Path inside the artifact. Nested members are the inner path. |
-| `pkg` | Package the finding belongs to (PURL when we have one). |
-| `desc` | One line a developer can read. |
-
-### `why`
-
-Optional. One sentence from the interpreter, when we have it. A PR comment.
-If it is absent, the hits are the why.
+`why` is one sentence from the interpreter, when we have it.
 
 ## Headers
 
 ```
 X-SHA256: …                              same as body.sha
 X-Beamline-Source: cache|bloom|hopper|scan
-Cache-Control: public, max-age=…         private if you authenticated
-Content-Encoding: gzip                   if you asked
+Cache-Control: public, max-age=…         private if authenticated
+Content-Encoding: gzip                   if requested
 Retry-After: 5                           on 202
 ```
 
 `X-Beamline-Source` is for operators. Do not branch on it.
 
-## Not 200
+## Errors
 
 ```json
 { "error": "unknown sample" }
 ```
 
-`detail` is included only when it adds a chain the status code does not.
+`detail` is included only when it adds something the status does not.
 
-| code | meaning |
+| code | |
 | --- | --- |
-| 202 | Queued. Body is `{"state":"pending"}`. Honor `Retry-After`. |
+| 202 | `{"state":"pending"}`. Honor `Retry-After`. |
 | 400 | Bad sha256 or PURL. |
 | 401 | Bad bearer token. |
-| 413 | Body too large. |
-| 415 / 422 | We have the bytes and cannot analyze them. |
-| 404 | No such route, or this sha is unknown and we have nothing to fetch. |
-| 429 / 503 / 504 | Capacity, down, or timed out. |
-
-## Mapping
-
-Semgrep: `check_id=id`, `path=file`, `message=why or desc`, severity from `crit`,
-fingerprint `sha+id`, `metadata.package=pkg`, gate on `lvl`.
-
-Chainguard: `GET /sha256/…` or `/purl/…`. `lvl == -1` means ship it.
-
-NetRise: `file` is the nested path; `pkg` is the component; three hits is the cap.
+| 413 | Too large. |
+| 415 | Body we will not accept. |
+| 422 | Bytes we cannot analyze. |
+| 404 | No such route or sample. |
+| 429 | At capacity. |
+| 503 | Unavailable. |
+| 504 | Timed out. |
