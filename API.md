@@ -4,11 +4,33 @@
 GET  /healthz            (also /_/health)
 GET  /lookup?sha256={64hex}
 GET  /lookup?purl={purl}
-POST /
+POST /analyze                            the artifact as the raw body
+POST /analyze?sha256={64hex}             no body: fetched from hopper
+POST /analyze?purl={purl}                no body: resolved by scan
 ```
 
-`POST /` is the raw file. `/lookup` takes exactly one key — both together, or
+`/lookup` reports what is already known and never spends an analysis slot; a
+key nothing holds is a 404. It takes exactly one key — both together, or
 neither, is a 400.
+
+`/analyze` is the route that may analyze. Send the artifact as the raw body
+and neither key is needed: the digest is computed from the bytes. Send
+`sha256` as well and it is checked — a mismatch is a 400, which is how a
+truncated upload is caught. The digest is never taken on trust; a verdict
+filed under a key the caller chose rather than one the bytes produce would
+poison this cache, scan's, and hopper's at once.
+
+The body is optional. Without it, name a key: `sha256` fetches the artifact
+from hopper, `purl` has scan resolve it against the registry. Both are a round
+trip slower than sending the bytes, and hopper cannot serve an artifact it has
+never seen. With no body and no key there is nothing to work from, which is a
+400.
+
+A `multipart/` or `application/x-www-form-urlencoded` body is a 415, checked
+before the keys, so send `Content-Type: application/octet-stream`.
+
+`purl` on `/analyze` is a hint rather than a second key: it lets scan graft
+registry provenance onto the report, and it is echoed in each hit's `pkg`.
 
 The `pkg:` prefix is optional and the scheme and type are case-folded, so
 `npm/left-pad@1.3.0` and `PKG:NPM/left-pad@1.3.0` are the same key. The rest of
@@ -18,8 +40,8 @@ Both keys travel as query parameters. A PURL's own grammar carries `?` and
 `#`, and in a path segment everything from a raw `?` is parsed as the URL's
 query string while a `#subpath` never leaves the client — a qualified PURL
 would silently become a different one. `GET /sha256/{64hex}` and
-`GET /purl/{purl}` were the earlier spelling of this route and no longer
-answer.
+`GET /purl/{purl}` were the earlier spelling of this route, and `POST /` of
+the upload; none of the three answer any more.
 
 If `BEAMLINE_TOKEN` is set, every route except the health checks requires
 `Authorization: Bearer …`.
@@ -111,6 +133,7 @@ hopper and scan and onto every log line. Send your own to correlate with ours.
 | 415 | Body we will not accept. |
 | 422 | Bytes we cannot analyze. |
 | 404 | No such route or sample. |
+| 405 | Right route, wrong method. `Allow` names the one that works: `/lookup` is GET, `/analyze` is POST. |
 | 429 | At capacity. |
 | 503 | Unavailable. |
 | 504 | Timed out. |

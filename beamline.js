@@ -68,7 +68,8 @@ async function dispatch(request, env, ctx) {
   const url = new URL(request.url);
   // /_/health is the name every service in this stack answers to; /healthz
   // stays because the Makefile and the stress harness probe it.
-  if ((url.pathname === "/healthz" || url.pathname === "/_/health") && request.method === "GET") {
+  if (url.pathname === "/healthz" || url.pathname === "/_/health") {
+    if (request.method !== "GET") return methodNotAllowed("GET");
     return json({ status: "ok" }, 200);
   }
 
@@ -79,14 +80,15 @@ async function dispatch(request, env, ctx) {
     if (!allowed.some((t) => tokenEq(got, t))) {
       return json({ error: "unauthorized" }, 401);
     }
-    env = { ...env, BEAMLINE_TOKEN: got };
   }
 
   try {
-    if (request.method === "POST" && url.pathname === "/analyze") {
+    if (url.pathname === "/analyze") {
+      if (request.method !== "POST") return methodNotAllowed("POST");
       return await handleAnalyze(request, env, ctx, url);
     }
-    if (request.method === "GET" && url.pathname === "/lookup") {
+    if (url.pathname === "/lookup") {
+      if (request.method !== "GET") return methodNotAllowed("GET");
       const sha = (url.searchParams.get("sha256") || "").trim();
       const purl = (url.searchParams.get("purl") || "").trim();
       if (!!sha === !!purl) {
@@ -111,12 +113,12 @@ async function lookupKey(env, ctx, origin, sha, purl) {
   if (sha) {
     const hex = sha.trim().toLowerCase();
     if (!SHA_RE.test(hex)) return json({ error: "invalid sha256" }, 400);
-    return lookup(env, ctx, origin, { sha: hex, bytes: null, purl: null });
+    return lookup(env, ctx, origin, { sha: hex, bytes: null, purl: null, analyze: false });
   }
   // Anything non-empty goes upstream: scan decides what is a PURL.
   const canonical = normalizePurl(purl);
   if (!canonical) return json({ error: "missing purl" }, 400);
-  return lookup(env, ctx, origin, { sha: null, bytes: null, purl: canonical });
+  return lookup(env, ctx, origin, { sha: null, bytes: null, purl: canonical, analyze: false });
 }
 
 // `pkg:` is optional, as it is on scan's own routes, and the scheme and type
@@ -139,19 +141,27 @@ function normalizePurl(raw) {
 
 // POST /analyze?sha256=…&purl=… with the artifact as the raw body.
 //
-// The sha rides in the query string so it arrives with the request line, ahead
-// of a single byte of body: the lookup race starts against hopper and every
-// scan worker while the upload is still streaming, and a hit answers without
-// the bytes ever mattering. `purl` is an optional hint that lets scan graft
-// registry provenance onto the report.
+// Both query parameters are optional when a body is present: the digest is
+// derived from the bytes. Scan is the tier that requires one, and it gets the
+// derived value, so a caller holding an artifact can simply send it. A caller
+// that already knows the digest may still send it and have it checked.
+// `purl` is a hint that lets scan graft registry provenance onto the report.
 //
-// The body is optional. Without it the artifact is fetched from hopper
+// The body is optional too. Without it the artifact is fetched from hopper
 // instead — correct, but a round trip slower. Sending the bytes is the fast
 // path, and the only path that works for something hopper has never seen.
+// With no body, a key must be named: there is nothing to derive one from.
+//
+// The body is read in full before the lookup race starts. Keeping the digest
+// in the query string would let the race begin while the upload streams — a
+// cached 16MB artifact could answer before its bytes finished arriving — but
+// nothing here does that today, and a caller need not hash anything to get an
+// answer. Reviving that would mean racing on the claimed digest and landing
+// the verification when the body completes.
 async function handleAnalyze(request, env, ctx, url) {
-  const sha = (url.searchParams.get("sha256") || "").trim().toLowerCase();
-  if (!SHA_RE.test(sha)) return json({ error: "invalid sha256" }, 400);
+  const claimed = (url.searchParams.get("sha256") || "").trim().toLowerCase();
   const purl = normalizePurl(url.searchParams.get("purl") || "");
+  if (claimed && !SHA_RE.test(claimed)) return json({ error: "invalid sha256" }, 400);
 
   const ct = (request.headers.get("content-type") || "").toLowerCase();
   if (ct.includes("multipart/") || ct.includes("application/x-www-form-urlencoded")) {
@@ -165,16 +175,36 @@ async function handleAnalyze(request, env, ctx, url) {
   if (body.byteLength > maxBytes) return json({ error: "too large" }, 413);
   const bytes = body.byteLength ? body : null;
 
-  // Bytes that do not hash to the sha they claim must never be analyzed. The
-  // verdict would be filed under the wrong key in beamline's cache, in every
-  // scan worker's cache, and in hopper — three tiers poisoned at once, and
-  // every later honest lookup for that sha would get this answer.
-  if (bytes && (await sha256Hex(bytes)) !== sha) {
-    logLine("sha_mismatch", { rid: ctx.rid, sha, bytes: bytes.byteLength });
-    return json({ error: "body does not match sha256" }, 400);
+  // The digest of an upload is derived here, never taken on trust. A verdict
+  // filed under a key the caller chose rather than one the bytes produce would
+  // poison beamline's cache, every scan worker's cache, and hopper at once, and
+  // every later honest lookup for that sha would get the planted answer.
+  // Deriving it also means a caller holding the artifact need not hash it
+  // first; scan still requires a digest, and this is where that digest comes
+  // from. A caller may send one anyway, and it is then a statement about what
+  // it believes it uploaded: a mismatch means the body was truncated or
+  // altered in flight, which is worth refusing rather than analyzing.
+  let sha = claimed;
+  if (bytes) {
+    sha = await sha256Hex(bytes);
+    if (claimed && claimed !== sha) {
+      logLine("sha_mismatch", { rid: ctx.rid, sha: claimed, actual: sha, bytes: bytes.byteLength });
+      return json({ error: "body does not match sha256" }, 400);
+    }
   }
+  // With no bytes there is nothing to derive a key from, so one must be named.
+  // A sha is what you have once you hold the artifact; a PURL is what you have
+  // before you do, and scan resolves it against the registry itself — which is
+  // also where the provenance it grafts into the report comes from.
+  if (!sha && !purl) return json({ error: "provide sha256 or purl" }, 400);
 
-  return await lookup(env, ctx, url.origin, { sha, bytes, purl: purl || null, filename: sha });
+  return await lookup(env, ctx, url.origin, {
+    sha: sha || null,
+    bytes,
+    purl: purl || null,
+    filename: sha || "artifact",
+    analyze: true,
+  });
 }
 
 async function lookup(env, ctx, origin, input) {
@@ -182,14 +212,19 @@ async function lookup(env, ctx, origin, input) {
   const cacheKey = input.sha
     ? new Request(`${origin}/lookup?sha256=${input.sha}`)
     : new Request(`${origin}/lookup?purl=${encodeURIComponent(input.purl)}`);
-  const flightKey = input.sha ? `sha:${input.sha}` : `purl:${input.purl}`;
+  // A read-only lookup and an analysis of the same key are different questions,
+  // so they get different flights: an /analyze must never be handed the 404 that
+  // an in-flight /lookup is about to produce.
+  const flightKey = `${input.analyze ? "analyze" : "lookup"}:${input.sha ? `sha:${input.sha}` : `purl:${input.purl}`}`;
   const cache = await getCache(env);
 
   let work = inflight.get(flightKey);
   if (!work) {
     work = (async () => {
       const hit = await cache.match(cacheKey);
-      if (hit) {
+      // A cached verdict serves either question. A cached *miss* only answers
+      // the read-only one — analysis is precisely what turns it into a hit.
+      if (hit && !(input.analyze && hit.status !== 200)) {
         const res = new Response(hit.body, hit);
         res.headers.set("X-Beamline-Source", "cache");
         logLine("lookup", { src: "cache", status: hit.status, ms: Date.now() - t0, ...idFields(ctx, input) });
@@ -239,8 +274,10 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
   let scan = null;
   let scanCtl = null;
   let hedged = false;
+  // /lookup reports what is already known and stops there; only /analyze may
+  // spend a scan slot. Both race the same cheap sources first.
   const analyze = (why) => {
-    if (scan) return;
+    if (scan || !input.analyze) return;
     hedge.cancel();
     hedged = why === "hedge";
     logLine(why === "hedge" ? "hedge" : "analyze", { ms: Date.now() - t0, why, hedge_ms: hedgeMs, ...ids });
@@ -302,7 +339,7 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
     if (!hopper.done) waits.push(hopper.settled);
     if (!known.done) waits.push(known.settled);
     if (scan && !scan.done) waits.push(scan.settled);
-    if (!scan) waits.push(hedge.fired);
+    if (!scan && input.analyze) waits.push(hedge.fired);
     if (!waits.length) break;
     if ((await Promise.race(waits)) === HEDGE) analyze("hedge");
   }
@@ -414,7 +451,9 @@ async function settle(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, 
       ...idFields(ctx, input),
     });
 
-  const queued = await queueAndWait(env, ctx, hopper, input, bytes, scanned);
+  // Waiting on hopper's worker is still work being done on the caller's behalf,
+  // so a read-only lookup does not do it: it reports what is known and stops.
+  const queued = input.analyze ? await queueAndWait(env, ctx, hopper, input, bytes, scanned) : null;
   if (queued?.env) {
     note("hopper", 200, { queued: true });
     const res = envelopeResponse(env, queued.env, queued.sha, "hopper", 86400, null, input.purl);
@@ -560,7 +599,7 @@ async function lookupAsk(env, ctx, path, base, control) {
   try {
     const answer = await fetchTimeout(
       `${base}${path}`,
-      { method: "GET", headers: backendHeaders(env, ctx) },
+      { method: "GET", headers: scanHeaders(env, ctx) },
       LOOKUP_TIMEOUT_MS,
       askCtx,
       async (resp) => {
@@ -601,7 +640,7 @@ async function hopperSample(env, ctx, input, timeoutMs, cancelSignal) {
   try {
     // The envelope is read here so it stays inside the request timeout, and
     // null — anything but a usable 200, 404, or 204 — trips the breaker.
-    const got = await fetchTimeout(url, { method: "GET", headers: backendHeaders(env, ctx) }, ms, fetchCtx, async (resp) => {
+    const got = await fetchTimeout(url, { method: "GET", headers: hopperHeaders(env, ctx) }, ms, fetchCtx, async (resp) => {
       const hex = String(resp.headers.get("x-sha256") || "").trim().toLowerCase();
       const sha = (SHA_RE.test(hex) && hex) || input.sha;
       if (resp.status === 200) {
@@ -633,7 +672,7 @@ async function hopperFile(env, ctx, sha) {
   try {
     const buf = await fetchTimeout(
             `${base}/api/file/${sha}`,
-      { method: "GET", headers: backendHeaders(env, ctx) },
+      { method: "GET", headers: hopperHeaders(env, ctx) },
       FILE_TIMEOUT_MS,
       ctx,
       async (resp) => {
@@ -805,7 +844,7 @@ async function scanPurl(env, ctx, base, purl) {
       `${base}/analyze-purl`,
       {
         method: "POST",
-        headers: { ...backendHeaders(env, ctx), "content-type": "application/json" },
+        headers: { ...scanHeaders(env, ctx), "content-type": "application/json" },
         body: JSON.stringify({ purl }),
       },
       timeout,
@@ -828,7 +867,7 @@ async function scanBytes(env, ctx, base, bytes, filename) {
     const body = multipart([{ name: "file", filename: filename || "upload.bin", body: new Uint8Array(bytes) }]);
     return await fetchTimeout(
       `${base}/analyze`,
-      { method: "POST", headers: { ...backendHeaders(env, ctx), "content-type": body.contentType }, body: body.body },
+      { method: "POST", headers: { ...scanHeaders(env, ctx), "content-type": body.contentType }, body: body.body },
       timeout,
       ctx,
       (resp) => readScan(resp, start, breaker, hostOf(base)),
@@ -874,7 +913,7 @@ async function hopperUpload(env, ctx, sha, bytes, filename) {
   try {
     const status = await fetchTimeout(
             `${base}/api/upload`,
-      { method: "POST", headers: { ...backendHeaders(env, ctx), "content-type": body.contentType }, body: body.body },
+      { method: "POST", headers: { ...hopperHeaders(env, ctx), "content-type": body.contentType }, body: body.body },
       FILE_TIMEOUT_MS,
       ctx,
       readStatus,
@@ -897,7 +936,7 @@ async function hopperRescan(env, ctx, sha) {
   const base = trimSlash(env.HOPPER_URL);
   if (!base || hopperBreaker.open() || !SHA_RE.test(sha)) return;
   try {
-    await fetchTimeout(`${base}/api/rescan/${sha}`, { method: "POST", headers: backendHeaders(env, ctx) }, HOPPER_RPC_MS, ctx, readStatus);
+    await fetchTimeout(`${base}/api/rescan/${sha}`, { method: "POST", headers: hopperHeaders(env, ctx) }, HOPPER_RPC_MS, ctx, readStatus);
   } catch (err) {
     if (clientAborted(ctx)) throw err;
   }
@@ -928,8 +967,20 @@ function backoff(base, attempt, cap) {
   return ceiling <= base ? base : base + Math.random() * (ceiling - base);
 }
 
-function backendHeaders(env, ctx) {
-  const tok = (env.BEAMLINE_TOKEN || "").trim();
+// Hopper and scan are separate services with separate credentials, so beamline
+// holds one token for each. The caller's own token is never forwarded: it
+// authenticates them to us and nothing further, so a beamline client cannot
+// turn its credential into direct access to a scanner.
+function hopperHeaders(env, ctx) {
+  return backendHeaders(env.HOPPER_TOKEN, ctx);
+}
+
+function scanHeaders(env, ctx) {
+  return backendHeaders(env.SCAN_TOKEN, ctx);
+}
+
+function backendHeaders(token, ctx) {
+  const tok = (token || "").trim();
   const headers = { "x-request-id": ctx.rid };
   if (tok) headers.authorization = `Bearer ${tok}`;
   return headers;
@@ -1139,8 +1190,11 @@ function multipart(fields) {
   return { contentType: `multipart/form-data; boundary=${boundary}`, body };
 }
 
+// The filename is how the digest reaches scan, so the bound must not clip one:
+// a sha256 is exactly 64 hex characters, and anything shorter here silently
+// hands over a truncated key that scan then names its own temp file after.
 function safeName(name) {
-  return String(name || "upload.bin").replace(/[^A-Za-z0-9_.-]/g, "_").slice(-63) || "upload.bin";
+  return String(name || "upload.bin").replace(/[^A-Za-z0-9_.-]/g, "_").slice(-64) || "upload.bin";
 }
 
 async function sha256Hex(buf) {
@@ -1361,6 +1415,18 @@ function json(obj, status) {
   return new Response(JSON.stringify(obj), {
     status,
     headers: { "content-type": "application/json" },
+  });
+}
+
+// `GET /analyze` is the easy mistake — dropping the body to analyze a PURL also
+// drops the POST that `--data-binary` was implying — and a 404 would send the
+// caller hunting for a misspelled path instead of a missing flag. RFC 9110
+// requires the `Allow` header here; the detail repeats it for anyone reading
+// only the body.
+function methodNotAllowed(allow) {
+  return new Response(JSON.stringify({ error: "method not allowed", detail: `use ${allow}` }), {
+    status: 405,
+    headers: { "content-type": "application/json", allow },
   });
 }
 

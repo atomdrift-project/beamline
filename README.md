@@ -17,6 +17,16 @@ starts and give a fast worker the chance to answer before the next is asked.
 Each worker gets its own circuit breaker, so a sick one drops out of the race
 without taking scanning down with it.
 
+Three separate tokens, none of them baked into the tree: `BEAMLINE_TOKEN` is
+who may call beamline, `HOPPER_TOKEN` and `SCAN_TOKEN` are how beamline calls
+its backends. Each is taken from the environment, and otherwise from the first
+non-empty line of `~/.tok/<service>` — the file the services themselves are
+pointed at with `--token-file`. `make deploy-cf` uploads all three as Worker
+secrets from the same source, so a local run and a deployed Worker
+authenticate identically, and a token with no value is left alone rather than
+uploaded empty. With no `BEAMLINE_TOKEN` anywhere, beamline serves every route
+unauthenticated.
+
 ```
 HOPPER_URL=… SCAN_URL=… node local.js
 HOPPER_URL=… SCAN_URL=… make deploy-cf

@@ -8,6 +8,7 @@
 
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
+import { readToken } from "./tok.js";
 
 const UA = "beamline-stress/1.0 (+https://github.com/isotope13-dev/forager)";
 const DEFAULT_N = 6;
@@ -19,12 +20,58 @@ const n = Math.max(1, Number(process.env.N) || DEFAULT_N);
 const samples = Math.max(0, Number(process.env.SAMPLES) || 0);
 const concurrency = Math.max(1, Number(process.env.CONCURRENCY) || DEFAULT_CONCURRENCY);
 const beamlineUrl = trimSlash(process.env.BEAMLINE_URL);
-const token = (process.env.BEAMLINE_TOKEN || "").trim();
+// Same ~/.tok fallback the server takes, so a run against a local beamline
+// started without arguments still presents the token that beamline read.
+const token = (process.env.BEAMLINE_TOKEN || "").trim() || readToken("beamline");
+const scanToken = (process.env.SCAN_TOKEN || "").trim() || readToken("scan");
+const hopperToken = (process.env.HOPPER_TOKEN || "").trim() || readToken("hopper");
 // SCAN_URL may list several interchangeable workers; probe the first.
 const scanUrl = trimSlash((process.env.SCAN_URL || "").split(",")[0]);
 const hopperUrl = trimSlash(process.env.HOPPER_URL);
 const outPath = process.env.STRESS_OUT || "";
+const popular = process.env.POPULAR === "1";
+const analyzeMisses = process.env.ANALYZE_MISSES === "1";
 const timeoutMs = Number(process.env.SCAN_TIMEOUT_MS) || 1_800_000;
+
+// Five very widely used packages per ecosystem, pinned to the versions that
+// were current when this list was written. Hardcoded deliberately: the value of
+// this run is that two of them are comparable, so a change in the numbers means
+// something changed in beamline — not that npm published a release overnight.
+// These are the PURLs a real fleet asks about constantly, so what matters here
+// is the cache and index hit rate, not whether an analysis succeeds.
+const POPULAR = [
+  ["npm", "pkg:npm/axios@1.19.0"],
+  ["npm", "pkg:npm/chalk@6.0.0"],
+  ["npm", "pkg:npm/express@5.2.1"],
+  ["npm", "pkg:npm/lodash@4.18.1"],
+  ["npm", "pkg:npm/react@19.2.8"],
+  ["pypi", "pkg:pypi/boto3@1.43.75"],
+  ["pypi", "pkg:pypi/numpy@2.5.2"],
+  ["pypi", "pkg:pypi/requests@2.34.2"],
+  ["pypi", "pkg:pypi/setuptools@84.0.0"],
+  ["pypi", "pkg:pypi/urllib3@2.7.0"],
+  ["cargo", "pkg:cargo/libc@0.2.189"],
+  ["cargo", "pkg:cargo/quote@1.0.47"],
+  ["cargo", "pkg:cargo/rand@0.10.2"],
+  ["cargo", "pkg:cargo/serde@1.0.229"],
+  ["cargo", "pkg:cargo/syn@3.0.3"],
+  ["golang", "pkg:golang/github.com/sirupsen/logrus@v1.10.1"],
+  ["golang", "pkg:golang/github.com/spf13/cobra@v1.10.2"],
+  ["golang", "pkg:golang/github.com/stretchr/testify@v1.12.1"],
+  ["golang", "pkg:golang/golang.org/x/sys@v0.47.0"],
+  ["golang", "pkg:golang/google.golang.org/protobuf@v1.36.12"],
+];
+
+// Group the fixed list the way the registry feeds are grouped, so mixJobs
+// interleaves ecosystems here exactly as it does for a live run.
+function popularJobs() {
+  const byEco = new Map();
+  for (const [eco, purl] of POPULAR) {
+    if (!byEco.has(eco)) byEco.set(eco, []);
+    byEco.get(eco).push(job(eco, purl));
+  }
+  return [...byEco.values()];
+}
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (isMain) {
@@ -44,8 +91,22 @@ async function main() {
     process.exit(2);
   }
 
-  process.stderr.write(`beamline ${beamlineUrl}\nscan     ${scanUrl}\nhopper   ${hopperUrl}\nN=${n}${samples ? ` SAMPLES=${samples}` : ""} concurrency=${concurrency}\n`);
+  process.stderr.write(
+    `beamline ${beamlineUrl}\nscan     ${scanUrl}\nhopper   ${hopperUrl}\n` +
+      `${popular ? "popular" : `N=${n}`}${samples ? ` SAMPLES=${samples}` : ""} concurrency=${concurrency}\n`,
+  );
   await pingBackends();
+
+  // POPULAR=1 swaps the live registry feeds for the fixed list above.
+  if (popular) {
+    const jobs = mixJobs(popularJobs(), samples || Infinity);
+    process.stderr.write(`submitting ${jobs.length} popular PURLs\n`);
+    const rows = await pool(jobs, concurrency, submit);
+    const summary = summarize(rows);
+    printReport(rows, summary, []);
+    if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, rows, summary });
+    process.exit(summary.bugs.length ? 1 : 0);
+  }
 
   const feeds = await Promise.allSettled([
     named("npm", fetchNpm),
@@ -88,13 +149,24 @@ async function pingBackends() {
   const scan = await probe(`${scanUrl}/_/health`);
   const hopper = await probe(`${hopperUrl}/healthz`);
   const hopperAlt = hopper === "ok" ? hopper : await probe(`${hopperUrl}/_/health`);
+  if (hopperToken) {
+    // /healthz is auth-exempt on hopper, so prove the credential works before a
+    // whole run turns into 401s that look like misses.
+    const probeSha = "0".repeat(64);
+    const auth = { authorization: `Bearer ${hopperToken}` };
+    const reach = await probe(`${hopperUrl}/api/sample/${probeSha}`, auth);
+    if (reach === "401" || reach === "403") {
+      process.stderr.write(`warning: hopper rejected our token (${reach})\n`);
+    }
+  }
   process.stderr.write(`health   beamline=${beam} scan=${scan} hopper=${hopperAlt}\n`);
   if (beam !== "ok") throw new Error(`beamline healthz: ${beam}`);
   if (scan !== "ok" && scan !== "saturated" && scan !== "degraded") {
     process.stderr.write(`warning: scan health is ${scan}\n`);
   }
   try {
-    const info = await get(`${scanUrl}/_/info`, 4000).then((r) => r.json());
+    const auth = scanToken ? { authorization: `Bearer ${scanToken}` } : {};
+    const info = await get(`${scanUrl}/_/info`, 4000, auth).then((r) => r.json());
     process.stderr.write(`scan     version=${info.version || "?"} slots=${info.slots ?? "?"}\n`);
   } catch {
     // info is optional
@@ -113,9 +185,9 @@ async function pingBackends() {
   }
 }
 
-async function probe(url) {
+async function probe(url, extra = {}) {
   try {
-    const resp = await get(url, 4000);
+    const resp = await get(url, 4000, extra);
     if (!resp.ok) return String(resp.status);
     const ct = resp.headers.get("content-type") || "";
     if (ct.includes("json")) {
@@ -243,13 +315,22 @@ async function fetchGo(limit) {
   return [];
 }
 
+// Ask what is known; if nothing is, ask for the work. The analyze call carries
+// the PURL and no bytes, so scan resolves the artifact from the registry itself
+// and the provenance it grafts into the report comes from the same fetch.
 async function submit(item) {
-  const url = `${beamlineUrl}/lookup?purl=${encodeURIComponent(item.purl)}`;
+  const looked = await ask(item, `${beamlineUrl}/lookup?purl=${encodeURIComponent(item.purl)}`, "GET");
+  if (!analyzeMisses || looked.status !== 404) return looked;
+  const analyzed = await ask(item, `${beamlineUrl}/analyze?purl=${encodeURIComponent(item.purl)}`, "POST");
+  return { ...analyzed, analyzed: true, lookupMs: looked.ms };
+}
+
+async function ask(item, url, method) {
   const headers = { "accept-encoding": "gzip" };
   if (token) headers.authorization = `Bearer ${token}`;
   const t0 = Date.now();
   try {
-    const resp = await get(url, timeoutMs + 10_000, headers);
+    const resp = await get(url, timeoutMs + 10_000, headers, method);
     const ms = Date.now() - t0;
     const body = await readJson(resp);
     const issues = checkApi(resp.status, resp.headers, body, item.purl);
@@ -383,26 +464,32 @@ function classify(r) {
   if (r.issues && r.issues.length) return "bug";
   if (!r.status) return "bug";
   if (r.status === 200) return "ok";
-  if (r.status === 400 || r.status === 404) return "bug";
+  // /lookup is read-only, so a 404 is the correct answer for something nothing
+  // has analyzed yet — a fact about the corpus, not a defect. It gets its own
+  // bucket because the hit rate is the number this run exists to report.
+  if (r.status === 404) return "miss";
+  if (r.status === 400) return "bug";
   if (r.status >= 500 && r.status !== 503 && r.status !== 504) return "bug";
   return "note";
 }
 
 function logRow(r) {
-  const tag = r.kind === "bug" ? "BUG" : r.kind === "note" ? "note" : "ok ";
+  const tag = r.kind === "bug" ? "BUG" : r.kind === "note" ? "note" : r.kind === "miss" ? "miss" : "ok ";
+  const how = r.analyzed ? " analyzed" : "";
   const src = (r.source || "-").padEnd(6);
   const eco = r.eco.padEnd(6);
   const ms = String(r.ms).padStart(6);
   let extra = r.status === 200 ? `lvl=${r.lvl}` : `${r.status} ${r.error || r.state || ""}`;
   if (r.sha) extra += ` sha=${String(r.sha).slice(0, 12)}`;
   if (r.issues && r.issues.length) extra += ` [${r.issues.join("; ")}]`;
-  process.stderr.write(`${tag} ${ms}ms ${src} ${eco} ${r.purl}  ${extra}\n`);
+  process.stderr.write(`${tag} ${ms}ms ${src} ${eco} ${r.purl}  ${extra}${how}\n`);
 }
 
 function summarize(rows) {
   const ok = rows.filter((r) => r.kind === "ok");
   const bugs = rows.filter((r) => r.kind === "bug");
   const notes = rows.filter((r) => r.kind === "note");
+  const misses = rows.filter((r) => r.kind === "miss");
   const lat = ok.map((r) => r.ms).sort((a, b) => a - b);
   const bySource = countBy(ok, (r) => r.source || "unknown");
   const byEco = countBy(rows, (r) => r.eco);
@@ -412,6 +499,7 @@ function summarize(rows) {
     ok: ok.length,
     bugs,
     notes,
+    misses,
     bySource,
     byEco,
     byKind,
@@ -428,10 +516,19 @@ function summarize(rows) {
 function printReport(rows, summary, feedErrors) {
   const { latency: L } = summary;
   process.stdout.write("\n");
-  process.stdout.write(`results  ${summary.ok} ok / ${summary.bugs.length} bug / ${summary.notes.length} note  (n=${summary.n})\n`);
+  const known = summary.ok + summary.misses.length;
+  const rate = known ? `${Math.round((summary.ok / known) * 100)}%` : "-";
+  process.stdout.write(
+    `results  ${summary.ok} hit / ${summary.misses.length} miss / ${summary.bugs.length} bug / ${summary.notes.length} note  (n=${summary.n})\n`,
+  );
+  process.stdout.write(`hit rate ${rate} of ${known} answered lookups\n`);
   process.stdout.write(`latency  p50=${fmtMs(L.p50)} p95=${fmtMs(L.p95)} p99=${fmtMs(L.p99)} max=${fmtMs(L.max)}  (ok n=${L.n})\n`);
   process.stdout.write(`source   ${fmtMap(summary.bySource)}\n`);
   process.stdout.write(`eco      ${fmtMap(summary.byEco)}\n`);
+  if (summary.misses.length) {
+    process.stdout.write("misses (nothing has analyzed these yet)\n");
+    for (const r of summary.misses) process.stdout.write(`  ${r.purl}\n`);
+  }
   if (summary.notes.length) {
     process.stdout.write("notes\n");
     for (const r of summary.notes) process.stdout.write(`  ${r.status} ${r.error || ""}  ${r.purl}\n`);
@@ -588,9 +685,9 @@ async function pool(items, width, fn) {
   return out;
 }
 
-async function get(url, ms, extra = {}) {
+async function get(url, ms, extra = {}, method = "GET") {
   const headers = { "user-agent": UA, ...extra };
-  const resp = await fetch(url, { headers, signal: AbortSignal.timeout(ms) });
+  const resp = await fetch(url, { method, headers, signal: AbortSignal.timeout(ms) });
   const local = beamlineUrl && url.startsWith(beamlineUrl);
   if (!local && !resp.ok) {
     const t = await resp.text().catch(() => "");
@@ -615,6 +712,8 @@ export const _test = {
   cratesSparsePath,
   percentile,
   classify,
+  POPULAR,
+  popularJobs,
   checkApi,
   mixJobs,
 };

@@ -80,7 +80,7 @@ test("percentile is nearest-rank", () => {
 test("classify treats a missing envelope as a bug, saturation as a note", () => {
   assert.equal(_test.classify({ status: 200 }), "ok");
   assert.equal(_test.classify({ status: 200, issues: ["sha"] }), "bug");
-  assert.equal(_test.classify({ status: 404 }), "bug");
+  assert.equal(_test.classify({ status: 404 }), "miss", "read-only /lookup: a miss is an answer, not a defect");
   assert.equal(_test.classify({ status: 400 }), "bug");
   assert.equal(_test.classify({ status: 500 }), "bug");
   assert.equal(_test.classify({ status: 503 }), "note");
@@ -124,4 +124,26 @@ test("mixJobs round-robins ecosystems up to the cap", () => {
     got.map((j) => j.purl),
     ["a", "b", "c", "a2"],
   );
+});
+
+test("the popular list is five pinned PURLs per ecosystem", () => {
+  const byEco = new Map();
+  for (const [eco, purl] of _test.POPULAR) {
+    assert.ok(purl.startsWith(`pkg:${eco === "cargo" ? "cargo" : eco}/`), purl);
+    // Pinned, not floating: an unversioned PURL would make two runs
+    // incomparable, which is the whole point of this list.
+    assert.ok(purl.includes("@"), `${purl} has no version`);
+    byEco.set(eco, (byEco.get(eco) || 0) + 1);
+  }
+  assert.deepEqual([...byEco.keys()].sort(), ["cargo", "golang", "npm", "pypi"]);
+  for (const [eco, count] of byEco) assert.equal(count, 5, eco);
+  assert.equal(new Set(_test.POPULAR.map(([, p]) => p)).size, _test.POPULAR.length, "no duplicates");
+});
+
+test("popular jobs interleave ecosystems", () => {
+  const mixed = _test.mixJobs(_test.popularJobs(), Infinity);
+  assert.equal(mixed.length, _test.POPULAR.length);
+  // Round-robin, so a run spreads load across registries rather than doing all
+  // of npm and then all of pypi.
+  assert.deepEqual(mixed.slice(0, 4).map((j) => j.eco), ["npm", "pypi", "cargo", "golang"]);
 });

@@ -52,14 +52,18 @@ test("BEAMLINE_TOKEN is required except on /healthz", async () => {
   assert.equal(wrong.status, 401);
 });
 
-test("accepted token is forwarded to hopper and scan", async () => {
-  const scanned = envelope(HELLO_SHA, { eng: "scan" });
+test("a caller's token authenticates them to us and goes no further", async () => {
   const backend = await mockBackend({
     bloom: "unknown",
     sample: () => ({ status: 404 }),
-    analyze: () => scanned,
+    analyze: () => envelope(HELLO_SHA, { eng: "scan" }),
   });
-  const env = { ...testEnv(backend.url), BEAMLINE_TOKEN: "alpha,beta" };
+  const env = {
+    ...testEnv(backend.url),
+    BEAMLINE_TOKEN: "alpha,beta",
+    HOPPER_TOKEN: "hopper-secret",
+    SCAN_TOKEN: "scan-secret",
+  };
   try {
     const res = await handle(
       new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
@@ -71,13 +75,17 @@ test("accepted token is forwarded to hopper and scan", async () => {
       waitCtx().ctx,
     );
     assert.equal(res.status, 200);
-    const sent = backend.auths.map((a) => a.authorization);
+    const sent = backend.auths.filter((a) => a.path !== "/healthz");
     assert.ok(sent.length > 0);
-    assert.ok(sent.every((h) => h === "Bearer beta"));
-    const paths = backend.auths.map((a) => a.path);
-    assert.ok(paths.some((p) => p === "/lookup"));
-    assert.ok(paths.some((p) => p.startsWith("/api/sample")));
-    assert.ok(paths.some((p) => p === "/analyze"));
+    // The caller's own credential must never leave beamline: holding it lets
+    // you ask beamline questions, not reach a scanner or the sample store.
+    assert.ok(!sent.some((a) => a.authorization === "Bearer beta"), JSON.stringify(sent));
+
+    const forScan = sent.filter((a) => a.path === "/lookup" || a.path.startsWith("/analyze"));
+    const forHopper = sent.filter((a) => a.path.startsWith("/api/"));
+    assert.ok(forScan.length > 0 && forHopper.length > 0, JSON.stringify(sent.map((a) => a.path)));
+    assert.ok(forScan.every((a) => a.authorization === "Bearer scan-secret"), JSON.stringify(forScan));
+    assert.ok(forHopper.every((a) => a.authorization === "Bearer hopper-secret"), JSON.stringify(forHopper));
   } finally {
     await backend.close();
   }
@@ -252,7 +260,7 @@ test("hopper miss with body posts /analyze and stores the artifact on hopper", a
 });
 
 test("PURL miss posts /analyze-purl", async () => {
-  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const sha = HELLO_SHA;
   const scanned = envelope(sha, { eng: "purl-scan" });
   const backend = await mockBackend({
     bloom: "unknown",
@@ -266,7 +274,7 @@ test("PURL miss posts /analyze-purl", async () => {
   const ctx = waitCtx();
   try {
     const res = await handle(
-      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
       env,
       ctx.ctx,
     );
@@ -334,7 +342,7 @@ test("hopper down still scans a PURL", async () => {
   const env = testEnv(backend.url, { HOPPER_URL: DEAD });
   try {
     const res = await handle(
-      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
       env,
       waitCtx().ctx,
     );
@@ -367,7 +375,7 @@ test("PURL hopper miss with scan down is 503, not a miss", async () => {
   const env = testEnv(backend.url, { SCAN_URL: DEAD });
   try {
     const res = await handle(
-      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
       env,
       noopCtx(),
     );
@@ -440,7 +448,7 @@ test("scan down on a pending hopper sample waits for the worker", async () => {
   });
   const env = testEnv(backend.url, { SCAN_URL: DEAD });
   try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, noopCtx());
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal(backend.hits.upload, 0);
@@ -457,7 +465,7 @@ test("scan down wait timeout returns 202 pending", async () => {
   });
   const env = testEnv(backend.url, { SCAN_URL: DEAD, SCAN_TIMEOUT_MS: "80" });
   try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, noopCtx());
     assert.equal(res.status, 202);
     // Jittered to spread the retry herd; the contract is a whole number of
     // seconds inside the advertised window, not one fixed value.
@@ -470,9 +478,37 @@ test("scan down wait timeout returns 202 pending", async () => {
 });
 
 test("unknown route is 404 not found", async () => {
-  const res = await handle(new Request("http://beamline/analyze"), {}, {});
+  const res = await handle(new Request("http://beamline/nope"), {}, {});
   assert.equal(res.status, 404);
   assert.equal((await res.json()).error, "not found");
+});
+
+test("a known route with the wrong method is 405, not 404", async () => {
+  // Dropping the body to analyze a PURL also drops the POST that
+  // `--data-binary` was implying, so this is the mistake callers actually make.
+  // A 404 would send them looking for a misspelled path.
+  const cases = [
+    ["http://beamline/analyze", "GET", "POST"],
+    ["http://beamline/lookup", "POST", "GET"],
+    ["http://beamline/healthz", "POST", "GET"],
+    ["http://beamline/_/health", "DELETE", "GET"],
+  ];
+  for (const [uri, method, allow] of cases) {
+    const res = await handle(new Request(uri, { method }), {}, {});
+    assert.equal(res.status, 405, `${method} ${uri}`);
+    assert.equal(res.headers.get("allow"), allow, `${method} ${uri} must name the method that works`);
+    assert.equal((await res.json()).error, "method not allowed");
+  }
+});
+
+test("the method check on a guarded route runs after the token check", async () => {
+  // A 405 tells the caller the route exists. That is fine once they are known
+  // to us, but an unauthenticated prod of /analyze must not learn it.
+  const res = await handle(new Request("http://beamline/analyze"), { BEAMLINE_TOKEN: "secret" }, {});
+  assert.equal(res.status, 401);
+  // Health answers before the token check, so its 405 is reachable unauthenticated.
+  const health = await handle(new Request("http://beamline/healthz", { method: "POST" }), { BEAMLINE_TOKEN: "secret" }, {});
+  assert.equal(health.status, 405);
 });
 
 test("query purl is not a route", async () => {
@@ -702,7 +738,7 @@ test("hedged PURL: slow hopper 200 beats analyze-purl and does not submit", asyn
   const ctx = waitCtx();
   try {
     const res = await handle(
-      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
       env,
       ctx.ctx,
     );
@@ -733,7 +769,7 @@ test("hedged PURL: scan wins if hopper stays silent", async () => {
   try {
     const t0 = Date.now();
     const res = await handle(
-      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
       env,
       ctx.ctx,
     );
@@ -761,7 +797,7 @@ test("SHA GET: slow hopper 200 still wins after hedge started a file fetch", asy
   const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
   const ctx = waitCtx();
   try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
+    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, ctx.ctx);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal((await res.json()).eng, "hopper-sha");
@@ -788,7 +824,7 @@ test("SHA GET: hedge scans hopper bytes if hopper sample stays silent", async ()
   const ctx = waitCtx();
   try {
     const t0 = Date.now();
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
+    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, ctx.ctx);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "scan");
     assert.equal((await res.json()).eng, "from-file");
@@ -874,7 +910,7 @@ test("hedged hopper 204 with scan down still waits for the hopper worker", async
   });
   const env = testEnv(backend.url, { SCAN_URL: DEAD, HOPPER_HEDGE_MS: "20" });
   try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, noopCtx());
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal((await res.json()).eng, "hopper-worker");
@@ -1251,7 +1287,7 @@ test("scan 400 on a PURL passes through, not 404", async () => {
   });
   const env = testEnv(backend.url);
   try {
-    const res = await handle(new Request("http://beamline/lookup?purl=not-a-purl"), env, noopCtx());
+    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=not-a-purl`, { method: "POST" }), env, noopCtx());
     assert.equal(res.status, 400);
     assert.equal((await res.json()).error, "not a package URL");
     assert.equal(backend.hits.analyze, 0);
@@ -1272,7 +1308,7 @@ test("scan 504 without hopper bytes is a timeout, not unavailable", async () => 
   const env = testEnv(backend.url);
   try {
     const res = await handle(
-      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
       env,
       noopCtx(),
     );
@@ -1295,7 +1331,7 @@ test("scan 429 without hopper bytes passes through", async () => {
   const env = testEnv(backend.url);
   try {
     const res = await handle(
-      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
       env,
       noopCtx(),
     );
@@ -1722,7 +1758,7 @@ test("scan reporting its own analysis timeout is not retried", async () => {
   const env = testEnv(backend.url);
   try {
     const res = await handle(
-      new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
       env,
       noopCtx(),
     );
@@ -1840,7 +1876,7 @@ test("a PURL lookup races the same way", async () => {
   const env = testEnv(hopper.url, { SCAN_URL: `${slow.url},${fast.url}` });
   try {
     const t0 = Date.now();
-    const res = await handle(new Request("http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"), env, waitCtx().ctx);
+    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }), env, waitCtx().ctx);
     assert.equal(res.status, 200);
     assert.equal((await res.json()).eng, "fast");
     assert.ok(Date.now() - t0 < 300);
@@ -2007,16 +2043,47 @@ test("an edge timeout is not retried into the same ceiling", async () => {
   }
 });
 
-test("/analyze requires a well-formed sha256", async () => {
+test("/analyze needs a key, and a malformed sha is not one", async () => {
   for (const uri of [
-    "http://beamline/analyze",
-    "http://beamline/analyze?sha256=",
     "http://beamline/analyze?sha256=nothex",
     `http://beamline/analyze?sha256=${HELLO_SHA.slice(0, 63)}`,
   ]) {
     const res = await handle(new Request(uri, { method: "POST", body: HELLO }), {}, {});
     assert.equal(res.status, 400, uri);
     assert.equal((await res.json()).error, "invalid sha256");
+  }
+  for (const uri of ["http://beamline/analyze", "http://beamline/analyze?sha256="]) {
+    const res = await handle(new Request(uri, { method: "POST" }), {}, {});
+    assert.equal(res.status, 400, uri);
+    assert.equal((await res.json()).error, "provide sha256 or purl");
+  }
+});
+
+test("bytes without a digest are hashed here, and the derived sha reaches scan", async () => {
+  let sentName = "";
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyze: (body) => {
+      sentName = /filename="([^"]*)"/.exec(body.toString("utf8"))?.[1] || "";
+      return envelope(HELLO_SHA, { lvl: -1, eng: "2.7.2" });
+    },
+  });
+  const env = testEnv(backend.url);
+  try {
+    // No sha256 anywhere in the request: the caller holds the artifact and
+    // should not have to hash it to ask about it.
+    const res = await handle(
+      new Request("http://beamline/analyze", { method: "POST", body: HELLO }),
+      env,
+      noopCtx(),
+    );
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).sha, HELLO_SHA, "the derived digest is the key we answer under");
+    // Scan requires a digest; this is where it comes from.
+    assert.equal(sentName, HELLO_SHA, "scan is handed the derived digest, not a placeholder");
+  } finally {
+    await backend.close();
   }
 });
 
@@ -2153,7 +2220,7 @@ function testEnv(url, extra = {}) {
     HOPPER_URL: extra.HOPPER_URL ?? url,
     SCAN_URL: extra.SCAN_URL ?? url,
     HOPPER_POLL_MS: extra.HOPPER_POLL_MS ?? "10",
-    SCAN_TIMEOUT_MS: extra.SCAN_TIMEOUT_MS,
+    SCAN_TIMEOUT_MS: extra.SCAN_TIMEOUT_MS ?? "2000",
     HOPPER_HEDGE_MS: extra.HOPPER_HEDGE_MS,
     HOPPER_LOOKUP_MS: extra.HOPPER_LOOKUP_MS,
     // Retries are real behaviour worth exercising, but not at a real clock:
@@ -2269,7 +2336,7 @@ function mockBackend(opts) {
       }
       if (url.pathname === "/analyze") {
         hits.analyze += 1;
-        const out = opts.analyze ? await opts.analyze() : null;
+        const out = opts.analyze ? await opts.analyze(body) : null;
         return sendAnalyze(res, out);
       }
       send(res, 404, { error: "not found" });
