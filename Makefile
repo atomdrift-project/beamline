@@ -34,10 +34,10 @@ SCAN_RETRIES ?=
 # Parse every file, then oxlint. No lint config is checked in: the defaults
 # are the standard, and the tree stays free of npm packages.
 lint:
-	@for f in beamline.js local.js stress.js tok.js beamline.test.js stress.test.js; do \
+	@for f in beamline.js local.js stress.js tok.js scripts/route-bench.mjs beamline.test.js stress.test.js; do \
 	  node --check "$$f" || exit 1; \
 	done
-	npx --yes $(OXLINT) --deny-warnings beamline.js local.js stress.js tok.js beamline.test.js stress.test.js
+	npx --yes $(OXLINT) --deny-warnings beamline.js local.js stress.js tok.js scripts/route-bench.mjs beamline.test.js stress.test.js
 
 test:
 	node --test

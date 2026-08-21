@@ -24,7 +24,6 @@ const POLL_MAX_MS = 5_000;
 const SCAN_RETRIES = 5;
 const SCAN_RETRY_BASE_MS = 1_000;
 const SCAN_RETRY_MAX_MS = 30_000;
-const SCAN_RACE_DELAY_MS = 0;
 const EDGE_TIMEOUT = 524;
 const MISS_MAX_AGE = 60;
 const RETRY_AFTER_MIN_S = 3;
@@ -62,7 +61,12 @@ async function dispatch(request, env, ctx) {
   // filtered and bounded first.
   const rid =
     cleanId(request.headers.get("x-request-id")) || cleanId(request.headers.get("cf-ray")) || crypto.randomUUID();
-  ctx = { ...ctx, rid };
+  // X-Beamline-Pin: <host> forces dispatch to one worker and bypasses the
+  // cache, so an experiment can time a specific backend on a specific sample.
+  // It only restricts a choice beamline was already free to make, but it does
+  // spend a scan slot on demand — so it lives behind the token gate with
+  // everything else, and is bounded like any other caller-supplied header.
+  ctx = { ...ctx, rid, pin: cleanId(request.headers.get("x-beamline-pin")) || null };
   if (request.signal && !ctx.signal) ctx.signal = request.signal;
 
   const url = new URL(request.url);
@@ -95,6 +99,10 @@ async function dispatch(request, env, ctx) {
         return json({ error: "provide exactly one of sha256 or purl" }, 400);
       }
       return await lookupKey(env, ctx, url.origin, sha, purl);
+    }
+    if (url.pathname === "/_/routes") {
+      if (request.method !== "GET") return methodNotAllowed("GET");
+      return await handleRoutes(env, ctx, url);
     }
     return json({ error: "not found" }, 404);
   } catch (err) {
@@ -218,24 +226,33 @@ async function lookup(env, ctx, origin, input) {
   const flightKey = `${input.analyze ? "analyze" : "lookup"}:${input.sha ? `sha:${input.sha}` : `purl:${input.purl}`}`;
   const cache = await getCache(env);
 
-  let work = inflight.get(flightKey);
+  // A pinned request measures a specific worker, so it may not be served by
+  // the cache or by someone else's in-flight work — either would return an
+  // answer the pinned worker never produced, and time nothing. It still
+  // populates both on the way out: the verdict is just as true for having been
+  // measured.
+  let work = ctx.pin ? null : inflight.get(flightKey);
   if (!work) {
     work = (async () => {
-      const hit = await cache.match(cacheKey);
+      const hit = ctx.pin ? null : await cache.match(cacheKey);
       // A cached verdict serves either question. A cached *miss* only answers
       // the read-only one — analysis is precisely what turns it into a hit.
       if (hit && !(input.analyze && hit.status !== 200)) {
         const res = new Response(hit.body, hit);
         res.headers.set("X-Beamline-Source", "cache");
+        // The stored copy names whoever produced it, possibly days ago. Left
+        // in place it would be read as this request's routing decision, and
+        // every cache hit would be attributed to that worker.
+        res.headers.delete("X-Beamline-Worker");
         logLine("lookup", { src: "cache", status: hit.status, ms: Date.now() - t0, ...idFields(ctx, input) });
         return res;
       }
       return runLookup(env, ctx, cache, cacheKey, input, t0);
     })();
-    inflight.set(flightKey, work);
+    if (!ctx.pin) inflight.set(flightKey, work);
     // Runs to completion even if every waiter walks away, so the answer still
     // reaches the cache and hopper for whoever asks next.
-    waitUntil(ctx, work.finally(() => inflight.delete(flightKey)));
+    waitUntil(ctx, work.finally(() => { if (!ctx.pin) inflight.delete(flightKey); }));
   }
 
   // The API is synchronous: a caller waits for its answer. Workers put no
@@ -379,7 +396,13 @@ async function scanLookup(env, ctx, input, scanCtl) {
     if (bytes) {
       const name = input.filename || input.sha;
       const scanned = await retryScan(env, scanCtx, ids, () =>
-        raceScan(env, scanCtx, ids, (base, armCtx) => scanBytes(env, armCtx, base, bytes, name)),
+        raceScan(
+          env,
+          scanCtx,
+          ids,
+          (base, armCtx) => scanBytes(env, armCtx, base, bytes, name),
+          bytes.byteLength,
+        ),
       );
       return { bytes, scanned };
     }
@@ -413,6 +436,10 @@ function replyHopper(env, ctx, cache, cacheKey, input, hopper, t0, hedged) {
 function replyScan(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0, hedged) {
   const sha = input.sha || scanned.sha || shaFromEnvelope(scanned.env);
   const res = envelopeResponse(env, scanned.env, sha, "scan", 86400, scanned.totalMs, input.purl);
+  // Who actually produced this. Without it a client can measure that beamline
+  // was slow but not which worker made it so, and work distribution is only
+  // visible by reading the logs of a process it does not run.
+  if (scanned.worker) res.headers.set("X-Beamline-Worker", scanned.worker);
   logLine("lookup", {
     src: "scan",
     status: 200,
@@ -709,18 +736,366 @@ async function hopperFile(env, ctx, sha) {
 // analysis already running rather than starting a second one — which is what
 // makes retrying an edge timeout worth doing at all.
 // Every healthy worker gets the same sample and the first real verdict wins.
-// The losers are aborted the moment it lands, which drops their connection; on
-// the scan side that releases their attachment, cancels the analysis, and frees
-// the slot, so a loser never finishes and never posts a result of its own to
-// hopper. Exactly one envelope leaves here, and it is the winner's.
+// The losers are aborted the moment it lands. That abort reliably stops an arm
+// that has not dispatched yet; it does NOT reliably stop one already running,
+// because the signal has to cross a Worker abort, the Cloudflare edge, and a
+// tunnel before scan sees a disconnect, and measurement says it does not arrive
+// — a dropped loser was observed analysing for a further 77s and returning 200.
 //
-// Workers start SCAN_RACE_DELAY_MS apart. At 0, the default, it is a flat race
-// and costs one analysis slot per worker per sample; raise it to give a fast
-// worker the chance to answer before the next one is ever asked.
-async function raceScan(env, ctx, ids, run) {
-  const workers = scanWorkers(env);
-  if (!workers.length) return { unavailable: true };
-  const stagger = numEnv(env, "SCAN_RACE_DELAY_MS", SCAN_RACE_DELAY_MS);
+// So the saving comes from the stagger, not the abort: an arm still waiting out
+// its delay is aborted before it ever asks, and costs its worker nothing. The
+// delay is set per request from the favourite's own predicted latency (see
+// rankWorkers), and SCAN_RACE_DELAY_MS overrides it — 0 restores the old flat
+// race, which costs one analysis slot per worker per sample.
+// ---------------------------------------------------------------- routing ---
+//
+// Which scan worker should go first?
+//
+// The old answer was "all of them, at once": SCAN_RACE_DELAY_MS defaulted to 0,
+// so every arm dispatched immediately and every worker analysed every sample.
+// Measured on one request, galadriel answered pkg:pypi/idna@2.5 in 12.5s while
+// interserver kept working on it for another 77s — a full duplicate analysis
+// per extra worker, on a fleet whose scarce resource is analysis slots.
+//
+// The fix is not to cancel the losers. Cancellation has to cross a Worker
+// abort, the Cloudflare edge, and a tunnel before scan sees a disconnect, and
+// the evidence is that it does not arrive. What works regardless of transport
+// is to not start the work: `scanArm` aborts during its stagger and reports
+// `never_started`, which costs a worker nothing at all.
+//
+// So the job here is to put the *most likely to finish first* worker in the
+// zero-delay slot, and hold the rest behind a delay long enough that they only
+// fire when the favourite is genuinely slow. That is a hedged request, and the
+// arm machinery already implements it.
+
+// How long a cached /_/stats reading stays usable. Short enough to follow a
+// worker filling up, long enough that routing costs one poll per worker per
+// this interval rather than one per request.
+const STATS_TTL_MS = 10_000;
+// Bound one stats poll. A worker too busy to answer this is, usefully, also a
+// worker we should not be sending work to.
+const STATS_TIMEOUT_MS = 1_500;
+// Used when a worker has no history for a size class yet. Deliberately
+// pessimistic-but-plausible: it should not beat a worker with real evidence.
+const UNKNOWN_JOB_MS = 5_000;
+// Ceiling on the hedge delay. Past this the second arm is so late it stops
+// being a hedge and starts being a timeout.
+const MAX_HEDGE_MS = 20_000;
+// Multiple of the favourite's predicted time to wait before hedging.
+//
+// Above 1, and that matters more than the exact value. The estimate is a *mean*,
+// so roughly half of all jobs exceed it: hedging at any fraction below 1 fires
+// on about half of all requests by construction, which is a race with extra
+// steps. Measured at 0.75 against a three-worker fleet, a third of all
+// dispatched arms were started and then cancelled. At 1.5 the second arm waits
+// until the favourite is already half again slower than its own average, which
+// is the tail a hedge is supposed to rescue.
+const HEDGE_FRACTION = 1.5;
+
+// Race outcomes per worker, for /_/routes.
+//
+// Per-isolate and therefore partial: Workers recycles isolates freely, so these
+// count one isolate's view since `raceSince`, not the fleet's since boot. That
+// is honest for a stress run — which lands on few isolates and reads them right
+// after — and useless as a long-run metric. The durable version of these
+// numbers is the scan_arm/scan_race log stream.
+const raceTally = new Map();
+const raceSince = Date.now();
+
+function tally(base) {
+  let t = raceTally.get(base);
+  if (!t) {
+    t = { started: 0, won: 0, never_started: 0, dropped: 0, failed: 0, timed: 0, ms_total: 0 };
+    raceTally.set(base, t);
+  }
+  return t;
+}
+
+// Per-isolate stats cache. Isolates are recycled often, which is exactly why
+// scan publishes its own history rather than beamline accumulating one: a cold
+// isolate gets a warm estimate from the first poll instead of routing blind
+// until it has seen enough traffic to learn.
+const statsCache = new Map();
+
+// The size buckets scan reports, and their upper bounds. Kept in step with
+// SIZE_BUCKETS in scan's src/server/mod.rs.
+const SIZE_BUCKETS = [
+  ["le_1mb", 1 << 20],
+  ["le_16mb", 16 << 20],
+  ["le_128mb", 128 << 20],
+  ["gt_128mb", Infinity],
+];
+
+function sizeBucket(bytes) {
+  for (const [name, bound] of SIZE_BUCKETS) {
+    if (bytes <= bound) return name;
+  }
+  return "gt_128mb";
+}
+
+// One worker's /_/stats, cached. Never throws: a worker that cannot be polled
+// is routed on no evidence rather than excluded, because "I could not ask" is
+// not the same as "it is unhealthy" — the circuit breaker already owns that.
+async function scanStats(env, ctx, base) {
+  const now = Date.now();
+  const hit = statsCache.get(base);
+  if (hit && now - hit.at < STATS_TTL_MS) return hit.stats;
+  let stats = null;
+  try {
+    stats = await fetchTimeout(
+      `${base}/_/stats`,
+      { method: "GET", headers: scanHeaders(env, ctx) },
+      STATS_TIMEOUT_MS,
+      // Deliberately not ctx: a caller hanging up should not poison the cache
+      // for every later request in this isolate.
+      null,
+      async (resp) => (resp.ok ? await resp.json() : null),
+    );
+  } catch {
+    stats = null;
+  }
+  statsCache.set(base, { at: now, stats });
+  return stats;
+}
+
+// Predicted milliseconds until this worker returns a verdict for an artifact of
+// `sizeHint` bytes.
+//
+// Service time alone, with no queueing term. Scan takes its slot with a
+// non-blocking try_acquire_owned() and returns 429 "At capacity" when none is
+// free, so a full worker is not slow — it is closed, and capability() excludes
+// it. An earlier version of this added `ceil(in_flight/slots) * service` for a
+// queue that does not exist, which over-penalized busy workers and oscillated:
+// route away, watch the average decay, route back.
+//
+// Size matters more than a single average admits. The 12.5s/90s split above was
+// one worker being slow at *large archives*, not slow in general — a scalar
+// average would have branded it slow for every small package too, and sent
+// those somewhere worse.
+function predictMs(stats, sizeHint) {
+  if (!stats) return UNKNOWN_JOB_MS;
+  const bucket = sizeHint != null ? stats.avg_job_ms_by_size?.[sizeBucket(sizeHint)] : null;
+  return bucket?.avg_ms ?? stats.avg_job_ms ?? UNKNOWN_JOB_MS;
+}
+
+// Does this estimate rest on anything the worker measured?
+//
+// A worker that answers /_/stats having completed no jobs reports a null
+// average, and predictMs falls back to UNKNOWN_JOB_MS for it — a default, not
+// evidence. Treating that as knowledge let a cold fleet hedge on a made-up
+// number: every worker tied at 5000ms, ranked at random, and the second arm
+// held 3750ms behind a coin toss. Answering /_/stats is not the same as having
+// something to say.
+function hasHistory(stats, sizeHint) {
+  if (!stats) return false;
+  const bucket = sizeHint != null ? stats.avg_job_ms_by_size?.[sizeBucket(sizeHint)] : null;
+  return (bucket?.avg_ms ?? stats.avg_job_ms) != null;
+}
+
+// Can this worker answer *correctly*, never mind quickly?
+//
+// These are not preferences. A worker missing 7z returns a weaker verdict on a
+// DMG rather than a slower one — and being weaker, it is also faster, so a
+// purely latency-ranked router would actively prefer it.
+function capability(stats, sizeHint) {
+  if (!stats) return null; // unknown: let the breaker decide, not a guess
+  if (stats.ready === false) return "not ready";
+  if (stats.overloaded === true) return "overloaded";
+  // Not a slow worker — a closed one. scan's slot acquire is non-blocking and
+  // answers 429 rather than queueing, so dispatching here buys a rejection.
+  if ((stats.slots_free ?? 1) <= 0) return "at capacity";
+  // `!= null`, not truthiness: a worker advertising 0 accepts nothing, and
+  // reading that as "no limit" sends it exactly the bodies it will refuse.
+  if (sizeHint != null && stats.max_upload_mb != null && sizeHint > stats.max_upload_mb * 1024 * 1024) {
+    return `upload limit ${stats.max_upload_mb}MB < ${sizeHint}B`;
+  }
+  return null;
+}
+
+// Order workers best-first, and say how long to hold the second arm.
+//
+// Ties and near-ties are broken randomly rather than by a stable sort. Always
+// sending to the current best is self-reinforcing: everyone piles onto whichever
+// worker last looked fastest until it is the slowest, then the fleet flips. A
+// little jitter damps that for no measurable loss.
+async function rankPool(env, ctx, workers, sizeHint) {
+  const scored = await Promise.all(
+    workers.map(async (base, i) => {
+      const stats = await scanStats(env, ctx, base);
+      return {
+        base,
+        stats,
+        i,
+        est: predictMs(stats, sizeHint),
+        known: hasHistory(stats, sizeHint),
+        why: capability(stats, sizeHint),
+        r: Math.random(),
+      };
+    }),
+  );
+  const usable = scored.filter((w) => w.why == null);
+  // Everything filtered out means the filter is wrong, or the fleet is. Either
+  // way, refusing to dispatch is worse than dispatching on stale information.
+  const pool = usable.length ? usable : scored;
+  // Near-ties break randomly *only between workers we have evidence for*.
+  // Always picking the current best is self-reinforcing — everyone piles onto
+  // whichever worker last looked fastest until it is the slowest, then the
+  // fleet flips — and jitter damps that. With no evidence there is nothing to
+  // damp, and the order the operator configured is a better guess than a coin
+  // toss, so ties fall back to it.
+  pool.sort((a, b) => {
+    if (Math.abs(a.est - b.est) >= 250) return a.est - b.est;
+    if (a.known && b.known) return a.r - b.r;
+    return a.i - b.i;
+  });
+  // Holding an arm back is a bet that the favourite is genuinely the fastest.
+  // With no stats to bet on, the ranking is arbitrary and the bet is a coin
+  // toss with a long delay attached — strictly worse than asking everyone. So
+  // evidence buys the hedge: no evidence, flat race, as before.
+  const informed = pool[0].known;
+  const hedge = informed ? Math.min(MAX_HEDGE_MS, Math.round(pool[0].est * HEDGE_FRACTION)) : 0;
+  return { pool, excluded: usable.length ? scored.filter((w) => w.why != null) : [], hedge, informed };
+}
+
+async function rankWorkers(env, ctx, workers, ids, sizeHint) {
+  const ranked = await rankPool(env, ctx, workers, sizeHint);
+  logLine("scan_route", {
+    order: ranked.pool.map((w) => hostOf(w.base)).join(","),
+    est_ms: ranked.pool.map((w) => Math.round(w.est)).join(","),
+    excluded: ranked.excluded.length || undefined,
+    hedge_ms: ranked.hedge,
+    informed: ranked.informed || undefined,
+    size: sizeHint ?? undefined,
+    ...ids,
+  });
+  return {
+    workers: ranked.pool.map((w) => w.base),
+    hedge: ranked.hedge,
+    est: new Map(ranked.pool.map((w) => [w.base, Math.round(w.est)])),
+  };
+}
+
+// GET /_/routes[?size=<bytes|10mb>] — what the router would do right now.
+//
+// A dry run of the real ranking, not a description of it: it calls the same
+// rankPool() a dispatch calls, so the two cannot drift. Without ?size it
+// answers for every size bucket at once, which is the view that shows a worker
+// being fast at small packages and slow at large ones — the case a single
+// average hides and the reason routing is size-aware at all.
+//
+// Behind the token gate with everything else: this names every worker and its
+// current load.
+async function handleRoutes(env, ctx, url) {
+  const raw = (url.searchParams.get("size") || "").trim();
+  // "none" is the PURL path: beamline learns an artifact's size only after scan
+  // resolves it, so a `?purl=` dispatch ranks on the scalar average with no
+  // bucket. That is most of the traffic on this fleet, so it is the first thing
+  // this view should be able to answer.
+  const unsized = raw.toLowerCase() === "none";
+  const size = raw && !unsized ? parseSize(raw) : null;
+  if (raw && !unsized && size == null) return json({ error: "invalid size" }, 400);
+
+  const all = urlList(env.SCAN_URL);
+  if (!all.length) return json({ error: "no SCAN_URL configured" }, 503);
+  // scanWorkers() filters tripped workers out before ranking ever sees them,
+  // so a breaker-excluded worker would otherwise just vanish from this view
+  // with no explanation — which is precisely when an operator is looking.
+  const live = all.filter((base) => !breakerFor(base).open());
+
+  let sizes;
+  if (unsized) sizes = [["unsized", null]];
+  else if (size != null) sizes = [[sizeBucket(size), size]];
+  else sizes = [["unsized", null], ...SIZE_BUCKETS.map(([n, b]) => [n, b === Infinity ? (128 << 20) + 1 : b])];
+  const routes = [];
+  for (const [bucket, bytes] of sizes) {
+    if (!live.length) {
+      routes.push({ size_bucket: bucket, size_bytes: bytes ?? undefined, dispatch: [], note: "every worker's breaker is open" });
+      continue;
+    }
+    const ranked = await rankPool(env, ctx, live, bytes);
+    const stagger = numEnv(env, "SCAN_RACE_DELAY_MS", ranked.hedge);
+    routes.push({
+      size_bucket: bucket,
+      size_bytes: bytes ?? undefined,
+      informed: ranked.informed,
+      hedge_ms: ranked.hedge,
+      // The delay each arm would actually wait. Arm i waits i*stagger, so a
+      // third worker is held twice as long as the second — the number an
+      // operator wants is this one, not the hedge it was derived from.
+      dispatch: ranked.pool.map((w, i) => ({
+        worker: hostOf(w.base),
+        est_ms: Math.round(w.est),
+        delay_ms: i * stagger,
+      })),
+      excluded: ranked.excluded.map((w) => ({ worker: hostOf(w.base), reason: w.why })),
+    });
+  }
+
+  // Stamped after ranking, not before: rankPool refreshes the stats cache, so a
+  // `now` taken up front is older than the readings it is used to age and every
+  // fresh poll reports a negative age.
+  const now = Date.now();
+  return json(
+    {
+      stats_ttl_ms: STATS_TTL_MS,
+      // A stagger that is not the hedge means SCAN_RACE_DELAY_MS is pinning it,
+      // which is otherwise invisible and explains a plan that looks wrong.
+      scan_race_delay_ms: numEnv(env, "SCAN_RACE_DELAY_MS", null) ?? undefined,
+      // Window these cover. Short relative to the run means the isolate was
+      // recycled mid-flight and the tallies below undercount.
+      race_window_ms: now - raceSince,
+      workers: all.map((base) => {
+        const hit = statsCache.get(base);
+        const t = raceTally.get(base);
+        return {
+          worker: hostOf(base),
+          breaker: breakerFor(base).open() ? "open" : "closed",
+          // What this worker was actually asked to do, and how that ended.
+          // `never_started` is work the hedge saved; `dropped` is work already
+          // running that a faster worker made redundant — the number that says
+          // whether racing is costing real capacity.
+          race: t
+            ? { ...t, avg_ms: t.timed ? Math.round(t.ms_total / t.timed) : undefined, ms_total: undefined, timed: undefined }
+            : undefined,
+          stats_age_ms: hit ? now - hit.at : undefined,
+          // null means polled and unanswered, which is not the same as never
+          // polled — one is a worker in trouble, the other is a cold isolate.
+          stats: hit ? hit.stats : undefined,
+        };
+      }),
+      routes,
+    },
+    200,
+  );
+}
+
+// Bytes, or a human size like "10mb". Returns null on anything else.
+function parseSize(raw) {
+  const m = /^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$/i.exec(raw);
+  if (!m) return null;
+  const scale = { b: 1, kb: 1 << 10, mb: 1 << 20, gb: 1 << 30 }[(m[2] || "b").toLowerCase()];
+  const n = Number(m[1]) * scale;
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+}
+
+async function raceScan(env, ctx, ids, run, sizeHint = null) {
+  let available = scanWorkers(env);
+  // An experiment pins the route so predicted and actual can be compared for a
+  // worker the router would not have chosen — the counterfactual a passive log
+  // cannot supply. Deliberately applied after the breaker filter: pinning is
+  // for measuring a healthy worker, not for reviving a tripped one.
+  if (ctx.pin) {
+    available = available.filter((base) => hostOf(base) === ctx.pin);
+    if (!available.length) return { unavailable: true, pinned: ctx.pin };
+  }
+  if (!available.length) return { unavailable: true };
+  // Best-first, with a hedge delay derived from the favourite's own estimate.
+  // SCAN_RACE_DELAY_MS still wins when set, so an operator can pin the old flat
+  // race (0) or a fixed stagger without touching code.
+  const ranked = await rankWorkers(env, ctx, available, ids, sizeHint);
+  const workers = ranked.workers;
+  const estOf = ranked.est;
+  const stagger = numEnv(env, "SCAN_RACE_DELAY_MS", ranked.hedge);
   const t0 = Date.now();
   const controls = workers.map(() => new AbortController());
   const arms = workers.map((base, i) => watch(scanArm(env, ctx, ids, run, base, i * stagger, controls[i])));
@@ -742,6 +1117,11 @@ async function raceScan(env, ctx, ids, run) {
       logLine("scan_race", {
         winner: hostOf(won.value.base),
         ms: Date.now() - t0,
+        // Prediction beside outcome on one line. Routing that is never scored
+        // against reality is a guess wearing arithmetic, and joining two log
+        // lines by rid to find out is a thing nobody does twice.
+        est_ms: estOf.get(won.value.base),
+        pinned: ctx.pin || undefined,
         scan_ms: won.value.scanned.ms,
         raced: workers.length,
         dropped: dropped.length ? dropped.join(",") : undefined,
@@ -779,15 +1159,18 @@ async function scanArm(env, ctx, ids, run, base, waitMs, control) {
     try {
       await sleep(waitMs, armCtx);
     } catch {
+      tally(base).never_started += 1;
       logLine("scan_arm", { worker, outcome: "never_started", ...ids });
       return { base, scanned: { cancelled: true, worker } };
     }
   }
   if (control.signal.aborted) {
+    tally(base).never_started += 1;
     logLine("scan_arm", { worker, outcome: "never_started", ...ids });
     return { base, scanned: { cancelled: true, worker } };
   }
   const t0 = Date.now();
+  tally(base).started += 1;
   logLine("scan_arm_start", { worker, held_ms: waitMs || undefined, ...ids });
   let scanned;
   try {
@@ -797,12 +1180,19 @@ async function scanArm(env, ctx, ids, run, base, waitMs, control) {
     // far behind it was: that margin is the whole picture of which worker is
     // slow, and it is invisible if a loser just disappears.
     if (!control.signal.aborted) throw err;
+    tally(base).dropped += 1;
     logLine("scan_arm", { worker, ms: Date.now() - t0, outcome: "dropped", ...ids });
     return { base, scanned: { cancelled: true, worker } };
   }
+  const armMs = Date.now() - t0;
+  const t = tally(base);
+  t.ms_total += armMs;
+  t.timed += 1;
+  if (scanned?.env) t.won += 1;
+  else t.failed += 1;
   logLine("scan_arm", {
     worker,
-    ms: Date.now() - t0,
+    ms: armMs,
     scan_ms: scanned?.totalMs,
     status: scanned?.status,
     outcome: scanned?.env ? "answered" : scanned?.rejected ? "rejected" : "unavailable",

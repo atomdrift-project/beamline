@@ -2261,6 +2261,7 @@ function mockBackend(opts) {
     result: 0,
     upload: 0,
     rescan: 0,
+    stats: 0,
   };
   const results = [];
   const auths = [];
@@ -2273,6 +2274,11 @@ function mockBackend(opts) {
         rid: req.headers["x-request-id"] || "",
       });
       const body = await readReq(req);
+      if (url.pathname === "/_/stats") {
+        hits.stats += 1;
+        if (!opts.stats) return send(res, 404, { error: "not found" });
+        return send(res, 200, typeof opts.stats === "function" ? opts.stats() : opts.stats);
+      }
       if (url.pathname === "/lookup") {
         hits.bloom += 1;
         if (opts.bloomDelayMs) await new Promise((r) => setTimeout(r, opts.bloomDelayMs));
@@ -2381,3 +2387,383 @@ async function listen(server) {
       }),
   };
 }
+
+const SIZE_BUCKET_COUNT = 5; // four buckets plus the unsized (PURL) route
+function hostOf(u) { return new URL(u).host; }
+
+// --- routing ---------------------------------------------------------------
+
+// Shape of a /_/stats reply, with only the fields routing reads.
+function statsFor({ slots = 8, free = 8, inFlight = 0, ms = 1000, bySize = {}, ...rest } = {}) {
+  return {
+    slots,
+    slots_free: free,
+    in_flight: inFlight,
+    ready: true,
+    overloaded: false,
+    max_upload_mb: 100,
+    avg_job_ms: ms,
+    avg_job_ms_by_size: bySize,
+    ...rest,
+  };
+}
+
+test("routing asks the worker its own history says is faster for this size", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  // Equal overall, but one is far better at small inputs — which is what a
+  // single scalar average would have hidden.
+  const small = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 8000, bySize: { le_1mb: { jobs: 50, avg_ms: 200 } } }),
+    analyze: () => envelope(HELLO_SHA, { eng: "small-specialist" }),
+  });
+  const big = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 8000, bySize: { le_1mb: { jobs: 50, avg_ms: 9000 } } }),
+    analyze: () => envelope(HELLO_SHA, { eng: "big-specialist" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${big.url},${small.url}` });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "small-specialist", "size-bucket history was ignored");
+    // Hedged, not raced: the favourite answered well inside its own estimate,
+    // so the other worker was never asked and spent no slot.
+    assert.equal(big.hits.analyze, 0, "the hedge fired even though the favourite was prompt");
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), small.close(), big.close()]);
+  }
+});
+
+test("a saturated worker loses to an idle one with the same service time", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const busy = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ slots: 4, free: 0, inFlight: 8, ms: 1000 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "busy" }),
+  });
+  const idle = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ slots: 4, free: 4, inFlight: 0, ms: 1000 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "idle" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${busy.url},${idle.url}` });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "idle", "queue depth was ignored");
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), busy.close(), idle.close()]);
+  }
+});
+
+test("a worker that cannot take the upload is not asked at all", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  // Would be picked on latency alone; it simply cannot accept the body.
+  const tiny = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 1, max_upload_mb: 0 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "too-small" }),
+  });
+  const roomy = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 9000 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "roomy" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${tiny.url},${roomy.url}` });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "roomy");
+    assert.equal(tiny.hits.analyze, 0, "an incapable worker was still asked");
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), tiny.close(), roomy.close()]);
+  }
+});
+
+test("an unready worker is skipped even when it looks fastest", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const loading = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 1, ready: false }),
+    analyze: () => envelope(HELLO_SHA, { eng: "loading" }),
+  });
+  const serving = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 9000 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "serving" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${loading.url},${serving.url}` });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "serving");
+    assert.equal(loading.hits.analyze, 0);
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), loading.close(), serving.close()]);
+  }
+});
+
+test("with no stats to go on it falls back to racing everyone", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  // Neither serves /_/stats. Holding an arm back would be a coin toss with a
+  // long delay attached, so the old flat race is the right answer.
+  const slow = await mockBackend({
+    bloom: "unknown",
+    analyze: async () => {
+      await delay(300);
+      return envelope(HELLO_SHA, { eng: "slow" });
+    },
+  });
+  const fast = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "fast" }) });
+  const env = testEnv(hopper.url, { SCAN_URL: `${slow.url},${fast.url}` });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "fast", "uninformed routing must still race");
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), slow.close(), fast.close()]);
+  }
+});
+
+test("/_/routes dry-runs the real ranking, per size bucket", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // Fast on small inputs, slow on large ones — the split a scalar average
+  // hides, and the reason this view is per-bucket.
+  const specialist = await mockBackend({
+    stats: statsFor({ ms: 9000, bySize: { le_1mb: { jobs: 40, avg_ms: 200 } } }),
+  });
+  const steady = await mockBackend({ stats: statsFor({ ms: 3000 }) });
+  const env = testEnv(hopper.url, { SCAN_URL: `${specialist.url},${steady.url}` });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes"), env, waitCtx().ctx);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+
+    assert.equal(body.routes[0].size_bucket, "unsized", "the PURL path is the common case and comes first");
+    const small = body.routes.find((r) => r.size_bucket === "le_1mb");
+    assert.equal(small.dispatch[0].worker, hostOf(specialist.url));
+    assert.equal(small.dispatch[0].est_ms, 200);
+    assert.equal(small.dispatch[0].delay_ms, 0, "the favourite must go immediately");
+    assert.equal(small.dispatch[1].delay_ms, small.hedge_ms, "arm 1 waits one stagger");
+    assert.equal(small.hedge_ms, 300, "hedge is 1.5x the favourite's own estimate");
+
+    // Same fleet, same instant, opposite order — which is the whole point.
+    const large = body.routes.find((r) => r.size_bucket === "le_128mb");
+    assert.equal(large.dispatch[0].worker, hostOf(steady.url));
+    assert.equal(body.routes.length, SIZE_BUCKET_COUNT);
+  } finally {
+    await Promise.all([hopper.close(), specialist.close(), steady.close()]);
+  }
+});
+
+test("/_/routes says why a worker was excluded", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  const loading = await mockBackend({ stats: statsFor({ ms: 1, ready: false }) });
+  const serving = await mockBackend({ stats: statsFor({ ms: 3000 }) });
+  const env = testEnv(hopper.url, { SCAN_URL: `${loading.url},${serving.url}` });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
+    const body = await res.json();
+    assert.equal(body.routes.length, 1, "?size= answers for one bucket");
+    assert.equal(body.routes[0].size_bucket, "le_1mb");
+    const [route] = body.routes;
+    assert.deepEqual(
+      route.excluded,
+      [{ worker: hostOf(loading.url), reason: "not ready" }],
+      "an excluded worker must carry its reason, not just vanish",
+    );
+    assert.equal(route.dispatch.length, 1);
+  } finally {
+    await Promise.all([hopper.close(), loading.close(), serving.close()]);
+  }
+});
+
+test("/_/routes rejects a size it cannot parse", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  const scan = await mockBackend({ stats: statsFor({}) });
+  const env = testEnv(hopper.url, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?size=huge"), env, waitCtx().ctx);
+    assert.equal(res.status, 400);
+  } finally {
+    await Promise.all([hopper.close(), scan.close()]);
+  }
+});
+
+test("/_/routes is behind the token gate", async () => {
+  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "secret" };
+  const res = await handle(new Request("http://beamline/_/routes"), env, waitCtx().ctx);
+  assert.equal(res.status, 401, "the route names every worker and its load");
+});
+
+test("a full worker is excluded as closed, not ranked as slow", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  // Fast on paper, but its next try_acquire_owned() returns 429.
+  const full = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ slots: 4, free: 0, inFlight: 4, ms: 100 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "full" }),
+  });
+  const open = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ slots: 4, free: 2, ms: 8000 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "open" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${full.url},${open.url}` });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "open");
+    assert.equal(full.hits.analyze, 0, "dispatching to a full worker buys a 429");
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), full.close(), open.close()]);
+  }
+});
+
+test("prediction is service time, with no queue term added", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // Busy but not full: scan does not queue, so in_flight must not inflate the
+  // estimate. 3 of 4 slots taken, and the estimate is still the raw average.
+  const busy = await mockBackend({ stats: statsFor({ slots: 4, free: 1, inFlight: 3, ms: 2000 }) });
+  const env = testEnv(hopper.url, { SCAN_URL: busy.url });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
+    const body = await res.json();
+    assert.equal(body.routes[0].dispatch[0].est_ms, 2000, "in_flight must not be added as queue wait");
+  } finally {
+    await Promise.all([hopper.close(), busy.close()]);
+  }
+});
+
+test("X-Beamline-Pin forces the route the router would not have chosen", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const quick = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 100 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "quick" }),
+  });
+  const slow = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 9000 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "slow" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${quick.url},${slow.url}` });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
+        method: "POST",
+        body: HELLO,
+        headers: { "x-beamline-pin": hostOf(slow.url) },
+      }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "slow", "the pin was ignored");
+    assert.equal(quick.hits.analyze, 0, "a pinned run must not also race the favourite");
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), quick.close(), slow.close()]);
+  }
+});
+
+test("a pinned run is never answered from cache", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const a = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 100 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "a" }),
+  });
+  const b = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 100 }),
+    analyze: () => envelope(HELLO_SHA, { eng: "b" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${a.url},${b.url}` });
+  const ask = async (pin) => {
+    const ctx = waitCtx();
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
+        method: "POST",
+        body: HELLO,
+        headers: pin ? { "x-beamline-pin": pin } : {},
+      }),
+      env,
+      ctx.ctx,
+    );
+    const body = await res.json();
+    await ctx.flush();
+    return body;
+  };
+  try {
+    await ask(null); // warms the cache under this key
+    const pinned = await ask(hostOf(b.url));
+    assert.equal(pinned.eng, "b", "the cached verdict answered instead of the pinned worker");
+    assert.ok(b.hits.analyze >= 1, "the pinned worker must actually be timed");
+  } finally {
+    await Promise.all([hopper.close(), a.close(), b.close()]);
+  }
+});
+
+test("/_/routes ages stats against a clock read after they are refreshed", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  const scan = await mockBackend({ stats: statsFor({ ms: 1000 }) });
+  const env = testEnv(hopper.url, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes"), env, waitCtx().ctx);
+    const body = await res.json();
+    // A freshly polled worker is 0ms old, never -11ms.
+    assert.ok(body.workers[0].stats_age_ms >= 0, `negative age: ${body.workers[0].stats_age_ms}`);
+  } finally {
+    await Promise.all([hopper.close(), scan.close()]);
+  }
+});
+
+test("a worker that answers /_/stats with no history is not evidence", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // Reachable and healthy, but has completed nothing: avg_job_ms is null.
+  const cold = await mockBackend({ stats: statsFor({ ms: null }) });
+  const also = await mockBackend({ stats: statsFor({ ms: null }) });
+  const env = testEnv(hopper.url, { SCAN_URL: `${cold.url},${also.url}` });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?size=none"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    assert.equal(route.informed, false, "a null average is a default, not knowledge");
+    assert.equal(route.hedge_ms, 0, "hedging on a made-up estimate serializes a cold fleet");
+    assert.equal(route.dispatch[1].delay_ms, 0);
+  } finally {
+    await Promise.all([hopper.close(), cold.close(), also.close()]);
+  }
+});

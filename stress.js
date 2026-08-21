@@ -101,9 +101,11 @@ async function main() {
   if (popular) {
     const jobs = mixJobs(popularJobs(), samples || Infinity);
     process.stderr.write(`submitting ${jobs.length} popular PURLs\n`);
+    const before = await raceSnapshot();
     const rows = await pool(jobs, concurrency, submit);
     const summary = summarize(rows);
     printReport(rows, summary, []);
+    printRace(raceDelta(before, await raceSnapshot()));
     if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, rows, summary });
     process.exit(summary.bugs.length ? 1 : 0);
   }
@@ -131,9 +133,11 @@ async function main() {
   }
 
   process.stderr.write(`submitting ${jobs.length} PURLs\n`);
+  const before = await raceSnapshot();
   const rows = await pool(jobs, concurrency, submit);
   const summary = summarize(rows);
   printReport(rows, summary, feedErrors);
+  printRace(raceDelta(before, await raceSnapshot()));
   if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, rows, summary });
   process.exit(summary.bugs.length ? 1 : 0);
 }
@@ -338,6 +342,7 @@ async function ask(item, url, method) {
       ms,
       status: resp.status,
       source: resp.headers.get("x-beamline-source") || "",
+      worker: resp.headers.get("x-beamline-worker") || "",
       sha: (body && body.sha) || resp.headers.get("x-sha256") || "",
       encoding: resp.headers.get("content-encoding") || "",
       error: body && body.error,
@@ -485,6 +490,76 @@ function logRow(r) {
   process.stderr.write(`${tag} ${ms}ms ${src} ${eco} ${r.purl}  ${extra}${how}\n`);
 }
 
+// beamline's per-worker race tallies. Null when the endpoint is absent (an
+// older deployment) — reported as unavailable rather than as zero, because
+// "no work was cancelled" and "nobody counted" look identical otherwise.
+async function raceSnapshot() {
+  if (!beamlineUrl) return null;
+  try {
+    const resp = await get(`${beamlineUrl}/_/routes?size=none`, META_TIMEOUT_MS, token ? { authorization: `Bearer ${token}` } : {});
+    if (!resp.ok) return null;
+    const body = await readJson(resp);
+    const out = new Map();
+    for (const w of body?.workers || []) if (w.race) out.set(w.worker, w.race);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+// after - before, per worker. An isolate recycled mid-run restarts its counters,
+// which shows up as a smaller "after"; treat that worker's window as starting
+// from zero and say so, rather than reporting a negative count.
+function raceDelta(before, after) {
+  if (!after) return null;
+  const keys = ["started", "won", "never_started", "dropped", "failed"];
+  const rows = [];
+  let recycled = false;
+  for (const [worker, a] of after) {
+    const b = (before && before.get(worker)) || null;
+    const reset = b && keys.some((k) => (a[k] || 0) < (b[k] || 0));
+    if (reset) recycled = true;
+    const d = { worker };
+    for (const k of keys) d[k] = (a[k] || 0) - (reset || !b ? 0 : b[k] || 0);
+    rows.push(d);
+  }
+  return { rows, recycled };
+}
+
+function printRace(delta) {
+  if (!delta) {
+    process.stdout.write("\nrace     unavailable (beamline has no /_/routes, or it declined)\n");
+    return;
+  }
+  const tot = delta.rows.reduce(
+    (a, r) => ({
+      started: a.started + r.started,
+      won: a.won + r.won,
+      never_started: a.never_started + r.never_started,
+      dropped: a.dropped + r.dropped,
+    }),
+    { started: 0, won: 0, never_started: 0, dropped: 0 },
+  );
+  // Every arm beamline created: the ones it ran, plus the ones the hedge
+  // spared. That total is the denominator for "what fraction was wasted".
+  const arms = tot.started + tot.never_started;
+  const pct = (x) => (arms ? `${((x / arms) * 100).toFixed(1)}%` : "-");
+  process.stdout.write(`\nrace     ${arms} arms for ${tot.won} verdicts\n`);
+  process.stdout.write(`  spared by hedge  ${tot.never_started} (${pct(tot.never_started)})  never dispatched\n`);
+  process.stdout.write(`  cancelled        ${tot.dropped} (${pct(tot.dropped)})  work started, then beaten\n`);
+  if (delta.recycled) {
+    process.stdout.write("  note: an isolate was recycled mid-run; these undercount\n");
+  }
+  process.stdout.write("\nby worker\n");
+  for (const r of delta.rows.sort((a, b) => b.won - a.won)) {
+    process.stdout.write(
+      `  ${r.worker.padEnd(34)} won ${String(r.won).padStart(4)}  ran ${String(r.started).padStart(4)}` +
+        `  spared ${String(r.never_started).padStart(4)}  cancelled ${String(r.dropped).padStart(4)}` +
+        `  failed ${String(r.failed).padStart(3)}\n`,
+    );
+  }
+}
+
 function summarize(rows) {
   const ok = rows.filter((r) => r.kind === "ok");
   const bugs = rows.filter((r) => r.kind === "bug");
@@ -492,6 +567,13 @@ function summarize(rows) {
   const misses = rows.filter((r) => r.kind === "miss");
   const lat = ok.map((r) => r.ms).sort((a, b) => a - b);
   const bySource = countBy(ok, (r) => r.source || "unknown");
+  const served = ok.filter((r) => r.source === "scan" && r.worker);
+  const byWorker = countBy(served, (r) => r.worker);
+  const workerLatency = {};
+  for (const w of Object.keys(byWorker)) {
+    const lats = served.filter((r) => r.worker === w).map((r) => r.ms).sort((a, b) => a - b);
+    workerLatency[w] = { n: lats.length, p50: percentile(lats, 50), p95: percentile(lats, 95), max: lats[lats.length - 1] };
+  }
   const byEco = countBy(rows, (r) => r.eco);
   const byKind = countBy(rows, (r) => r.kind);
   return {
@@ -501,6 +583,9 @@ function summarize(rows) {
     notes,
     misses,
     bySource,
+    byWorker,
+    workerLatency,
+    served: served.length,
     byEco,
     byKind,
     latency: {
@@ -525,6 +610,16 @@ function printReport(rows, summary, feedErrors) {
   process.stdout.write(`latency  p50=${fmtMs(L.p50)} p95=${fmtMs(L.p95)} p99=${fmtMs(L.p99)} max=${fmtMs(L.max)}  (ok n=${L.n})\n`);
   process.stdout.write(`source   ${fmtMap(summary.bySource)}\n`);
   process.stdout.write(`eco      ${fmtMap(summary.byEco)}\n`);
+  if (summary.served) {
+    process.stdout.write(`\nserved   ${summary.served} of ${summary.ok} by a worker (rest: cache or hopper)\n`);
+    for (const [w, c] of Object.entries(summary.byWorker).sort((a, b) => b[1] - a[1])) {
+      const l = summary.workerLatency[w];
+      const share = ((c / summary.served) * 100).toFixed(1);
+      process.stdout.write(
+        `  ${w.padEnd(34)} ${String(c).padStart(4)} (${share.padStart(5)}%)  p50 ${l.p50}ms  p95 ${l.p95}ms  max ${l.max}ms\n`,
+      );
+    }
+  }
   if (summary.misses.length) {
     process.stdout.write("misses (nothing has analyzed these yet)\n");
     for (const r of summary.misses) process.stdout.write(`  ${r.purl}\n`);
