@@ -2388,7 +2388,7 @@ async function listen(server) {
   };
 }
 
-const SIZE_BUCKET_COUNT = 5; // four buckets plus the unsized (PURL) route
+const ROUTE_CLASS_COUNT = 8; // four PURL types plus four size buckets
 function hostOf(u) { return new URL(u).host; }
 
 // --- routing ---------------------------------------------------------------
@@ -2566,8 +2566,8 @@ test("/_/routes dry-runs the real ranking, per size bucket", async () => {
     assert.equal(res.status, 200);
     const body = await res.json();
 
-    assert.equal(body.routes[0].size_bucket, "unsized", "the PURL path is the common case and comes first");
-    const small = body.routes.find((r) => r.size_bucket === "le_1mb");
+    assert.equal(body.routes[0].kind, "purl_type", "the PURL path is the common case and comes first");
+    const small = body.routes.find((r) => r.class === "le_1mb");
     assert.equal(small.dispatch[0].worker, hostOf(specialist.url));
     assert.equal(small.dispatch[0].est_ms, 200);
     assert.equal(small.dispatch[0].delay_ms, 0, "the favourite must go immediately");
@@ -2575,9 +2575,9 @@ test("/_/routes dry-runs the real ranking, per size bucket", async () => {
     assert.equal(small.hedge_ms, 300, "hedge is 1.5x the favourite's own estimate");
 
     // Same fleet, same instant, opposite order — which is the whole point.
-    const large = body.routes.find((r) => r.size_bucket === "le_128mb");
+    const large = body.routes.find((r) => r.class === "le_128mb");
     assert.equal(large.dispatch[0].worker, hostOf(steady.url));
-    assert.equal(body.routes.length, SIZE_BUCKET_COUNT);
+    assert.equal(body.routes.length, ROUTE_CLASS_COUNT);
   } finally {
     await Promise.all([hopper.close(), specialist.close(), steady.close()]);
   }
@@ -2592,7 +2592,7 @@ test("/_/routes says why a worker was excluded", async () => {
     const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
     const body = await res.json();
     assert.equal(body.routes.length, 1, "?size= answers for one bucket");
-    assert.equal(body.routes[0].size_bucket, "le_1mb");
+    assert.equal(body.routes[0].class, "le_1mb");
     const [route] = body.routes;
     assert.deepEqual(
       route.excluded,
@@ -2765,5 +2765,157 @@ test("a worker that answers /_/stats with no history is not evidence", async () 
     assert.equal(route.dispatch[1].delay_ms, 0);
   } finally {
     await Promise.all([hopper.close(), cold.close(), also.close()]);
+  }
+});
+
+test("an unsized estimate compares workers on one shared job mix", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // Both took the same time per size class. They differ only in what they were
+  // fed: `lucky` saw mostly small work, `unlucky` mostly large. A scalar
+  // average would call lucky the faster machine; it is the same machine.
+  const lucky = await mockBackend({
+    stats: statsFor({
+      ms: 1200, // scalar, dragged down by an easy mix
+      bySize: { le_1mb: { jobs: 90, avg_ms: 1000 }, le_128mb: { jobs: 10, avg_ms: 3000 } },
+    }),
+  });
+  const unlucky = await mockBackend({
+    stats: statsFor({
+      ms: 2800, // scalar, inflated by a hard mix
+      bySize: { le_1mb: { jobs: 10, avg_ms: 1000 }, le_128mb: { jobs: 90, avg_ms: 3000 } },
+    }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${lucky.url},${unlucky.url}` });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?size=none"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    const [a, b] = route.dispatch;
+    assert.equal(a.est_ms, b.est_ms, `identical workers scored differently: ${a.est_ms} vs ${b.est_ms}`);
+    // Fleet mix is 100 small / 100 large, so a typical job is 2000ms.
+    assert.equal(a.est_ms, 2000);
+  } finally {
+    await Promise.all([hopper.close(), lucky.close(), unlucky.close()]);
+  }
+});
+
+test("a class a worker has never handled falls back to its own average", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // Only small-file history. Asked about a 128MB artifact it must not be
+  // predicted at its small-file speed just because that is all it has done.
+  const small = await mockBackend({
+    stats: statsFor({ ms: 9000, bySize: { le_1mb: { jobs: 40, avg_ms: 200 } } }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: small.url });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?size=128mb"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    assert.equal(route.dispatch[0].est_ms, 9000, "predicted a 128MB job at its small-file speed");
+  } finally {
+    await Promise.all([hopper.close(), small.close()]);
+  }
+});
+
+test("429 does not trip the breaker, so a busy worker is asked again", async () => {
+  // Enough 429s to open the breaker if they were counted as failures, then a
+  // verdict. The worker is healthy throughout — it was only ever full.
+  let calls = 0;
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyzePurl: () => {
+      calls += 1;
+      return calls <= 6
+        ? { status: 429, body: { error: "At capacity (4/4 active analyses)" } }
+        : envelope(HELLO_SHA, { eng: "recovered" });
+    },
+  });
+  const env = testEnv(backend.url, { SCAN_RETRY_BASE_MS: "1", SCAN_RETRIES: "8" });
+  try {
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
+      env,
+      noopCtx(),
+    );
+    assert.equal(res.status, 200, "backpressure was mistaken for a broken worker");
+    assert.equal((await res.json()).eng, "recovered");
+    assert.ok(calls > 6, `gave up after ${calls} attempts`);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a 5xx still trips the breaker", async () => {
+  // The regression guard for the change above: real failures must still open it.
+  let calls = 0;
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyzePurl: () => {
+      calls += 1;
+      return { status: 500, body: { error: "boom" } };
+    },
+  });
+  const env = testEnv(backend.url, { SCAN_RETRY_BASE_MS: "1", SCAN_RETRIES: "8" });
+  try {
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fbroken%401.0.0", { method: "POST" }),
+      env,
+      noopCtx(),
+    );
+    assert.equal(res.status, 503);
+    // BREAKER_FAILS is 5; the ladder must stop there rather than run all 8.
+    assert.ok(calls <= 6, `kept hammering a broken worker: ${calls} attempts`);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("Server-Timing reports each raced arm, not just the winner", async () => {
+  // hopper answers late; the scan index answers first and wins. Both figures
+  // must survive, or the race is unmeasurable from outside.
+  const backend = await mockBackend({
+    bloom: "skip",
+    bloomDelayMs: 20,
+    sample: async () => {
+      await delay(120);
+      return { status: 404 };
+    },
+  });
+  const env = testEnv(backend.url);
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
+      env,
+      ctx.ctx,
+    );
+    assert.equal(res.status, 200);
+    const t = res.headers.get("server-timing") || "";
+    assert.match(t, /scan_index;dur=\d+/, `no scan-index timing: ${t}`);
+    assert.match(t, /total;dur=\d+/, `no total: ${t}`);
+    await ctx.flush();
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a cached reply does not replay the timings of the request that made it", async () => {
+  const backend = await mockBackend({ bloom: "skip" });
+  const env = testEnv(backend.url);
+  const ask = async () => {
+    const ctx = waitCtx();
+    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
+    await ctx.flush();
+    return res;
+  };
+  try {
+    const first = await ask();
+    assert.ok(first.headers.get("server-timing"), "the live reply should be timed");
+    const second = await ask();
+    if (second.headers.get("x-beamline-source") === "cache") {
+      assert.equal(second.headers.get("server-timing"), null, "stale timings served as if fresh");
+    }
+  } finally {
+    await backend.close();
   }
 });
