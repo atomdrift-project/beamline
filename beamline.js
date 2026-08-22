@@ -26,6 +26,12 @@ const SCAN_RETRY_BASE_MS = 1_000;
 const SCAN_RETRY_MAX_MS = 30_000;
 const EDGE_TIMEOUT = 524;
 const MISS_MAX_AGE = 60;
+// How long a real verdict stays served from our cache. Deliberately short
+// while the service is still moving: a verdict that turns out wrong clears
+// within the hour rather than sitting in every colo for a day. Raise
+// VERDICT_MAX_AGE once the shape of the answers has settled — the cache is
+// per-colo and per-key, so a longer life is the whole of the hit rate.
+const VERDICT_MAX_AGE = 3600;
 const RETRY_AFTER_MIN_S = 3;
 const RETRY_AFTER_MAX_S = 8;
 
@@ -66,7 +72,16 @@ async function dispatch(request, env, ctx) {
   // It only restricts a choice beamline was already free to make, but it does
   // spend a scan slot on demand — so it lives behind the token gate with
   // everything else, and is bounded like any other caller-supplied header.
+  // ExecutionContext keeps waitUntil on its prototype, bound to itself, so a
+  // spread produces an object without it — and every background job would then
+  // be an unregistered promise the runtime may cancel the moment the response
+  // goes out. That is silent: the helper below simply finds no waitUntil and
+  // does nothing, so the cache never populates and nothing says why. Carry it
+  // over explicitly, still bound to the context that owns it. Every later
+  // { ...ctx } spreads this plain object, where it is an own property.
+  const host = ctx;
   ctx = { ...ctx, rid, pin: cleanId(request.headers.get("x-beamline-pin")) || null };
+  if (typeof host?.waitUntil === "function") ctx.waitUntil = (p) => host.waitUntil(p);
   if (request.signal && !ctx.signal) ctx.signal = request.signal;
 
   const url = new URL(request.url);
@@ -240,6 +255,13 @@ async function lookup(env, ctx, origin, input) {
       if (hit && !(input.analyze && hit.status !== 200)) {
         const res = new Response(hit.body, hit);
         res.headers.set("X-Beamline-Source", "cache");
+        // The stored copy is deliberately `public` so Cloudflare will hold it
+        // at all — that rewrite is between us and our own cache (see serveHit).
+        // The client's copy must carry the scope a fresh answer would, or an
+        // authenticated verdict goes out marked cacheable by every browser and
+        // shared proxy on the way back. The stored max-age is kept: Cloudflare
+        // sends an Age alongside it, which is what makes it mean anything.
+        res.headers.set("cache-control", clientScope(env, hit.headers.get("cache-control")));
         // The stored copy names whoever produced it, possibly days ago. Left
         // in place it would be read as this request's routing decision, and
         // every cache hit would be attributed to that worker.
@@ -299,12 +321,23 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
     if (header) res.headers.set("Server-Timing", header);
     return res;
   };
-  const hopper = watch(hopperSample(env, ctx, input, lookupMs, hopperCtl.signal), () => {
-    timing.hopper = at();
-  });
-  const known = watch(scanKnown(env, ctx, input, knownCtl.signal), () => {
-    timing.index = at();
-  });
+  // A pinned analysis skips the cheap sources entirely. The point of a pin is
+  // to measure one worker on one artifact, and an answer from hopper's index
+  // measures neither — it was returning a stored verdict and reporting
+  // `source: hopper`, which made the pin useless for the job it exists for.
+  // A pinned /lookup still races them: it is not allowed to analyze, so cheap
+  // sources are the only thing it has.
+  const forced = Boolean(ctx.pin) && input.analyze;
+  const hopper = forced
+    ? watch(Promise.resolve(null))
+    : watch(hopperSample(env, ctx, input, lookupMs, hopperCtl.signal), () => {
+        timing.hopper = at();
+      });
+  const known = forced
+    ? watch(Promise.resolve({ verdict: null, bloom: "unknown" }))
+    : watch(scanKnown(env, ctx, input, knownCtl.signal), () => {
+        timing.index = at();
+      });
   const hedge = deadline(hedgeMs, ctx, HEDGE);
 
   let scan = null;
@@ -332,8 +365,17 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
       dropped.push("hopper");
     }
     if (!known.done) {
-      knownCtl.abort();
-      dropped.push("scan-index");
+      // Deliberately not aborted. It is a bloom lookup already in flight, and
+      // letting it land is the only way to learn what the scan index would have
+      // cost when hopper beat it — measured over 13 live lookups, hopper won
+      // every one and the index arm's cost was therefore never once observed.
+      // Logged out-of-band so it cannot delay the reply.
+      waitUntil(
+        ctx,
+        known.settled.then(() => {
+          logLine("lookup_arms", { winner: why, index_ms: timing.index, hopper_ms: timing.hopper, ...ids });
+        }),
+      );
     }
     if (scan && !scan.done) {
       scanCtl.abort();
@@ -353,7 +395,7 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
     }
     if (known.value?.verdict) {
       stop("index_hit");
-      const res = verdictResponse(env, known.value.verdict, input, 86400);
+      const res = verdictResponse(env, known.value.verdict, input, verdictAge(env));
       logLine("lookup", { src: "scan-cache", status: 200, ms: Date.now() - t0, ...ids });
       return timed(serveHit(ctx, cache, cacheKey, res));
     }
@@ -467,7 +509,7 @@ async function scanLookup(env, ctx, input, scanCtl) {
 }
 
 function replyHopper(env, ctx, cache, cacheKey, input, hopper, t0, hedged) {
-  const res = envelopeResponse(env, hopper.body, hopper.sha, "hopper", 86400, null, input.purl);
+  const res = envelopeResponse(env, hopper.body, hopper.sha, "hopper", verdictAge(env), null, input.purl);
   logLine("lookup", {
     src: "hopper",
     status: 200,
@@ -481,7 +523,7 @@ function replyHopper(env, ctx, cache, cacheKey, input, hopper, t0, hedged) {
 
 function replyScan(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0, hedged) {
   const sha = input.sha || scanned.sha || shaFromEnvelope(scanned.env);
-  const res = envelopeResponse(env, scanned.env, sha, "scan", 86400, scanned.totalMs, input.purl);
+  const res = envelopeResponse(env, scanned.env, sha, "scan", verdictAge(env), scanned.totalMs, input.purl);
   // Who actually produced this. Without it a client can measure that beamline
   // was slow but not which worker made it so, and work distribution is only
   // visible by reading the logs of a process it does not run.
@@ -529,7 +571,7 @@ async function settle(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, 
   const queued = input.analyze ? await queueAndWait(env, ctx, hopper, input, bytes, scanned) : null;
   if (queued?.env) {
     note("hopper", 200, { queued: true });
-    const res = envelopeResponse(env, queued.env, queued.sha, "hopper", 86400, null, input.purl);
+    const res = envelopeResponse(env, queued.env, queued.sha, "hopper", verdictAge(env), null, input.purl);
     return serveHit(ctx, cache, cacheKey, res);
   }
   if (queued?.failed) {
@@ -824,19 +866,60 @@ const STATS_TIMEOUT_MS = 1_500;
 // Used when a worker has no history for a size class yet. Deliberately
 // pessimistic-but-plausible: it should not beat a worker with real evidence.
 const UNKNOWN_JOB_MS = 5_000;
-// Ceiling on the hedge delay. Past this the second arm is so late it stops
-// being a hedge and starts being a timeout.
-const MAX_HEDGE_MS = 20_000;
-// Multiple of the favourite's predicted time to wait before hedging.
+// Completions a class average needs before it is treated as evidence.
 //
-// Above 1, and that matters more than the exact value. The estimate is a *mean*,
-// so roughly half of all jobs exceed it: hedging at any fraction below 1 fires
-// on about half of all requests by construction, which is a race with extra
-// steps. Measured at 0.75 against a three-worker fleet, a third of all
-// dispatched arms were started and then cancelled. At 1.5 the second arm waits
-// until the favourite is already half again slower than its own average, which
-// is the tail a hedge is supposed to rescue.
-const HEDGE_FRACTION = 1.5;
+// One sample is a story, not a statistic, and the router had no way to tell the
+// difference: `hasHistory` accepted any non-null average, so a worker that had
+// finished exactly one large archive was ranked as though it were slow at
+// everything. Observed live right after a restart — the fleet's *fastest*
+// worker was demoted to second on n=1 while another led on n=6. Below this
+// threshold the next-broadest evidence is used instead.
+const MIN_CLASS_SAMPLES = 5;
+// How heavily occupancy counts against a worker's estimate.
+//
+// scan rejects rather than queues, so a busy worker's real cost is not a longer
+// wait — it is the chance of a 429 and a hop to somebody else. At 1.0 a fully
+// occupied worker is scored as though the work took twice as long, which is
+// roughly what a rejection plus a failover costs now that a refusal promotes
+// the next arm immediately.
+//
+// Ranking on latency alone had a specific failure: the fleet's *smallest*
+// worker was also its fastest, so it won every first-arm dispatch, filled its
+// six slots in milliseconds and refused the rest — while a 64-slot worker sat
+// with 44 free. Speed and capacity are different questions and the router was
+// only asking one.
+const CAPACITY_WEIGHT = 1.0;
+
+// occupancy is the fraction of a worker's slots in use, clamped to [0,1].
+// Unknown slots mean an unknown answer, and 0 keeps such a worker ranked on
+// latency alone rather than inventing a penalty for it.
+function occupancy(stats) {
+  const slots = Number(stats?.slots);
+  if (!Number.isFinite(slots) || slots <= 0) return 0;
+  const busy = Number(stats.in_flight ?? slots - (stats.slots_free ?? slots));
+  if (!Number.isFinite(busy) || busy <= 0) return 0;
+  return Math.min(1, busy / slots);
+}
+// The hedge is a stall detector, not a latency optimizer.
+//
+// It used to be the latter, and the distinction is the whole design. Racing
+// every worker at once wasted a full analysis per request; hedging below the
+// expected time fired on roughly half of them, because the estimate is a
+// central tendency and half of all jobs exceed it. Neither is what a second
+// arm is for now: routing picks the favourite on measured p80, and a refusal
+// promotes the next worker immediately, so the only failure a hedge still
+// covers is a worker that *accepted* the work and then went quiet.
+//
+// So it fires late and rarely. A worker past this multiple of its own p80 is
+// not slow, it is stuck — and the alternative is waiting out SCAN_TIMEOUT_MS,
+// which is thirty minutes.
+const HEDGE_FRACTION = 3;
+// Ceiling on the hedge delay, as a fraction of the scan timeout rather than a
+// bare number. The previous fixed 20s was set when a job took ~5s; once fresh
+// analyses reached 100-380s it clamped every hedge to 20s and turned the whole
+// mechanism back into the flat race it replaced. Tying it to the timeout keeps
+// it in scale with whatever the work actually costs.
+const HEDGE_TIMEOUT_SHARE = 0.5;
 
 // Race outcomes per worker, for /_/routes.
 //
@@ -943,12 +1026,9 @@ function predictMs(stats, hint, mix) {
   // blended average is the honest fallback — it at least contains every size it
   // has really seen. The mix is for requests with no class at all.
   const classed = classMs(stats, hint);
-  if (classed != null) return classed;
-  if (hint == null) {
-    const mixed = mixedMs(stats, mix);
-    if (mixed != null) return mixed;
-  }
-  return stats.avg_job_ms ?? UNKNOWN_JOB_MS;
+  const base = classed ?? (hint == null ? mixedMs(stats, mix) : null) ?? blendedMs(stats) ?? UNKNOWN_JOB_MS;
+  // How long the work takes, then how likely this worker is to take it.
+  return base * (1 + CAPACITY_WEIGHT * occupancy(stats));
 }
 
 // This worker's average for the cost class the request falls in, or null when
@@ -959,13 +1039,63 @@ function predictMs(stats, hint, mix) {
 // pseudo-version (a repository clone) ran 120s while npm tarballs finished in
 // single-digit seconds, and every one of them looked identical to a router
 // reading one blended average.
+// What one `/lookup` costs on this worker: an index probe, near-constant in
+// the size of the artifact and three orders of magnitude cheaper than an
+// analysis. Reported in microseconds because a healthy probe rounds to 0ms, and
+// a routing signal that is always zero is no signal.
+function lookupMsOf(stats) {
+  if (!stats) return null;
+  const windowed = recentMs(stats.recent_lookup);
+  if (windowed != null) return windowed;
+  if (stats.lookup_samples != null && stats.lookup_samples < MIN_CLASS_SAMPLES) return null;
+  if (stats.avg_lookup_us != null) return stats.avg_lookup_us / 1000;
+  return stats.avg_lookup_ms ?? null;
+}
+
 function classMs(stats, hint) {
   if (hint == null) return null;
+  // The cheap-source race asks the index, not the analyzer. Predicting it from
+  // an analysis average would be wrong by a factor of a thousand.
+  if (hint.lookup) return lookupMsOf(stats);
   const bucket =
     hint.bytes != null
       ? stats.avg_job_ms_by_size?.[sizeBucket(hint.bytes)]
       : stats.avg_job_ms_by_type?.[purlType(hint.purl)];
-  return bucket?.avg_ms ?? null;
+  if (!bucket) return null;
+  return recentMs(bucket.recent) ?? meanMs(bucket);
+}
+
+// The windowed p80 a worker publishes for this class: what the work usually
+// costs, over the last hour, including a bad day.
+//
+// Preferred over the lifetime mean for two reasons the fleet demonstrated.
+// Analysis time is bimodal — seconds for a package, minutes for an archive —
+// so a mean lands between the humps and describes almost no real job; measured
+// live, mean-based estimates were out by roughly 10x against observed medians.
+// And a mean over a sample count keeps reporting an incident long after it
+// ends, where an hour-long window forgets on a clock.
+function recentMs(recent) {
+  if (!recent || recent.p80_ms == null) return null;
+  if (recent.samples != null && recent.samples < MIN_CLASS_SAMPLES) return null;
+  return recent.p80_ms;
+}
+
+// The lifetime mean, for a worker that has not been upgraded to publish a
+// window yet. Same sample floor: one job is a story, not a statistic.
+function meanMs(bucket) {
+  if (!bucket || bucket.avg_ms == null) return null;
+  if (bucket.jobs != null && bucket.jobs < MIN_CLASS_SAMPLES) return null;
+  return bucket.avg_ms;
+}
+
+// The worker's blended average, if it rests on enough completions to mean
+// something. Same threshold, same reason.
+function blendedMs(stats) {
+  const windowed = recentMs(stats.recent);
+  if (windowed != null) return windowed;
+  if (stats.avg_job_ms == null) return null;
+  if (stats.avg_job_samples != null && stats.avg_job_samples < MIN_CLASS_SAMPLES) return null;
+  return stats.avg_job_ms;
 }
 
 // Each worker's per-size averages re-weighted by one shared job mix.
@@ -1016,9 +1146,10 @@ function jobMix(all) {
 // something to say.
 function hasHistory(stats, hint, mix) {
   if (!stats) return false;
+  if (hint?.lookup) return lookupMsOf(stats) != null;
   if (classMs(stats, hint) != null) return true;
   if (hint == null && mixedMs(stats, mix) != null) return true;
-  return stats.avg_job_ms != null;
+  return blendedMs(stats) != null;
 }
 
 // Can this worker answer *correctly*, never mind quickly?
@@ -1074,6 +1205,15 @@ async function rankPool(env, ctx, workers, hint) {
   // damp, and the order the operator configured is a better guess than a coin
   // toss, so ties fall back to it.
   pool.sort((a, b) => {
+    // A worker we could not poll ranks behind one we could.
+    //
+    // This was backwards: an unpollable worker got UNKNOWN_JOB_MS, and 5000ms
+    // beats a worker honestly reporting 8000ms — so failing to answer promoted
+    // you. Observed live when a fleet was pointed at the wrong hostnames: every
+    // request went first to a worker that could not be reached at all. Being
+    // unreachable is not proof of illness (the breaker owns that), but it is
+    // not evidence of health either, and it must never outrank measurement.
+    if ((a.stats == null) !== (b.stats == null)) return a.stats == null ? 1 : -1;
     if (Math.abs(a.est - b.est) >= 250) return a.est - b.est;
     if (a.known && b.known) return a.r - b.r;
     return a.i - b.i;
@@ -1082,8 +1222,18 @@ async function rankPool(env, ctx, workers, hint) {
   // With no stats to bet on, the ranking is arbitrary and the bet is a coin
   // toss with a long delay attached — strictly worse than asking everyone. So
   // evidence buys the hedge: no evidence, flat race, as before.
+  // No exploration here on purpose. A previous revision promoted a random
+  // non-favourite on 10% of requests, to stop a worker being trapped by a
+  // reputation its own starved sample set could never repair. The measurement
+  // that motivated it did not survive scrutiny — the worker in question was
+  // winning half the fleet's work at the time — so the cost (a tenth of all
+  // dispatches sent somewhere the evidence says is slower) bought a fix for a
+  // problem never shown to exist. If per-worker averages do turn out to be
+  // biased by the routing itself, the honest repair is to make the samples
+  // comparable, not to dilute the ranking that reads them.
   const informed = pool[0].known;
-  const hedge = informed ? Math.min(MAX_HEDGE_MS, Math.round(pool[0].est * HEDGE_FRACTION)) : 0;
+  const ceiling = Math.round(numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS) * HEDGE_TIMEOUT_SHARE);
+  const hedge = informed ? Math.min(ceiling, Math.round(pool[0].est * HEDGE_FRACTION)) : 0;
   return { pool, excluded: usable.length ? scored.filter((w) => w.why != null) : [], hedge, informed };
 }
 
@@ -1137,12 +1287,14 @@ async function handleRoutes(env, ctx, url) {
   const live = all.filter((base) => !breakerFor(base).open());
 
   let classes;
-  if (rawPurl) classes = [{ kind: "purl_type", name: purlType(rawPurl), hint: { purl: rawPurl } }];
+  if (rawType.toLowerCase() === "lookup") classes = [{ kind: "lookup", name: "lookup", hint: { lookup: true } }];
+  else if (rawPurl) classes = [{ kind: "purl_type", name: purlType(rawPurl), hint: { purl: rawPurl } }];
   else if (rawType) classes = [{ kind: "purl_type", name: purlType(`pkg:${rawType}/x`), hint: { purl: `pkg:${rawType}/x` } }];
   else if (size != null) classes = [{ kind: "size", name: sizeBucket(size), bytes: size, hint: { bytes: size } }];
   else if (rawSize) classes = [{ kind: "unsized", name: "unsized", hint: null }];
   else {
     classes = [
+      { kind: "lookup", name: "lookup", hint: { lookup: true } },
       ...["npm", "pypi", "cargo", "golang"].map((t) => ({
         kind: "purl_type",
         name: t,
@@ -1248,7 +1400,26 @@ async function raceScan(env, ctx, ids, run, hint = null) {
   const stagger = numEnv(env, "SCAN_RACE_DELAY_MS", ranked.hedge);
   const t0 = Date.now();
   const controls = workers.map(() => new AbortController());
-  const arms = workers.map((base, i) => watch(scanArm(env, ctx, ids, run, base, i * stagger, controls[i])));
+  // One gate per arm, opened when the arm ahead of it gives up. Arm 0 has no
+  // delay to shorten, so its gate is never used.
+  const gates = workers.map(() => {
+    let open = () => {};
+    const waited = new Promise((resolve) => {
+      open = resolve;
+    });
+    return { waited, open };
+  });
+  // Arms start in index order, so releasing "the next one" is releasing the
+  // next gate. Starts at 1 because arm 0 is already running.
+  let released = 1;
+  const promote = () => {
+    if (released < gates.length) gates[released++].open();
+  };
+  const arms = workers.map((base, i) =>
+    watch(scanArm(env, ctx, ids, run, base, i * stagger, controls[i], gates[i].waited)),
+  );
+  // Arms already accounted for, so one settling does not promote twice.
+  const counted = new Set();
 
   const dropLosers = () => {
     const dropped = [];
@@ -1261,6 +1432,13 @@ async function raceScan(env, ctx, ids, run, hint = null) {
   };
 
   for (;;) {
+    // Any arm that has finished without a verdict releases the next one from
+    // its remaining delay.
+    for (const [i, arm] of arms.entries()) {
+      if (!arm.done || counted.has(i)) continue;
+      counted.add(i);
+      if (!arm.value?.scanned?.env) promote();
+    }
     const won = arms.find((arm) => arm.value?.scanned?.env);
     if (won) {
       const dropped = dropLosers();
@@ -1302,12 +1480,16 @@ async function raceScan(env, ctx, ids, run, hint = null) {
 
 // One worker's run at the sample, held back by `waitMs` so a staggered race
 // need not start everything at once.
-async function scanArm(env, ctx, ids, run, base, waitMs, control) {
+async function scanArm(env, ctx, ids, run, base, waitMs, control, release) {
   const armCtx = { ...ctx, signal: mergeAbort(ctx.signal, control.signal) };
   const worker = hostOf(base);
   if (waitMs > 0) {
     try {
-      await sleep(waitMs, armCtx);
+      // The stagger is a bet that the worker ahead will answer. The moment it
+      // answers "no" that bet is settled, and waiting out the rest of the delay
+      // is dead time — which is how a fleet with 44 free slots served 503s
+      // while beamline sat out a 20-second hedge behind an instant 429.
+      await Promise.race(release ? [sleep(waitMs, armCtx), release] : [sleep(waitMs, armCtx)]);
     } catch {
       tally(base).never_started += 1;
       logLine("scan_arm", { worker, outcome: "never_started", ...ids });
@@ -1594,6 +1776,13 @@ function envelopeResponse(env, envelope, sha, source, maxAge, totalMs, purl) {
 
 // Authenticated answers are private to everything between us and the client.
 // Our own cache is a different matter — see serveHit.
+// The scope a client's copy carries, restoring what serveHit dropped for the
+// benefit of our own cache.
+function clientScope(env, stored) {
+  const age = /max-age=(\d+)/.exec(stored || "");
+  return age ? `${cacheScope(env)}, max-age=${age[1]}` : cacheScope(env);
+}
+
 function cacheScope(env) {
   return (env.BEAMLINE_TOKEN || "").trim() ? "private" : "public";
 }
@@ -1869,6 +2058,12 @@ function mergeAbort(a, b) {
   return ac.signal;
 }
 
+// One place decides how long a verdict lives, so the four paths that can
+// produce one cannot drift apart.
+function verdictAge(env) {
+  return numEnv(env, "VERDICT_MAX_AGE", VERDICT_MAX_AGE);
+}
+
 function numEnv(env, key, fallback) {
   if (!env || env[key] == null || env[key] === "") return fallback;
   const n = Number(env[key]);
@@ -1894,6 +2089,14 @@ function idFields(ctx, input) {
   return out;
 }
 
+// Workers Logs indexes the fields of an object handed to console.log, and
+// treats a JSON string as one opaque message. `src` is what says whether a
+// lookup was served from cache, so it has to go out as a field or the hit rate
+// is only reachable by text search. Node has no such indexer and renders an
+// object in a form nothing can parse, so `node local.js` keeps the flat line.
+const STRUCTURED_LOGS =
+  typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers";
+
 function logLine(event, fields) {
   if (logLine.mute) return;
   try {
@@ -1901,7 +2104,7 @@ function logLine(event, fields) {
     for (const k of Object.keys(fields || {})) {
       if (fields[k] !== undefined) row[k] = fields[k];
     }
-    console.log(JSON.stringify(row));
+    console.log(STRUCTURED_LOGS ? row : JSON.stringify(row));
   } catch {
     // Logging must never fail a lookup.
   }

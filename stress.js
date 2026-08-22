@@ -337,7 +337,10 @@ async function ask(item, url, method) {
     const resp = await get(url, timeoutMs + 10_000, headers, method);
     const ms = Date.now() - t0;
     const body = await readJson(resp);
-    const issues = checkApi(resp.status, resp.headers, body, item.purl);
+    // Whether we authenticated decides the scope the answer must carry, and
+    // only the caller knows that — so it is passed in rather than read from
+    // module state, which would make the check untestable either way.
+    const issues = checkApi(resp.status, resp.headers, body, item.purl, token ? "private" : "public");
     return row(item, {
       ms,
       status: resp.status,
@@ -370,16 +373,31 @@ async function gunzip(u8) {
 }
 
 const ALLOWED_200 = new Set(["sha", "purl", "lvl", "eng", "why", "hits"]);
-const ALLOWED_HIT = new Set(["id", "crit", "file", "pkg", "desc"]);
+// `off` and `line` are documented hit fields (API.md: "off is the byte offset
+// of the match within file, and line its 1-based source line"). They were
+// missing here, so every response carrying a located hit — which is the useful
+// kind — was reported as an API violation. The harness was stale, not the API.
+const ALLOWED_HIT = new Set(["id", "crit", "file", "pkg", "desc", "off", "line"]);
 const SOURCES = new Set(["cache", "scan-cache", "bloom", "hopper", "scan"]);
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DOC_STATUS = new Set([200, 202, 400, 401, 413, 415, 422, 404, 429, 503, 504, 500]);
 
-function checkApi(status, headers, body, askedPurl) {
+function checkApi(status, headers, body, askedPurl, scope) {
   const issues = [];
   const h = headers && typeof headers.get === "function" ? headers : new Headers(headers || {});
   if (!DOC_STATUS.has(status)) issues.push(`status ${status} not in API.md`);
-  if (status === 200) return check200(h, body, askedPurl, issues);
+  if (status === 200) {
+    // API.md: "public, max-age=… / private if authenticated". Beamline stores
+    // its own copy as public because Cloudflare will not hold a private one,
+    // and that rewrite once reached the client: an authenticated verdict came
+    // back marked cacheable by every shared cache on the way. A fresh reply
+    // and a cached one are the same response here, so both are checked.
+    const cc = h.get("cache-control") || "";
+    if (scope && !cc.startsWith(scope)) {
+      issues.push(`cache-control "${cc || "absent"}" should be ${scope} (${h.get("x-beamline-source") || "?"})`);
+    }
+    return check200(h, body, askedPurl, issues);
+  }
   if (status === 202) {
     if (!body || body.state !== "pending") issues.push("202 needs {state:pending}");
     if (body && body.error) issues.push("202 must not use error");
@@ -439,6 +457,10 @@ function checkHit(hit) {
   for (const k of ["file", "pkg", "desc"]) {
     if (hit[k] != null && (typeof hit[k] !== "string" || hit[k] === "")) issues.push(`hit.${k} empty`);
   }
+  // Either may be absent — a binary window carries no line structure — but a
+  // present one has to be a real position.
+  if (hit.off != null && (!Number.isInteger(hit.off) || hit.off < 0)) issues.push("hit.off not a byte offset");
+  if (hit.line != null && (!Number.isInteger(hit.line) || hit.line < 1)) issues.push("hit.line not 1-based");
   return issues;
 }
 

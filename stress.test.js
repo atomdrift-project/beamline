@@ -103,10 +103,14 @@ test("checkApi accepts a documented 200 and rejects ml/raw and hits on clean", (
       }[name];
     },
   };
-  assert.deepEqual(
-    _test.checkApi(200, headers, { sha, purl: "pkg:npm/left-pad@1.3.0", lvl: -1, eng: "2.7.2" }, "pkg:npm/left-pad@1.3.0"),
-    [],
-  );
+  const clean = { sha, purl: "pkg:npm/left-pad@1.3.0", lvl: -1, eng: "2.7.2" };
+  assert.deepEqual(_test.checkApi(200, headers, clean, "pkg:npm/left-pad@1.3.0", "public"), []);
+  // An authenticated caller must never be handed a publicly cacheable verdict:
+  // beamline stores its own copy as public, and that rewrite once reached the
+  // client on every cache hit.
+  assert.ok(_test.checkApi(200, headers, clean, "pkg:npm/left-pad@1.3.0", "private").length);
+  const priv = { get: (n) => (n === "cache-control" ? "private, max-age=3600" : headers.get(n)) };
+  assert.deepEqual(_test.checkApi(200, priv, clean, "pkg:npm/left-pad@1.3.0", "private"), []);
   assert.ok(_test.checkApi(200, headers, { sha, lvl: -1, ml: { lvl: -1 } }, null).length);
   assert.ok(_test.checkApi(200, headers, { sha, lvl: -1, hits: [{ id: "x", crit: 5 }] }, null).length);
   assert.ok(_test.checkApi(200, headers, { sha, lvl: 3, hits: [{ id: "x", crit: 2 }] }, null).length);

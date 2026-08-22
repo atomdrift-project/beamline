@@ -1618,6 +1618,167 @@ test("a token-protected reply is private to the client but still cacheable by us
   }
 });
 
+test("background work is registered on the context the request arrived on", async () => {
+  // Regression: dispatch spread the ExecutionContext to attach a request id,
+  // which dropped the prototype's waitUntil. Production then served a 100%
+  // cache miss rate while every test passed — under Node the put runs anyway,
+  // so asserting that the cache eventually filled proves nothing. The invariant
+  // that actually broke is that the runtime was *told* to keep the work alive,
+  // so that is what this asserts.
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
+  });
+  const host = hostCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
+      testEnv(backend.url),
+      host.ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.ok(host.registered() > 0, "nothing was handed to waitUntil; background work would be cancelled");
+    await host.flush();
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a verdict is cached for an hour, and the life is tunable", async () => {
+  const mk = async (extra) => {
+    const backend = await mockBackend({
+      bloom: "unknown",
+      sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
+    });
+    try {
+      const env = { ...testEnv(backend.url), ...extra };
+      const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
+      assert.equal(res.status, 200);
+      return res.headers.get("cache-control");
+    } finally {
+      await backend.close();
+    }
+  };
+  // Short by default: while the service is still moving, a wrong verdict must
+  // age out of every colo within the hour rather than within the day.
+  assert.match(await mk({}), /max-age=3600$/);
+  // And raisable without a code change, for when the answers have settled.
+  assert.match(await mk({ VERDICT_MAX_AGE: "86400" }), /max-age=86400$/);
+});
+
+test("a lookup logs the layer that answered, so cache hits are countable", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
+  });
+  const env = testEnv(backend.url);
+  const ctx = waitCtx();
+  const log = captureLogs();
+  _test.muteLogs(false);
+  try {
+    await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
+    await ctx.flush();
+    await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
+  } finally {
+    _test.muteLogs(true);
+    log.restore();
+    await backend.close();
+  }
+  const sources = log.rows.filter((r) => r.event === "lookup").map((r) => r.src);
+  // The first request pays for the answer, the second is the hit. Both name a
+  // source: a hit rate nothing reports is a hit rate nobody knows.
+  assert.ok(sources.includes("hopper"), `sources were ${JSON.stringify(sources)}`);
+  assert.ok(sources.includes("cache"), `sources were ${JSON.stringify(sources)}`);
+});
+
+test("a cached answer is the same answer, on every path that produces one", async () => {
+  const stored = () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) });
+  const cases = [
+    {
+      what: "hopper hit, authenticated",
+      backend: { bloom: "unknown", sample: stored },
+      extra: { BEAMLINE_TOKEN: "alpha" },
+      make: () =>
+        new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { authorization: "Bearer alpha" } }),
+    },
+    {
+      what: "hopper hit, open deployment",
+      backend: { bloom: "unknown", sample: stored },
+      extra: {},
+      make: () => new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
+    },
+    {
+      what: "definite miss, authenticated",
+      backend: { bloom: "unknown", sample: () => ({ status: 404 }) },
+      extra: { BEAMLINE_TOKEN: "alpha" },
+      make: () =>
+        new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { authorization: "Bearer alpha" } }),
+    },
+    {
+      what: "purl asked of hopper, authenticated",
+      backend: { bloom: "unknown", sample: stored },
+      extra: { BEAMLINE_TOKEN: "alpha" },
+      make: () =>
+        new Request(`http://beamline/lookup?purl=${encodeURIComponent("pkg:gem/rails@8.1.3.1")}`, {
+          headers: { authorization: "Bearer alpha" },
+        }),
+    },
+  ];
+  for (const c of cases) {
+    const backend = await mockBackend(c.backend);
+    try {
+      await assertSameThroughCache({ ...testEnv(backend.url), ...c.extra }, c.make, c.what);
+    } finally {
+      await backend.close();
+    }
+  }
+});
+
+test("a reply from cache is as private to the client as a fresh one", async () => {
+  // serveHit stores the copy as `public` because Cloudflare will not hold a
+  // `private` one. That rewrite must not reach the caller: found in production
+  // once the cache started serving, where an authenticated verdict came back
+  // marked public — and the zone then restamped max-age to its browser TTL,
+  // so a cached answer advertised a different life than a fresh one.
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
+  });
+  const env = { ...testEnv(backend.url), BEAMLINE_TOKEN: "alpha" };
+  const headers = { authorization: "Bearer alpha" };
+  const ctx = waitCtx();
+  try {
+    const first = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers }), env, ctx.ctx);
+    assert.equal(first.status, 200);
+    await ctx.flush();
+
+    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers }), env, noopCtx());
+    assert.equal(second.headers.get("x-beamline-source"), "cache");
+    assert.equal(second.headers.get("cache-control"), first.headers.get("cache-control"));
+    assert.match(second.headers.get("cache-control"), /^private, max-age=3600$/);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("an unauthenticated deployment still serves a public cached reply", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
+  });
+  const env = testEnv(backend.url);
+  const ctx = waitCtx();
+  try {
+    await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
+    await ctx.flush();
+    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
+    assert.equal(second.headers.get("x-beamline-source"), "cache");
+    assert.match(second.headers.get("cache-control"), /^public, max-age=3600$/);
+  } finally {
+    await backend.close();
+  }
+});
+
 test("a definite miss is cached, so a hot unknown sha stops replaying the pipeline", async () => {
   const backend = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
   const env = testEnv(backend.url);
@@ -2180,6 +2341,12 @@ function captureLogs() {
   const orig = console.log;
   console.log = (...args) => {
     const s = args[0];
+    // logLine hands Workers an object and Node a serialized line; a helper that
+    // knew only one of them would silently capture nothing on the other.
+    if (s && typeof s === "object" && !Array.isArray(s)) {
+      rows.push(s);
+      return;
+    }
     if (typeof s === "string" && s.startsWith("{")) {
       try {
         rows.push(JSON.parse(s));
@@ -2234,6 +2401,52 @@ function testEnv(url, extra = {}) {
 
 function noopCtx() {
   return { waitUntil() {} };
+}
+
+// The real ExecutionContext is a class instance: waitUntil lives on the
+// prototype and there are no own enumerable properties at all. waitCtx's object
+// literal keeps it as an own property, which a spread copies — so only this
+// shape catches code that spreads the context and drops the method.
+function hostCtx() {
+  const jobs = [];
+  class ExecutionContextLike {
+    waitUntil(p) {
+      jobs.push(Promise.resolve(p));
+    }
+  }
+  return {
+    ctx: new ExecutionContextLike(),
+    registered: () => jobs.length,
+    async flush() {
+      while (jobs.length) await Promise.all(jobs.splice(0));
+    },
+  };
+}
+
+// Headers a cached answer is allowed to differ on: each describes this
+// delivery rather than the verdict being delivered.
+const DELIVERY_HEADERS = new Set(["x-beamline-source", "x-beamline-worker", "server-timing", "age", "date"]);
+
+// Runs one request twice and asserts the cached answer is the same answer.
+//
+// Both cache bugs found in production were divergences between the copy
+// beamline stored and the copy a caller gets back — a `public` scope that was
+// meant for our cache alone, and before that no stored copy at all. Neither is
+// visible to a test that only ever inspects the first response, so this looks
+// at the second and compares.
+async function assertSameThroughCache(env, make, what) {
+  const ctx = waitCtx();
+  const fresh = await handle(make(), env, ctx.ctx);
+  await ctx.flush();
+  const cached = await handle(make(), env, noopCtx());
+
+  assert.equal(cached.headers.get("x-beamline-source"), "cache", `${what}: second request was not a cache hit`);
+  assert.equal(cached.status, fresh.status, `${what}: status differs`);
+  assert.equal(await cached.clone().text(), await fresh.clone().text(), `${what}: body differs`);
+  for (const [k, v] of fresh.headers) {
+    if (DELIVERY_HEADERS.has(k.toLowerCase())) continue;
+    assert.equal(cached.headers.get(k), v, `${what}: header ${k} differs between a fresh and a cached answer`);
+  }
 }
 
 function waitCtx() {
@@ -2388,7 +2601,7 @@ async function listen(server) {
   };
 }
 
-const ROUTE_CLASS_COUNT = 8; // four PURL types plus four size buckets
+const ROUTE_CLASS_COUNT = 9; // lookup, four PURL types, four size buckets
 function hostOf(u) { return new URL(u).host; }
 
 // --- routing ---------------------------------------------------------------
@@ -2404,6 +2617,8 @@ function statsFor({ slots = 8, free = 8, inFlight = 0, ms = 1000, bySize = {}, .
     max_upload_mb: 100,
     avg_job_ms: ms,
     avg_job_ms_by_size: bySize,
+    // Enough by default so existing cases stay "informed"; overridden per test.
+    avg_job_samples: 50,
     ...rest,
   };
 }
@@ -2566,13 +2781,16 @@ test("/_/routes dry-runs the real ranking, per size bucket", async () => {
     assert.equal(res.status, 200);
     const body = await res.json();
 
-    assert.equal(body.routes[0].kind, "purl_type", "the PURL path is the common case and comes first");
+    assert.equal(body.routes[0].kind, "lookup", "the index probe is its own cost class");
+    assert.equal(body.routes[1].kind, "purl_type", "the PURL path is the common case");
     const small = body.routes.find((r) => r.class === "le_1mb");
     assert.equal(small.dispatch[0].worker, hostOf(specialist.url));
     assert.equal(small.dispatch[0].est_ms, 200);
     assert.equal(small.dispatch[0].delay_ms, 0, "the favourite must go immediately");
     assert.equal(small.dispatch[1].delay_ms, small.hedge_ms, "arm 1 waits one stagger");
-    assert.equal(small.hedge_ms, 300, "hedge is 1.5x the favourite's own estimate");
+    // 3x the favourite's own estimate: the hedge is a stall detector now, so
+    // it sits well above the expected time rather than just below it.
+    assert.equal(small.hedge_ms, 600);
 
     // Same fleet, same instant, opposite order — which is the whole point.
     const large = body.routes.find((r) => r.class === "le_128mb");
@@ -2652,18 +2870,55 @@ test("a full worker is excluded as closed, not ranked as slow", async () => {
   }
 });
 
-test("prediction is service time, with no queue term added", async () => {
+test("occupancy scales the estimate; queue depth is still not added to it", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
-  // Busy but not full: scan does not queue, so in_flight must not inflate the
-  // estimate. 3 of 4 slots taken, and the estimate is still the raw average.
+  // 3 of 4 slots busy. scan rejects rather than queues, so the penalty is
+  // proportional to how full the worker is — not the queue-drain term a
+  // waiting-line model would add, which at this depth would be a whole extra
+  // service time or more.
   const busy = await mockBackend({ stats: statsFor({ slots: 4, free: 1, inFlight: 3, ms: 2000 }) });
   const env = testEnv(hopper.url, { SCAN_URL: busy.url });
   try {
     const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
     const body = await res.json();
-    assert.equal(body.routes[0].dispatch[0].est_ms, 2000, "in_flight must not be added as queue wait");
+    // 2000 * (1 + 0.75), not 2000 and not 2000 + ceil(3/4)*2000.
+    assert.equal(body.routes[0].dispatch[0].est_ms, 3500);
   } finally {
     await Promise.all([hopper.close(), busy.close()]);
+  }
+});
+
+test("an idle worker is scored on its latency alone", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  const idle = await mockBackend({ stats: statsFor({ slots: 8, free: 8, inFlight: 0, ms: 2000 }) });
+  const env = testEnv(hopper.url, { SCAN_URL: idle.url });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
+    const body = await res.json();
+    assert.equal(body.routes[0].dispatch[0].est_ms, 2000, "nothing to penalize on an empty worker");
+  } finally {
+    await Promise.all([hopper.close(), idle.close()]);
+  }
+});
+
+test("a nearly-full worker loses to a roomier one that is slower on paper", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // The shape observed live: one worker faster but almost out of slots, another
+  // slower with most of its capacity free. Latency alone picked the first and
+  // then collected its 429s.
+  const tight = await mockBackend({ stats: statsFor({ slots: 16, free: 1, inFlight: 15, ms: 10000 }) });
+  const roomy = await mockBackend({ stats: statsFor({ slots: 64, free: 44, inFlight: 20, ms: 14000 }) });
+  const env = testEnv(hopper.url, { SCAN_URL: `${tight.url},${roomy.url}` });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    assert.equal(route.dispatch[0].worker, hostOf(roomy.url), "sent work to a worker with one slot left");
+    // 14000*(1+20/64)=18375 beats 10000*(1+15/16)=19375: the faster worker
+    // loses because it has almost nowhere to put the work.
+    assert.equal(route.dispatch[0].est_ms, 18375);
+    assert.equal(route.dispatch[1].est_ms, 19375);
+  } finally {
+    await Promise.all([hopper.close(), tight.close(), roomy.close()]);
   }
 });
 
@@ -2917,5 +3172,315 @@ test("a cached reply does not replay the timings of the request that made it", a
     }
   } finally {
     await backend.close();
+  }
+});
+
+test("a pinned analysis is not answered by the cheap sources", async () => {
+  // hopper holds a verdict and the index would serve it. Pinning says "measure
+  // this worker", so neither may answer.
+  const hopper = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "from-hopper" }) }),
+  });
+  const worker = await mockBackend({
+    bloom: "skip",
+    verdict: () => envelope(HELLO_SHA, { eng: "from-index" }),
+    analyze: () => envelope(HELLO_SHA, { eng: "from-worker" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: worker.url });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
+        method: "POST",
+        body: HELLO,
+        headers: { "x-beamline-pin": hostOf(worker.url) },
+      }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "from-worker", "a pin that an index can answer measures nothing");
+    assert.equal(res.headers.get("x-beamline-source"), "scan");
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), worker.close()]);
+  }
+});
+
+test("one unlucky sample does not brand a worker slow", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // Exactly the shape seen live after a restart: the fast worker had finished
+  // one large archive, the other had a real history at a mediocre speed.
+  const thin = await mockBackend({
+    stats: statsFor({ ms: 33757, bySize: {}, avg_job_samples: 1, avg_job_ms_by_type: { pypi: { jobs: 1, avg_ms: 33757 } } }),
+  });
+  const settled = await mockBackend({
+    stats: statsFor({ ms: 3038, bySize: {}, avg_job_samples: 6, avg_job_ms_by_type: { pypi: { jobs: 6, avg_ms: 3038 } } }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${thin.url},${settled.url}` });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?type=pypi"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    const byWorker = Object.fromEntries(route.dispatch.map((d) => [d.worker, d.est_ms]));
+    assert.equal(byWorker[hostOf(thin.url)], 5000, "n=1 was taken as evidence instead of falling back");
+    assert.equal(byWorker[hostOf(settled.url)], 3038, "n=6 clears the bar and should be used");
+  } finally {
+    await Promise.all([hopper.close(), thin.close(), settled.close()]);
+  }
+});
+
+test("a class average is used once it has enough completions behind it", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  const w = await mockBackend({
+    stats: statsFor({ ms: 9000, bySize: {}, avg_job_samples: 40, avg_job_ms_by_type: { golang: { jobs: 40, avg_ms: 25000 } } }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: w.url });
+  try {
+    const golang = await (await handle(new Request("http://beamline/_/routes?type=golang"), env, waitCtx().ctx)).json();
+    assert.equal(golang.routes[0].dispatch[0].est_ms, 25000, "a well-sampled class average must win");
+    // npm has no history at all here, so it falls back to the blended average.
+    const npm = await (await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx)).json();
+    assert.equal(npm.routes[0].dispatch[0].est_ms, 9000);
+  } finally {
+    await Promise.all([hopper.close(), w.close()]);
+  }
+});
+
+test("an index probe is not predicted from an analysis average", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // Slow to analyze, fast to answer its index — the normal shape, and the two
+  // must not be conflated: they differ by three orders of magnitude.
+  const w = await mockBackend({
+    stats: statsFor({ ms: 40000, avg_lookup_us: 900, lookup_samples: 500 }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: w.url });
+  try {
+    const lookup = await (await handle(new Request("http://beamline/_/routes?type=lookup"), env, waitCtx().ctx)).json();
+    assert.equal(lookup.routes[0].dispatch[0].est_ms, 1, "900us should read as ~1ms, not the 40s analysis average");
+    const npm = await (await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx)).json();
+    assert.equal(npm.routes[0].dispatch[0].est_ms, 40000, "the analysis class still uses the analysis average");
+  } finally {
+    await Promise.all([hopper.close(), w.close()]);
+  }
+});
+
+test("a worker that cannot be polled never outranks one that can", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // No /_/stats at all: it would score UNKNOWN_JOB_MS (5000) and beat an
+  // honest 8000ms — being unreachable used to be a promotion.
+  const silent = await mockBackend({});
+  const honest = await mockBackend({ stats: statsFor({ ms: 8000 }) });
+  const env = testEnv(hopper.url, { SCAN_URL: `${silent.url},${honest.url}` });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    assert.equal(route.dispatch[0].worker, hostOf(honest.url), "silence outranked measurement");
+    assert.equal(route.dispatch[1].worker, hostOf(silent.url));
+  } finally {
+    await Promise.all([hopper.close(), silent.close(), honest.close()]);
+  }
+});
+
+test("a refusal promotes the next worker instead of waiting out its hedge", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  // The live shape: the favourite is small and instantly full, the next worker
+  // has capacity. Its hedge is long, so waiting it out is the whole bug.
+  const full = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ slots: 6, free: 6, ms: 1000 }),
+    analyzePurl: () => ({ status: 429, body: { error: "At capacity (6/6 active analyses)" } }),
+  });
+  const roomy = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ slots: 64, free: 64, ms: 9000 }),
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "roomy" }),
+  });
+  const env = testEnv(hopper.url, {
+    SCAN_URL: `${full.url},${roomy.url}`,
+    // A hedge far longer than this test may take: if the promotion does not
+    // work, the arm waits this out and the assertion below fails on time.
+    SCAN_RACE_DELAY_MS: "10000",
+    SCAN_RETRY_BASE_MS: "1",
+  });
+  const ctx = waitCtx();
+  const started = Date.now();
+  try {
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "roomy");
+    const took = Date.now() - started;
+    assert.ok(took < 5000, `waited ${took}ms behind an instant refusal — the hedge was not cut short`);
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), full.close(), roomy.close()]);
+  }
+});
+
+test("a worker that is merely slow still gets its full hedge", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  // The counter-case: promotion must trigger on a refusal, not on slowness.
+  // This worker answers correctly, just not instantly, and the second arm must
+  // stay parked rather than duplicate the work.
+  const slow = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 1000 }),
+    analyzePurl: async () => {
+      await delay(150);
+      return envelope(HELLO_SHA, { eng: "slow-but-fine" });
+    },
+  });
+  const backup = await mockBackend({
+    bloom: "unknown",
+    stats: statsFor({ ms: 9000 }),
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "backup" }),
+  });
+  const env = testEnv(hopper.url, {
+    SCAN_URL: `${slow.url},${backup.url}`,
+    SCAN_RACE_DELAY_MS: "3000",
+  });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "slow-but-fine");
+    assert.equal(backup.hits.analyzePurl, 0, "a slow worker is not a failed one");
+    await ctx.flush();
+  } finally {
+    await Promise.all([hopper.close(), slow.close(), backup.close()]);
+  }
+});
+
+test("the estimate prefers a worker's windowed p80 over its lifetime mean", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // Both published. The mean is inflated by an incident the window has already
+  // forgotten, which is the whole reason to prefer the window.
+  const w = await mockBackend({
+    stats: statsFor({
+      ms: 200000,
+      bySize: {},
+      avg_job_ms_by_type: {
+        npm: { jobs: 40, avg_ms: 200000, recent: { samples: 40, p80_ms: 9000, mean_ms: 7000 } },
+      },
+    }),
+  });
+  // A generous timeout so the ceiling does not clamp: this case is about the
+  // 3x rule, and the clamp has its own test below.
+  const env = testEnv(hopper.url, { SCAN_URL: w.url, SCAN_TIMEOUT_MS: "600000" });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    assert.equal(route.dispatch[0].est_ms, 9000, "the lifetime mean should not win over a live window");
+    // A stall detector, not a race: 3x the estimate, not a fraction of it.
+    assert.equal(route.hedge_ms, 27000);
+  } finally {
+    await Promise.all([hopper.close(), w.close()]);
+  }
+});
+
+test("a window with too few samples falls back to the mean", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  const w = await mockBackend({
+    stats: statsFor({
+      ms: 5000,
+      bySize: {},
+      avg_job_ms_by_type: {
+        npm: { jobs: 40, avg_ms: 4000, recent: { samples: 2, p80_ms: 90000, mean_ms: 90000 } },
+      },
+    }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: w.url });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    assert.equal(route.dispatch[0].est_ms, 4000, "two samples are not a distribution");
+  } finally {
+    await Promise.all([hopper.close(), w.close()]);
+  }
+});
+
+test("a worker publishing no window still routes on its mean", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // An older scan build: no `recent` anywhere. It must stay routable.
+  const old = await mockBackend({
+    stats: statsFor({ ms: 6000, bySize: {}, avg_job_ms_by_type: { npm: { jobs: 40, avg_ms: 6000 } } }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: old.url });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    assert.equal(route.dispatch[0].est_ms, 6000);
+    assert.equal(route.informed, true);
+  } finally {
+    await Promise.all([hopper.close(), old.close()]);
+  }
+});
+
+test("the hedge ceiling scales with the scan timeout, not a fixed 20s", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // A very slow class: 3x its p80 is far past any fixed ceiling, so the clamp
+  // is what decides. Tied to SCAN_TIMEOUT_MS it stays in scale with the work.
+  const slow = await mockBackend({
+    stats: statsFor({
+      ms: 400000,
+      bySize: {},
+      avg_job_ms_by_type: { golang: { jobs: 40, avg_ms: 400000, recent: { samples: 40, p80_ms: 400000 } } },
+    }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: slow.url, SCAN_TIMEOUT_MS: "600000" });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?type=golang"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    // 3 * 400000 = 1.2M, clamped to half the 600s timeout.
+    assert.equal(route.hedge_ms, 300000);
+  } finally {
+    await Promise.all([hopper.close(), slow.close()]);
+  }
+});
+
+test("beamline reads the exact shape scan publishes", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  // Verbatim from scan's recent_json(): {samples, p80_ms, mean_ms}. This is the
+  // other half of the contract test in scan's job_bucket_recent_tests — a
+  // rename on either side demotes routing back to lifetime means and nothing
+  // else changes, so both sides pin the names.
+  const w = await mockBackend({
+    stats: {
+      slots: 8,
+      slots_free: 8,
+      in_flight: 0,
+      ready: true,
+      overloaded: false,
+      max_upload_mb: 100,
+      avg_job_ms: 999999,
+      avg_job_samples: 50,
+      recent: { samples: 40, p80_ms: 4200, mean_ms: 3100 },
+      recent_lookup: { samples: 500, p80_ms: 2, mean_ms: 1 },
+      avg_job_ms_by_type: {
+        npm: { jobs: 40, avg_ms: 999999, recent: { samples: 40, p80_ms: 7700, mean_ms: 5000 } },
+      },
+      avg_job_ms_by_size: {},
+    },
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: w.url, SCAN_TIMEOUT_MS: "600000" });
+  try {
+    const npm = await (await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx)).json();
+    assert.equal(npm.routes[0].dispatch[0].est_ms, 7700, "per-type window not read");
+
+    const look = await (await handle(new Request("http://beamline/_/routes?type=lookup"), env, waitCtx().ctx)).json();
+    assert.equal(look.routes[0].dispatch[0].est_ms, 2, "lookup window not read");
+
+    // cargo has no per-type entry, so it falls back to the worker-wide window —
+    // not to the 999999ms lifetime mean sitting right beside it.
+    const cargo = await (await handle(new Request("http://beamline/_/routes?type=cargo"), env, waitCtx().ctx)).json();
+    assert.equal(cargo.routes[0].dispatch[0].est_ms, 4200, "worker-wide window not read");
+  } finally {
+    await Promise.all([hopper.close(), w.close()]);
   }
 });

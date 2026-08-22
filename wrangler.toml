@@ -6,6 +6,16 @@ compatibility_date = "2026-08-19"
 # HOPPER_URL and SCAN_URL are not stored here; make deploy-cf passes them
 # from the environment.
 
+# logLine emits one object per lookup carrying `src`, which names the layer
+# that answered — cache, scan-cache, bloom, hopper, or scan. Workers Logs
+# indexes those fields, so the cache hit rate is a query rather than a guess.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [vars]
 MAX_BYTES = "16777216"
 SCAN_TIMEOUT_MS = "1800000"
+# How long a verdict stays in caches.default. Short while the service is still
+# moving; raise it once the answers have settled.
+VERDICT_MAX_AGE = "3600"
