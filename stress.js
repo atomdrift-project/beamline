@@ -324,9 +324,23 @@ async function fetchGo(limit) {
 // and the provenance it grafts into the report comes from the same fetch.
 async function submit(item) {
   const looked = await ask(item, `${beamlineUrl}/lookup?purl=${encodeURIComponent(item.purl)}`, "GET");
-  if (!analyzeMisses || looked.status !== 404) return looked;
+  const answered = !analyzeMisses || looked.status !== 404 ? looked : null;
+  if (answered) return { ...answered, both: await bothProbe(item, answered) };
   const analyzed = await ask(item, `${beamlineUrl}/analyze?purl=${encodeURIComponent(item.purl)}`, "POST");
-  return { ...analyzed, analyzed: true, lookupMs: looked.ms };
+  return { ...analyzed, analyzed: true, lookupMs: looked.ms, both: await bothProbe(item, analyzed) };
+}
+
+// Re-ask with both keys, which is the shape a real client is in after its first
+// answer: it now knows the digest as well as the locator. This measures what
+// the optimized path is worth, against the same artifact on the same fleet, a
+// moment apart — the only comparison that controls for what the corpus holds.
+//
+// Skipped when the first answer produced no digest; there is nothing to pair.
+async function bothProbe(item, prior) {
+  if (!prior?.sha || !/^[0-9a-f]{64}$/.test(prior.sha)) return null;
+  const url = `${beamlineUrl}/lookup?purl=${encodeURIComponent(item.purl)}&sha256=${prior.sha}`;
+  const probed = await ask(item, url, "GET");
+  return { ms: probed.ms, status: probed.status, source: probed.source };
 }
 
 async function ask(item, url, method) {
@@ -589,6 +603,15 @@ function summarize(rows) {
   const misses = rows.filter((r) => r.kind === "miss");
   const lat = ok.map((r) => r.ms).sort((a, b) => a - b);
   const bySource = countBy(ok, (r) => r.source || "unknown");
+  // What the both-keys path cost, beside what the single key cost.
+  const paired = rows.filter((r) => r.both && r.ms != null);
+  const bothStats = {
+    n: paired.length,
+    unsupported: paired.filter((r) => r.both.status === 400).length,
+    hit: paired.filter((r) => r.both.status === 200).length,
+    single: percentile(paired.map((r) => r.ms).sort((a, b) => a - b), 50),
+    both: percentile(paired.map((r) => r.both.ms).sort((a, b) => a - b), 50),
+  };
   const served = ok.filter((r) => r.source === "scan" && r.worker);
   const byWorker = countBy(served, (r) => r.worker);
   const workerLatency = {};
@@ -605,6 +628,7 @@ function summarize(rows) {
     notes,
     misses,
     bySource,
+    bothStats,
     byWorker,
     workerLatency,
     served: served.length,
@@ -632,6 +656,13 @@ function printReport(rows, summary, feedErrors) {
   process.stdout.write(`latency  p50=${fmtMs(L.p50)} p95=${fmtMs(L.p95)} p99=${fmtMs(L.p99)} max=${fmtMs(L.max)}  (ok n=${L.n})\n`);
   process.stdout.write(`source   ${fmtMap(summary.bySource)}\n`);
   process.stdout.write(`eco      ${fmtMap(summary.byEco)}\n`);
+  const b = summary.bothStats;
+  if (b && b.n) {
+    process.stdout.write(`\nboth-keys ${b.n} probed  ${b.hit} answered  p50 ${b.both}ms (single key p50 ${b.single}ms)\n`);
+    if (b.unsupported) {
+      process.stdout.write(`  ${b.unsupported} rejected with 400 — this beamline predates the two-key lookup\n`);
+    }
+  }
   if (summary.served) {
     process.stdout.write(`\nserved   ${summary.served} of ${summary.ok} by a worker (rest: cache or hopper)\n`);
     for (const [w, c] of Object.entries(summary.byWorker).sort((a, b) => b[1] - a[1])) {

@@ -36,6 +36,14 @@ const MEMORY_CACHE_MAX = 1024;
 const HIT_LIMIT = 3;
 const HIT_MIN_CRIT = 3;
 const POLL_MAX_MS = 5_000;
+// How long to wait between asking the workers' index whether a detached
+// analysis has landed, and the ceiling that backoff climbs to. Deliberately
+// unhurried: a Worker gets a bounded number of subrequests per request and
+// each poll asks every worker, so a 30-minute wait at a 15s ceiling costs a
+// few hundred of them, while a 1s poll would exhaust the budget long before
+// the analysis finished.
+const DETACH_POLL_MS = 5_000;
+const DETACH_POLL_MAX_MS = 15_000;
 const SCAN_RETRIES = 5;
 const SCAN_RETRY_BASE_MS = 1_000;
 const SCAN_RETRY_MAX_MS = 30_000;
@@ -265,6 +273,13 @@ async function lookup(env, ctx, origin, input) {
   // answer the pinned worker never produced, and time nothing. It still
   // populates both on the way out: the verdict is just as true for having been
   // measured.
+  // The flight outlives whoever opened it: a later caller may join it, and the
+  // answer is bound for the cache regardless. Running it on the caller's own
+  // context would hand them a veto over it — their signal reaches scan through
+  // scanCtx, so a closed laptop cancels an analysis someone else is waiting on
+  // and the next caller restarts a job that was nearly done. Each caller races
+  // their own disconnect at the join below instead.
+  const flightCtx = { ...ctx, signal: undefined };
   let work = ctx.pin ? null : inflight.get(flightKey);
   if (!work) {
     work = (async () => {
@@ -289,7 +304,7 @@ async function lookup(env, ctx, origin, input) {
         logLine("lookup", { src: "cache", status: hit.status, ms: Date.now() - t0, ...idFields(ctx, input) });
         return res;
       }
-      return runLookup(env, ctx, cache, cacheKey, input, t0);
+      return runLookup(env, flightCtx, cache, cacheKey, input, t0);
     })();
     if (!ctx.pin) inflight.set(flightKey, work);
     // Runs to completion even if every waiter walks away, so the answer still
@@ -302,7 +317,7 @@ async function lookup(env, ctx, origin, input) {
   // so holding costs nothing — while handing back an early 202 would cap the
   // remaining work at the 30s `waitUntil` budget and throw away anything
   // slower. `SCAN_TIMEOUT_MS` is the one budget that bounds a lookup.
-  return (await work).clone();
+  return (await joinFlight(ctx, work)).clone();
 }
 
 // A timer the winner puts out. Without the cancel, every hedge and every hold
@@ -546,8 +561,11 @@ async function scanLookup(env, ctx, input, scanCtl) {
       return { bytes, scanned };
     }
     if (input.purl) {
-      const scanned = await retryScan(env, scanCtx, ids, () =>
-        raceScan(env, scanCtx, ids, (base, armCtx) => scanPurl(env, armCtx, base, input.purl), {
+      // Ask who is already on it before choosing where to send it.
+      const busy = await runningWorker(env, scanCtx, input, ids);
+      const runCtx = busy ? { ...scanCtx, affinity: busy } : scanCtx;
+      const scanned = await retryScan(env, runCtx, ids, () =>
+        raceScan(env, runCtx, ids, (base, armCtx) => scanPurl(env, armCtx, base, input.purl), {
           purl: input.purl,
         }),
       );
@@ -636,6 +654,18 @@ async function settle(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, 
     return json({ error: "unavailable" }, 503);
   }
   if (scanned?.unavailable) {
+    // A 524 means the edge stopped waiting, not that the analysis stopped. The
+    // worker runs on, files its verdict, and answers the next caller from its
+    // index in milliseconds — so the only thing lost at the ceiling is the
+    // connection carrying the answer. Wait for it to land rather than report a
+    // failure for work that is still running and about to succeed. This is
+    // what lets a sample outlive the ceiling at all: without it nothing slower
+    // than 125s can ever be answered, whatever SCAN_TIMEOUT_MS says.
+    const late = scanned.status === EDGE_TIMEOUT ? await waitForDetached(env, ctx, input, t0) : null;
+    if (late) {
+      note("scan", 200, { detached: true });
+      return serveHit(ctx, cache, cacheKey, verdictResponse(env, late, input, verdictAge(env)));
+    }
     const res =
       scanned.status === 504 || scanned.status === 429
         ? scanClientResponse(scanned.status, scanned)
@@ -651,6 +681,31 @@ async function settle(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, 
     headers: { "content-type": "application/json", "cache-control": `${cacheScope(env)}, max-age=${MISS_MAX_AGE}` },
   });
   return serveHit(ctx, cache, cacheKey, miss);
+}
+
+// Waits out an analysis the edge cut loose, polling the workers' index until
+// the verdict appears. Returns it, or null if the budget ran out first.
+//
+// The budget is measured from when the request arrived rather than from the
+// cut, so SCAN_TIMEOUT_MS remains what it claims to be: the total a caller can
+// wait, not a fresh allowance handed out after every ceiling.
+async function waitForDetached(env, ctx, input, t0) {
+  if (!input.sha && !input.purl) return null;
+  const deadline = t0 + numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS);
+  const poll = numEnv(env, "DETACH_POLL_MS", DETACH_POLL_MS);
+  logLine("scan_detached", { ms: Date.now() - t0, ...idFields(ctx, input) });
+  for (let attempt = 0; Date.now() < deadline; attempt++) {
+    const wait = Math.min(backoff(poll, attempt, DETACH_POLL_MAX_MS), Math.max(0, deadline - Date.now()));
+    if (wait <= 0) break;
+    await sleep(wait, ctx);
+    if (clientAborted(ctx)) return null;
+    const known = await scanKnown(env, ctx, input, null);
+    if (known?.verdict) {
+      logLine("scan_landed", { ms: Date.now() - t0, polls: attempt + 1, ...idFields(ctx, input) });
+      return known.verdict;
+    }
+  }
+  return null;
 }
 
 // Scan down, or hopper already has the bytes: upload if needed, promote, wait.
@@ -772,6 +827,56 @@ async function scanKnown(env, ctx, input, cancelSignal) {
 
 // One worker's answer. An empty `bloom` means it could not give one, so the
 // race keeps waiting on whoever is left.
+// Which worker is already analyzing this artifact, if any.
+//
+// A worker mid-analysis attaches a second request for the same key to the run
+// in progress rather than starting another, so a caller who reconnected — a new
+// isolate, an empty flight table, no memory of the request that was cut — must
+// be sent back to it. Beamline's own single-flight cannot do this: it lives in
+// one isolate, and the reconnect is very often somewhere else. Only the workers
+// know, so they are the ones asked.
+//
+// Costs one index-speed request per worker, and only on the analyze path — the
+// path that is about to spend orders of magnitude more than that. A worker that
+// cannot answer is simply not the one running it.
+async function runningWorker(env, ctx, input, ids) {
+  const workers = scanWorkers(env);
+  const keys = [];
+  if (input.sha) keys.push(`sha256=${input.sha}`);
+  if (input.purl) keys.push(`purl=${encodeURIComponent(input.purl)}`);
+  if (!workers.length || !keys.length) return null;
+  const path = `/status?${keys.join("&")}`;
+  const asked = await Promise.all(workers.map((base) => statusAsk(env, ctx, path, base)));
+  const busy = asked.find((a) => a?.state === "running");
+  if (busy) {
+    logLine("scan_affinity", { worker: busy.worker, elapsed_ms: busy.elapsed_ms, ...ids });
+  }
+  return busy?.worker || null;
+}
+
+async function statusAsk(env, ctx, path, base) {
+  const worker = hostOf(base);
+  try {
+    return await fetchTimeout(
+      `${base}${path}`,
+      { method: "GET", headers: scanHeaders(env, ctx) },
+      LOOKUP_TIMEOUT_MS,
+      ctx,
+      async (resp) => {
+        if (resp.status !== 200) {
+          await drain(resp);
+          return null;
+        }
+        const body = await resp.json().catch(() => null);
+        if (!body || typeof body !== "object") return null;
+        return { worker, state: body.state, elapsed_ms: body.elapsed_ms };
+      },
+    );
+  } catch {
+    return null;
+  }
+}
+
 async function lookupAsk(env, ctx, path, base, control) {
   const worker = hostOf(base);
   const askCtx = { ...ctx, signal: mergeAbort(ctx.signal, control.signal) };
@@ -793,6 +898,8 @@ async function lookupAsk(env, ctx, path, base, control) {
         return {
           verdict: resp.status === 200 ? body : null,
           bloom: (typeof body.bloom === "string" && body.bloom) || "unknown",
+          // Present on a miss when this worker is analyzing the key right now.
+          analyzing: (body.analyzing && typeof body.analyzing === "object") || null,
         };
       },
     );
@@ -1459,6 +1566,16 @@ async function raceScan(env, ctx, ids, run, hint = null) {
     if (!available.length) return { unavailable: true, pinned: ctx.pin };
   }
   if (!available.length) return { unavailable: true };
+  // A worker already analyzing this artifact attaches a second request to the
+  // run in progress rather than starting another beside it, so a caller who
+  // reconnected belongs back on that worker — anywhere else pays for the whole
+  // analysis again. Applied after the breaker filter, so a run we cannot reach
+  // is not waited for, and never over a pin, which is an experiment that has
+  // asked for a specific worker.
+  if (ctx.affinity) {
+    const home = available.filter((base) => hostOf(base) === ctx.affinity);
+    if (home.length) available = home;
+  }
   // Best-first, with a hedge delay derived from the favourite's own estimate.
   // SCAN_RACE_DELAY_MS still wins when set, so an operator can pin the old flat
   // race (0) or a fixed stagger without touching code.
@@ -1685,6 +1802,15 @@ async function readScan(resp, start, breaker, worker) {
   if (resp.status === 429) {
     return { unavailable: true, busy: true, status: resp.status, body, ms, totalMs, worker };
   }
+  // Slow, not broken. The edge synthesizes a 524 at its own ceiling without the
+  // worker having said anything: it is still analyzing and will file the
+  // verdict shortly — measured, a sample cut at 125.19s was serving from that
+  // worker's index minutes later. Counting it would open the breakers of the
+  // workers handling the heaviest samples first and empty the fleet, the same
+  // inversion 429 caused.
+  if (resp.status === EDGE_TIMEOUT) {
+    return { unavailable: true, detached: true, status: resp.status, body, ms, totalMs, worker };
+  }
   if (unreachableStatus(resp.status)) {
     breaker.fail();
     return { unavailable: true, status: resp.status, body, ms, totalMs, worker };
@@ -1725,6 +1851,20 @@ function tokenList(raw) {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+// Waits for a shared flight on behalf of one caller, giving up if that caller
+// disconnects. The flight itself is unsignalled and keeps running: the answer
+// is still owed to the cache, to hopper, and to whoever asks next. Only this
+// caller's claim on it ends, which handle() reports as a 499.
+function joinFlight(ctx, work) {
+  if (!ctx.signal) return work;
+  return new Promise((resolve, reject) => {
+    const leave = () => reject(new DOMException("Aborted", "AbortError"));
+    if (ctx.signal.aborted) return leave();
+    ctx.signal.addEventListener("abort", leave, { once: true });
+    work.then(resolve, reject).finally(() => ctx.signal.removeEventListener("abort", leave));
+  });
 }
 
 function clientAborted(ctx) {
@@ -2241,6 +2381,10 @@ export const _test = {
   BREAKER_FAILS,
   makeBreaker,
   memoryCache,
+  // Lets a test wait until a caller has actually joined the shared flight,
+  // rather than sleeping and hoping. Timing-based waits here were flaky under a
+  // loaded event loop, and a flaky test about cancellation is worse than none.
+  flightCount: () => inflight.size,
   tokenEq,
   tokenList,
   numEnv,

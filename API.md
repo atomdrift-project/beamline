@@ -147,6 +147,12 @@ hopper and scan and onto every log line. Send your own to correlate with ours.
 
 `detail` is included only when it adds something the status does not.
 
+A call blocks until the sample has an answer. Analyses run to 30 minutes on the
+heaviest packages, and the connection is simply held: there is no duration limit
+on a Worker request while the caller stays connected. A caller that disconnects
+loses nothing — the analysis keeps running, and reconnecting on the same key
+joins the work already in progress rather than starting it again.
+
 | code | |
 | --- | --- |
 | 202 | `{"state":"pending"}`. Honor `Retry-After`; it is jittered, so do not pin it. Rare: the call blocks while an analysis somebody else already started completes, and only gives up on a 202 when that outruns the request budget. |
@@ -158,5 +164,5 @@ hopper and scan and onto every log line. Send your own to correlate with ours.
 | 404 | No such route or sample. |
 | 405 | Right route, wrong method. `Allow` names the one that works: `/lookup` is GET, `/analyze` is POST. |
 | 429 | At capacity. |
-| 503 | Unavailable. |
+| 503 | Unavailable. No worker could be reached, and nothing is running on the sample. It does not mean the analysis was slow: a sample that outruns the 125s edge ceiling is waited out rather than failed, because the worker finishes it and files the verdict regardless. |
 | 504 | Timed out. |

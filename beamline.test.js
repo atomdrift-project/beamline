@@ -1194,6 +1194,216 @@ test("client abort during the hedge wait is 499", async () => {
   }
 });
 
+// A caller whose connection drops has not withdrawn the question. Beamline
+// hands the analysis to waitUntil precisely so it outlives them, so whoever
+// asks next should join the work already running rather than pay for it a
+// second time. Scan charges by the analysis and the slow ones run for minutes:
+// restarting one because a laptop shut its lid is the difference between a
+// reconnect that costs nothing and one that costs the whole job again — and
+// the reconnecting caller must never inherit the first caller's cancellation.
+// The edge stops waiting on an origin at 125s and answers 524, but scan keeps
+// going: it files the verdict and serves the next caller from its index. That
+// is the only reason an analysis can outlive the ceiling, and it is measured —
+// two direct requests were cut at 125.18s while the worker ran on past 345s.
+// A 524 must therefore never reach a caller as a 5xx.
+// A 524 says the sample was slow, not that the worker is sick. Counting it
+// would open the breaker of whichever worker drew the heaviest samples first,
+// and a fleet-wide slow patch would take every worker out at once — the same
+// inversion that 429 caused before it was excluded.
+test("the edge ceiling does not trip a worker's breaker", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyzePurl: () => ({ status: 524, body: "error code: 524" }),
+  });
+  const env = testEnv(backend.url, { DETACH_POLL_MS: "10", SCAN_TIMEOUT_MS: "120" });
+  const url = `http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`;
+  try {
+    for (let i = 0; i < _test.BREAKER_FAILS + 2; i++) {
+      await handle(new Request(url, { method: "POST" }), env, waitCtx().ctx);
+      _test.reset();
+    }
+    const before = backend.hits.analyzePurl;
+    await handle(new Request(url, { method: "POST" }), env, waitCtx().ctx);
+    assert.ok(backend.hits.analyzePurl > before, "the worker was taken out of the fleet by edge timeouts");
+  } finally {
+    await backend.close();
+  }
+});
+
+test("an analysis cut loose at the edge ceiling is waited out, not failed", async () => {
+  const sha = HELLO_SHA;
+  const scanned = envelope(sha, { eng: "purl-scan" });
+  let landed = false;
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    // The worker finishes after the cut, so the index answers from the second
+    // poll onward — exactly what production does minutes later.
+    verdict: () => (landed ? scanned : null),
+    analyzePurl: () => {
+      landed = true;
+      return { status: 524, body: "error code: 524" };
+    },
+  });
+  const env = testEnv(backend.url, { DETACH_POLL_MS: "10" });
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200, "the edge ceiling was reported to the caller as a failure");
+    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
+    assert.equal((await res.json()).purl, "pkg:npm/left-pad@1.3.0");
+  } finally {
+    await backend.close();
+  }
+});
+
+// The wait is bounded by the caller's budget, not handed a fresh one at every
+// ceiling: a worker that never files a verdict must still give up and say so.
+test("a detached analysis that never lands still ends within the budget", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyzePurl: () => ({ status: 524, body: "error code: 524" }),
+  });
+  const env = testEnv(backend.url, { DETACH_POLL_MS: "10", SCAN_TIMEOUT_MS: "300" });
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 503);
+  } finally {
+    await backend.close();
+  }
+});
+
+// The reconnect guarantee across isolates. Beamline's own single-flight lives
+// in one isolate, and a caller who reconnects usually lands in another — so the
+// only thing that knows an analysis is already running is the worker running
+// it. Scan attaches a second request for the same key to the run in progress,
+// which makes the reconnect free, but only if it arrives at that worker.
+test("a reconnect is routed to the worker already analyzing it", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const idle = await mockBackend({
+    bloom: "unknown",
+    status: { state: "unknown" },
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "idle" }),
+  });
+  const busy = await mockBackend({
+    bloom: "unknown",
+    status: { state: "running", elapsed_ms: 143_000, attached: 0 },
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "busy" }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${idle.url},${busy.url}` });
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "busy", "the reconnect started a second analysis elsewhere");
+    assert.equal(idle.hits.analyzePurl, 0, "a duplicate analysis was dispatched to an idle worker");
+    assert.equal(busy.hits.analyzePurl, 1);
+  } finally {
+    await Promise.all([hopper.close(), idle.close(), busy.close()]);
+  }
+});
+
+// Affinity is a preference, not a pin. A run we cannot reach is not worth
+// waiting for, so a worker whose breaker is open must not capture the request.
+test("affinity does not strand a request on an unreachable worker", async () => {
+  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+  const well = await mockBackend({
+    bloom: "unknown",
+    status: { state: "unknown" },
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "well" }),
+  });
+  // Claims to be running the analysis, but every dispatch to it fails.
+  const sick = await mockBackend({
+    bloom: "unknown",
+    status: { state: "running", elapsed_ms: 1000, attached: 0 },
+    analyzePurl: () => ({ status: 500, body: { error: "boom" } }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: `${sick.url},${well.url}`, SCAN_RETRIES: "0" });
+  const url = `http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0`;
+  try {
+    for (let i = 0; i < _test.BREAKER_FAILS; i++) {
+      await handle(new Request(url, { method: "POST" }), { ...env, cache: _test.memoryCache() }, waitCtx().ctx);
+    }
+    const before = well.hits.analyzePurl;
+    const res = await handle(
+      new Request(url, { method: "POST" }),
+      { ...env, cache: _test.memoryCache() },
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200, "affinity held the request on a worker with an open breaker");
+    assert.equal((await res.json()).eng, "well");
+    assert.ok(well.hits.analyzePurl > before);
+  } finally {
+    await Promise.all([hopper.close(), well.close(), sick.close()]);
+  }
+});
+
+test("a client that disconnects and reconnects joins the same analysis", async () => {
+  const sha = HELLO_SHA;
+  const scanned = envelope(sha, { eng: "purl-scan" });
+  // The analysis is held open rather than timed, so the reconnect cannot
+  // accidentally land after it finished and pass for the wrong reason.
+  let began;
+  let finish;
+  const begun = new Promise((r) => (began = r));
+  const held = new Promise((r) => (finish = r));
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: () => ({ status: 404 }),
+    analyzePurl: async () => {
+      began();
+      await held;
+      return scanned;
+    },
+  });
+  // Long enough that the held analysis cannot time out and be retried while the
+  // test is watching — a retry would look exactly like a restarted analysis.
+  const env = testEnv(backend.url, { SCAN_TIMEOUT_MS: "60000" });
+  const url = `http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`;
+  const ac = new AbortController();
+  const first = waitCtx();
+  const second = waitCtx();
+  try {
+    const gone = handle(new Request(url, { method: "POST", signal: ac.signal }), env, first.ctx);
+    await begun;
+    ac.abort();
+    assert.equal((await gone).status, 499, "the caller who left is told so");
+    assert.equal(_test.flightCount(), 1, "the analysis was abandoned when its caller left");
+
+    // The reconnect must attach to the running analysis, not start its own. A
+    // caller going solo would consult the filter and dispatch within a tick or
+    // two, so the wait below is room to do the wrong thing visibly; the
+    // analysis itself is held, so it cannot finish early and pass by accident.
+    const back = handle(new Request(url, { method: "POST" }), env, second.ctx);
+    await delay(100);
+    assert.equal(backend.hits.bloom, 1, "the reconnect ran its own lookup instead of joining");
+    assert.equal(backend.hits.analyzePurl, 1, "the reconnect restarted the analysis rather than joining it");
+    finish();
+
+    const res = await back;
+    assert.equal(res.status, 200, "the reconnecting caller inherited the disconnect");
+    assert.equal((await res.json()).purl, "pkg:npm/left-pad@1.3.0");
+    assert.equal(backend.hits.analyzePurl, 1, "one disconnect cost a second full analysis");
+    await first.flush();
+    await second.flush();
+  } finally {
+    finish();
+    await backend.close();
+  }
+});
+
 test("concurrent hedged lookups share one origin fetch", async () => {
   const backend = await mockBackend({
     bloom: "unknown",
@@ -2546,6 +2756,7 @@ function mockBackend(opts) {
     upload: 0,
     rescan: 0,
     stats: 0,
+    status: 0,
   };
   const results = [];
   const auths = [];
@@ -2562,6 +2773,11 @@ function mockBackend(opts) {
         hits.stats += 1;
         if (!opts.stats) return send(res, 404, { error: "not found" });
         return send(res, 200, typeof opts.stats === "function" ? opts.stats() : opts.stats);
+      }
+      if (url.pathname === "/status") {
+        hits.status += 1;
+        const out = typeof opts.status === "function" ? opts.status(url) : opts.status;
+        return send(res, 200, out || { state: "unknown" });
       }
       if (url.pathname === "/lookup") {
         hits.bloom += 1;
@@ -3737,6 +3953,80 @@ test("the index probe carries both keys when the caller gave both", async () => 
     assert.equal(asked.sha, HELLO_SHA, "digest missing from the index probe");
     assert.equal(asked.purl, "pkg:npm/left-pad@1.3.0", "purl missing from the index probe");
     assert.equal(backend.hits.bloom, 1, "one probe per worker, not one per key");
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a conflicted bloom also waits for hopper rather than re-deriving", async () => {
+  // `conflicted` means the filters disagree about this artifact — scan's word
+  // for "trust neither". It shares the bad-set branch, and sharing a branch is
+  // exactly the thing that stops being true when someone edits one of them.
+  const backend = await mockBackend({
+    bloom: "conflicted",
+    sample: async () => {
+      await delay(120);
+      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { lvl: 3, eng: "hopper-settled-it" }) };
+    },
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "wasted-scan" }),
+  });
+  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "hopper-settled-it");
+    assert.equal(backend.hits.analyzePurl, 0, "a contradiction is not a reason to scan immediately");
+    await ctx.flush();
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a skip from the merged index decision still short-circuits", async () => {
+  // scan merges both keys and may answer `skip` on the strength of either.
+  // Beamline serves that as a benign stub without touching hopper or a worker.
+  const backend = await mockBackend({
+    bloom: "skip",
+    sample: () => ({ status: 404 }),
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "should-not-run" }),
+  });
+  const env = testEnv(backend.url);
+  try {
+    const res = await handle(
+      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
+      env,
+      noopCtx(),
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-beamline-source"), "bloom");
+    assert.equal(backend.hits.analyzePurl, 0);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a stored verdict from the index beats the hopper round trip", async () => {
+  // The index answering with a verdict is the cheapest hit there is: no hopper
+  // query, no analysis. Worth pinning now that both keys can produce one.
+  const backend = await mockBackend({
+    bloom: "known-bad",
+    verdict: () => ({ sha: HELLO_SHA, lvl: 3, eng: "index-verdict" }),
+    sample: () => ({ status: 404 }),
+  });
+  const env = testEnv(backend.url);
+  try {
+    const res = await handle(
+      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
+      env,
+      noopCtx(),
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
+    assert.equal((await res.json()).eng, "index-verdict");
   } finally {
     await backend.close();
   }
