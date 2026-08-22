@@ -4,14 +4,37 @@
 GET  /healthz            (also /_/health)
 GET  /lookup?sha256={64hex}
 GET  /lookup?purl={purl}
+GET  /lookup?purl={purl}&sha256={64hex}  both: the fast path, see below
 POST /analyze                            the artifact as the raw body
-POST /analyze?sha256={64hex}             no body: fetched from hopper
 POST /analyze?purl={purl}                no body: resolved by scan
+POST /analyze?purl={purl}&sha256={64hex} no body, and the digest is checked
 ```
 
 `/lookup` reports what is already known and never spends an analysis slot; a
-key nothing holds is a 404. It takes exactly one key — both together, or
-neither, is a 400.
+key nothing holds is a 404. Name at least one key; neither is a 400.
+
+### Sending both keys
+
+If you already know the digest **and** the PURL, send both. It is the fastest
+path we offer, and it costs you nothing to use.
+
+The two keys are not interchangeable, which is why both are worth having. A
+`sha256` names exact bytes. A versioned `purl` names whatever sample the corpus
+holds for that release — usually the same artifact, but not necessarily the one
+you are holding. So:
+
+- The digest is asked first, because it is exact. If it answers, that is the
+  answer, and the PURL costs nothing — no second query is made.
+- If the digest is unknown, the PURL gets a second chance. The corpus can know
+  release `1.0` without having seen your particular bytes, and that is a hit you
+  would not have got from either key alone.
+- If the PURL resolves to a *different* digest than the one you named, that
+  answer is refused rather than served. It describes different bytes, and a
+  release whose digest has moved under it is worth knowing about rather than
+  papering over.
+
+The practical effect is that a caller who knows both never pays for a fetch to
+find out whether they agree: we compare the digests from the lookup itself.
 
 `/analyze` is the route that may analyze. Send the artifact as the raw body
 and neither key is needed: the digest is computed from the bytes. Send
@@ -20,17 +43,17 @@ truncated upload is caught. The digest is never taken on trust; a verdict
 filed under a key the caller chose rather than one the bytes produce would
 poison this cache, scan's, and hopper's at once.
 
-The body is optional. Without it, name a key: `sha256` fetches the artifact
-from hopper, `purl` has scan resolve it against the registry. Both are a round
-trip slower than sending the bytes, and hopper cannot serve an artifact it has
-never seen. With no body and no key there is nothing to work from, which is a
-400.
+The body is optional, but a `purl` is then required: scan resolves it against
+the registry itself. A digest alone is not enough to analyze — it is a lookup
+key, not an artifact — so `/analyze?sha256=` with no body and no `purl` is a
+404, not an analysis. Send the bytes, or send a PURL, or use `/lookup`.
 
 A `multipart/` or `application/x-www-form-urlencoded` body is a 415, checked
 before the keys, so send `Content-Type: application/octet-stream`.
 
-`purl` on `/analyze` is a hint rather than a second key: it lets scan graft
-registry provenance onto the report, and it is echoed in each hit's `pkg`.
+`purl` on `/analyze` is both the thing scan resolves when there is no body and
+a hint when there is: it lets scan graft registry provenance onto the report,
+and it is echoed in each hit's `pkg`.
 
 The `pkg:` prefix is optional and the scheme and type are case-folded, so
 `npm/left-pad@1.3.0` and `PKG:NPM/left-pad@1.3.0` are the same key. The rest of
@@ -126,7 +149,7 @@ hopper and scan and onto every log line. Send your own to correlate with ours.
 
 | code | |
 | --- | --- |
-| 202 | `{"state":"pending"}`. Honor `Retry-After`; it is jittered, so do not pin it. The analysis is still running and the retry is usually cheap. |
+| 202 | `{"state":"pending"}`. Honor `Retry-After`; it is jittered, so do not pin it. Rare: the call blocks while an analysis somebody else already started completes, and only gives up on a 202 when that outruns the request budget. |
 | 400 | Bad sha256 or PURL. |
 | 401 | Bad bearer token. |
 | 413 | Too large. |

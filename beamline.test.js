@@ -250,7 +250,7 @@ test("hopper miss with body posts /analyze and stores the artifact on hopper", a
     assert.equal(backend.hits.analyze, 1);
     assert.equal(backend.hits.analyzePurl, 0);
     await ctx.flush();
-    assert.equal(backend.hits.upload, 1);
+    assert.equal(backend.hits.upload, 0);
     // The verdict is the scan worker's to renew; beamline only contributes the
     // bytes, which are the one thing hopper cannot get anywhere else.
     assert.equal(backend.hits.result, 0);
@@ -408,16 +408,12 @@ test("an unavailable lookup does not disable /analyze", async () => {
   }
 });
 
-test("scan down with posted bytes uploads to hopper and waits", async () => {
-  let samples = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: (sha) => {
-      samples += 1;
-      if (samples === 1) return { status: 404 };
-      return { status: 200, sha, body: envelope(sha, { eng: "hopper-worker" }) };
-    },
-  });
+test("scan down and hopper has never seen it is 503, not a queue", async () => {
+  // Beamline used to upload the bytes here and wait for a hopper worker to pick
+  // them up. It no longer writes at all, so an artifact hopper does not already
+  // hold has nobody working on it and nothing to wait for — the honest answer
+  // is that the service is unavailable, and the scan fleet is the capacity.
+  const backend = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
   const env = testEnv(backend.url, { SCAN_URL: DEAD });
   try {
     const res = await handle(
@@ -425,11 +421,9 @@ test("scan down with posted bytes uploads to hopper and waits", async () => {
       env,
       noopCtx(),
     );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "hopper-worker");
-    assert.equal(backend.hits.upload, 1);
-    assert.equal(backend.hits.rescan, 1);
+    assert.equal(res.status, 503);
+    assert.equal(backend.hits.upload, 0);
+    assert.equal(backend.hits.rescan, 0);
     assert.equal(backend.hits.analyze, 0);
   } finally {
     await backend.close();
@@ -452,7 +446,7 @@ test("scan down on a pending hopper sample waits for the worker", async () => {
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal(backend.hits.upload, 0);
-    assert.equal(backend.hits.rescan, 1);
+    assert.equal(backend.hits.rescan, 0);
   } finally {
     await backend.close();
   }
@@ -547,7 +541,7 @@ test("hopper miss without bytes is unknown sample", async () => {
 });
 
 test("hopper hedge defaults", () => {
-  assert.equal(_test.HOPPER_HEDGE_MS, 1_000);
+  assert.equal(_test.HOPPER_HEDGE_MS, 500);
   assert.equal(_test.HOPPER_LOOKUP_MS, 15_000);
   assert.equal(_test.HOPPER_RPC_MS, 2_000);
   assert.equal(_test.BREAKER_FAILS, 5);
@@ -655,7 +649,7 @@ test("hedge serves scan if hopper stays silent, then aborts hopper", async () =>
     assert.ok(ms < 300, `scan hedge took ${ms}ms; hopper should have been abandoned`);
     await ctx.flush();
     assert.equal(backend.hits.result, 0, "the scan worker files the verdict, not beamline");
-    assert.equal(backend.hits.upload, 1);
+    assert.equal(backend.hits.upload, 0);
     const abort = logs.rows.find((r) => r.event === "abort");
     const lookup = logs.rows.filter((r) => r.event === "lookup").pop();
     assert.equal(abort && abort.target, "hopper");
@@ -785,53 +779,62 @@ test("hedged PURL: scan wins if hopper stays silent", async () => {
   }
 });
 
-test("SHA GET: slow hopper 200 still wins after hedge started a file fetch", async () => {
+test("a slow hopper 200 still wins after the hedge started an analysis", async () => {
   const backend = await mockBackend({
     bloom: "unknown",
     sample: async () => {
       await delay(80);
       return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-sha" }) };
     },
-    analyze: () => envelope(HELLO_SHA, { eng: "scan" }),
+    // Slower than hopper: the hedge starts it at 20ms, hopper answers at 80ms,
+    // and the point is that a hopper answer already in flight still wins.
+    analyzePurl: async () => {
+      await delay(200);
+      return envelope(HELLO_SHA, { eng: "scan" });
+    },
   });
   const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
   const ctx = waitCtx();
   try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, ctx.ctx);
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal((await res.json()).eng, "hopper-sha");
     await ctx.flush();
-    assert.equal(backend.hits.analyze, 0);
     assert.equal(backend.hits.result, 0);
-    assert.ok(backend.hits.file >= 1);
   } finally {
     await backend.close();
   }
 });
 
-test("SHA GET: hedge scans hopper bytes if hopper sample stays silent", async () => {
+test("the hedge starts an analysis rather than waiting out a silent hopper", async () => {
   const backend = await mockBackend({
     bloom: "unknown",
     sample: async () => {
       await delay(200);
       return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "too-late" }) };
     },
-    file: HELLO,
-    analyze: () => envelope(HELLO_SHA, { eng: "from-file" }),
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "from-scan" }),
   });
   const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
   const ctx = waitCtx();
   try {
     const t0 = Date.now();
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, ctx.ctx);
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal((await res.json()).eng, "from-file");
-    assert.ok(Date.now() - t0 < 150);
+    assert.equal((await res.json()).eng, "from-scan");
+    assert.ok(Date.now() - t0 < 150, "waited out the slow hopper instead of hedging");
     await ctx.flush();
-    assert.equal(backend.hits.file, 1);
-    assert.equal(backend.hits.analyze, 1);
+    assert.equal(backend.hits.analyzePurl, 1);
     assert.equal(backend.hits.result, 0, "the scan worker files the verdict, not beamline");
   } finally {
     await backend.close();
@@ -859,7 +862,7 @@ test("slow hopper 404 after hedge still scans and submits", async () => {
     assert.equal(res.headers.get("x-beamline-source"), "scan");
     await ctx.flush();
     assert.equal(backend.hits.result, 0, "the scan worker files the verdict, not beamline");
-    assert.equal(backend.hits.upload, 1);
+    assert.equal(backend.hits.upload, 0);
   } finally {
     await backend.close();
   }
@@ -914,7 +917,7 @@ test("hedged hopper 204 with scan down still waits for the hopper worker", async
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("x-beamline-source"), "hopper");
     assert.equal((await res.json()).eng, "hopper-worker");
-    assert.equal(backend.hits.rescan, 1);
+    assert.equal(backend.hits.rescan, 0);
   } finally {
     await backend.close();
   }
@@ -1432,30 +1435,92 @@ test("PURLs normalize so the pkg: prefix and type case are not two keys", () => 
   assert.equal(_test.normalizePurl("   "), "");
 });
 
-test("/lookup takes exactly one key", async () => {
-  const backend = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
+test("/lookup needs at least one key", async () => {
+  const backend = await mockBackend({ bloom: "unknown" });
   const env = testEnv(backend.url);
   try {
-    const both = await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}&purl=pkg:npm/x@1`),
+    const res = await handle(new Request("http://beamline/lookup"), env, noopCtx());
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /provide sha256, purl, or both/);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("both keys is the optimized path, not an error", async () => {
+  // A caller who already knows the digest and the PURL can hand us both. The
+  // digest is asked first because it names exact bytes; the PURL is the second
+  // chance when the corpus has the release but not those bytes.
+  let byPurl = 0;
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: (sha, url) => {
+      if (url && url.searchParams.get("purl")) {
+        byPurl += 1;
+        return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "by-purl" }) };
+      }
+      return { status: 404 };
+    },
+  });
+  const env = testEnv(backend.url);
+  try {
+    const res = await handle(
+      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
       env,
       noopCtx(),
     );
-    assert.equal(both.status, 400);
-    assert.equal((await both.json()).error, "provide exactly one of sha256 or purl");
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "by-purl");
+    assert.equal(byPurl, 1, "the PURL should have been the second chance");
+  } finally {
+    await backend.close();
+  }
+});
 
-    const neither = await handle(new Request("http://beamline/lookup"), env, noopCtx());
-    assert.equal(neither.status, 400);
+test("a digest hit does not spend a second query on the PURL", async () => {
+  let byPurl = 0;
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: (sha, url) => {
+      if (url && url.searchParams.get("purl")) byPurl += 1;
+      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "by-sha" }) };
+    },
+  });
+  const env = testEnv(backend.url);
+  try {
+    const res = await handle(
+      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
+      env,
+      noopCtx(),
+    );
+    assert.equal((await res.json()).eng, "by-sha");
+    assert.equal(byPurl, 0, "an exact hit must not cost hopper a second query");
+  } finally {
+    await backend.close();
+  }
+});
 
-    const bad = await handle(new Request("http://beamline/lookup?sha256=nope"), env, noopCtx());
-    assert.equal(bad.status, 400);
-    assert.equal((await bad.json()).error, "invalid sha256");
-
-    // The path forms /lookup replaced are gone, not quietly still serving.
-    for (const gone of [`http://beamline/sha256/${HELLO_SHA}`, "http://beamline/purl/pkg:npm/x@1"]) {
-      const res = await handle(new Request(gone), env, noopCtx());
-      assert.equal(res.status, 404, `${gone} should no longer route`);
-    }
+test("a PURL answer describing different bytes is refused, not served", async () => {
+  // The release resolves to a digest the caller did not ask about: a re-publish,
+  // or worse. Serving it would answer a question nobody asked.
+  const other = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: (sha, url) => {
+      if (url && url.searchParams.get("purl")) {
+        return { status: 200, sha: other, body: envelope(other, { eng: "different-artifact" }) };
+      }
+      return { status: 404 };
+    },
+  });
+  const env = testEnv(backend.url);
+  try {
+    const res = await handle(
+      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
+      env,
+      noopCtx(),
+    );
+    assert.equal(res.status, 404, "a verdict for other bytes is not this artifact's verdict");
   } finally {
     await backend.close();
   }
@@ -2192,10 +2257,12 @@ test("an edge timeout is not retried into the same ceiling", async () => {
   const ctx = waitCtx();
   try {
     const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx);
-    // Straight to the hopper queue instead of a retry storm: pending, not a
-    // quarter hour of re-analysis.
-    assert.equal(res.status, 202);
-    assert.deepEqual(await res.json(), { state: "pending" });
+    // Unavailable rather than a retry storm. It was 202 when beamline could
+    // hand the work to hopper's queue; with beamline read-only, hopper has
+    // never seen this artifact and there is no queue to hand it to. The
+    // property under test is unchanged: one attempt, not a quarter hour of
+    // re-analysis into the same wall.
+    assert.equal(res.status, 503);
     // Retrying costs a full analysis per worker and hits the same wall.
     assert.equal(stalled.hits.analyze, 1);
     await ctx.flush();
@@ -2274,7 +2341,11 @@ test("bytes that do not hash to the claimed sha are refused", async () => {
   }
 });
 
-test("/analyze without a body falls back to fetching the artifact from hopper", async () => {
+test("/analyze with only a digest does not go fetch the artifact", async () => {
+  // A digest is a lookup key, not an artifact. Beamline used to answer this by
+  // pulling the bytes from hopper and pushing them to a worker — the whole
+  // artifact twice through this service, to reach bytes the worker can fetch
+  // for itself. It is a miss now, and the caller sends bytes or a PURL.
   const backend = await mockBackend({
     bloom: "unknown",
     sample: () => ({ status: 404 }),
@@ -2289,9 +2360,9 @@ test("/analyze without a body falls back to fetching the artifact from hopper", 
       env,
       ctx.ctx,
     );
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "from-hopper");
-    assert.equal(backend.hits.file, 1);
+    assert.equal(res.status, 404);
+    assert.equal(backend.hits.file, 0, "beamline must not relay artifact bytes");
+    assert.equal(backend.hits.analyze, 0, "nothing to analyze without the bytes");
     await ctx.flush();
   } finally {
     await backend.close();
@@ -3482,5 +3553,191 @@ test("beamline reads the exact shape scan publishes", async () => {
     assert.equal(cargo.routes[0].dispatch[0].est_ms, 4200, "worker-wide window not read");
   } finally {
     await Promise.all([hopper.close(), w.close()]);
+  }
+});
+
+test("beamline blocks on hopper's 202 and answers when the verdict lands", async () => {
+  let polls = 0;
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: (sha) => {
+      polls += 1;
+      // Held but unanalyzed twice, then done. Beamline presents a blocking
+      // API, so it waits rather than handing the caller a 202 to chase.
+      if (polls <= 2) return { status: 202, sha: sha || HELLO_SHA };
+      return { status: 200, sha: sha || HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-worker" }) };
+    },
+  });
+  const env = testEnv(backend.url, { SCAN_URL: DEAD, HOPPER_POLL_MS: "5" });
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }),
+      env,
+      noopCtx(),
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-beamline-source"), "hopper");
+    assert.equal((await res.json()).eng, "hopper-worker");
+    assert.ok(polls >= 3, `gave up after ${polls} polls`);
+    assert.equal(backend.hits.upload, 0, "waiting is a read, not a write");
+    assert.equal(backend.hits.rescan, 0);
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a 204 from an older hopper still means queued", async () => {
+  let polls = 0;
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: (sha) => {
+      polls += 1;
+      // Pre-202 hopper. Reading this as "nothing here" would abandon a sample
+      // somebody is actively analyzing.
+      if (polls === 1) return { status: 204, sha: sha || HELLO_SHA };
+      return { status: 200, sha: sha || HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-worker" }) };
+    },
+  });
+  const env = testEnv(backend.url, { SCAN_URL: DEAD, HOPPER_POLL_MS: "5" });
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }),
+      env,
+      noopCtx(),
+    );
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "hopper-worker");
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a queue that never finishes hands back 202, not a hung request", async () => {
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: (sha) => ({ status: 202, sha: sha || HELLO_SHA }),
+  });
+  // A short budget stands in for the real one: the point is that the wait ends.
+  const env = testEnv(backend.url, { SCAN_URL: DEAD, HOPPER_POLL_MS: "5", SCAN_TIMEOUT_MS: "80" });
+  try {
+    const res = await handle(
+      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }),
+      env,
+      noopCtx(),
+    );
+    assert.equal(res.status, 202);
+    assert.deepEqual(await res.json(), { state: "pending" });
+    assert.ok(res.headers.get("retry-after"), "202 must say when to come back");
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a bad-set bloom hit waits for hopper's reason instead of re-deriving it", async () => {
+  // The filter says this key is bad and can say nothing else — it is a bloom
+  // filter. Hopper holds the reason, because a known-bad sample is one the
+  // corpus already has. Spending a scan slot to re-derive it would be waste.
+  const backend = await mockBackend({
+    bloom: "known-bad",
+    sample: async () => {
+      // Slower than the hedge: without the suppression, an analysis starts.
+      await delay(120);
+      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { lvl: 3, eng: "hopper-reason" }) };
+    },
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "wasted-scan" }),
+  });
+  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("x-beamline-source"), "hopper");
+    assert.equal((await res.json()).eng, "hopper-reason");
+    await ctx.flush();
+    assert.equal(backend.hits.analyzePurl, 0, "spent a scan slot on a sample hopper could explain");
+  } finally {
+    await backend.close();
+  }
+});
+
+test("a bad-set hit still analyzes when hopper genuinely has no reason", async () => {
+  // Suppressing the hedge delays the decision; it must not remove it. When
+  // hopper misses outright there is nothing to wait for.
+  const backend = await mockBackend({
+    bloom: "known-bad",
+    sample: () => ({ status: 404 }),
+    analyzePurl: () => envelope(HELLO_SHA, { lvl: 3, eng: "scan-had-to" }),
+  });
+  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).eng, "scan-had-to");
+    assert.equal(backend.hits.analyzePurl, 1);
+    await ctx.flush();
+  } finally {
+    await backend.close();
+  }
+});
+
+test("an unknown bloom still hedges into an analysis", async () => {
+  // The counter-case: suppression applies only to the bad set. An unknown key
+  // is exactly what the hedge exists for.
+  const backend = await mockBackend({
+    bloom: "unknown",
+    sample: async () => {
+      await delay(200);
+      return { status: 404 };
+    },
+    analyzePurl: () => envelope(HELLO_SHA, { eng: "hedged" }),
+  });
+  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await res.json()).eng, "hedged");
+    assert.equal(backend.hits.analyzePurl, 1, "the hedge should have fired");
+    await ctx.flush();
+  } finally {
+    await backend.close();
+  }
+});
+
+test("the index probe carries both keys when the caller gave both", async () => {
+  // One request per worker, not two: scan checks each key against its own
+  // filters and merges, which is where the filters already are.
+  let asked = null;
+  const backend = await mockBackend({
+    bloom: (url) => {
+      asked = { sha: url.searchParams.get("sha256"), purl: url.searchParams.get("purl") };
+      return "unknown";
+    },
+    sample: () => ({ status: 404 }),
+  });
+  const env = testEnv(backend.url);
+  try {
+    await handle(
+      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
+      env,
+      noopCtx(),
+    );
+    assert.equal(asked.sha, HELLO_SHA, "digest missing from the index probe");
+    assert.equal(asked.purl, "pkg:npm/left-pad@1.3.0", "purl missing from the index probe");
+    assert.equal(backend.hits.bloom, 1, "one probe per worker, not one per key");
+  } finally {
+    await backend.close();
   }
 });

@@ -9,10 +9,25 @@ const SHA_RE = /^[0-9a-f]{64}$/;
 const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
 const DEFAULT_SCAN_TIMEOUT_MS = 1_800_000;
 const LOOKUP_TIMEOUT_MS = 500;
-const HOPPER_HEDGE_MS = 1_000;
+// What hopper answers for an artifact it holds but has not analyzed: the one
+// outcome worth waiting on, because somebody is already producing the answer.
+// 204 is the same state from a hopper that predates the 202, and is accepted so
+// a mixed-version fleet does not read "queued" as "nothing here".
+const HOPPER_QUEUED = 202;
+function isQueued(status) {
+  return status === HOPPER_QUEUED || status === 204;
+}
+
+// How long the analysis arm waits on a silent hopper before starting anyway.
+//
+// A policy number, not a measurement: hopper's lookups are tightly clustered at
+// 25-117ms, so this is not tracking a distribution — it is answering "how long
+// is it worth stalling a caller before spending a scan slot". 500ms is roughly
+// four times the observed p99, so it fires on genuine silence and nothing else.
+// A definite miss does not wait at all; only silence does.
+const HOPPER_HEDGE_MS = 500;
 const HOPPER_LOOKUP_MS = 15_000;
 const HOPPER_RPC_MS = 2_000;
-const FILE_TIMEOUT_MS = 30_000;
 const HEDGE = Symbol("hedge");
 const HOPPER_POLL_MS = 500;
 const BREAKER_FAILS = 5;
@@ -110,8 +125,8 @@ async function dispatch(request, env, ctx) {
       if (request.method !== "GET") return methodNotAllowed("GET");
       const sha = (url.searchParams.get("sha256") || "").trim();
       const purl = (url.searchParams.get("purl") || "").trim();
-      if (!!sha === !!purl) {
-        return json({ error: "provide exactly one of sha256 or purl" }, 400);
+      if (!sha && !purl) {
+        return json({ error: "provide sha256, purl, or both" }, 400);
       }
       return await lookupKey(env, ctx, url.origin, sha, purl);
     }
@@ -133,15 +148,19 @@ async function dispatch(request, env, ctx) {
 // Validate and canonicalize one key, then look it up. Shared by /lookup and
 // the path aliases so a PURL means the same thing however it arrived.
 async function lookupKey(env, ctx, origin, sha, purl) {
+  let hex = null;
   if (sha) {
-    const hex = sha.trim().toLowerCase();
+    hex = sha.trim().toLowerCase();
     if (!SHA_RE.test(hex)) return json({ error: "invalid sha256" }, 400);
-    return lookup(env, ctx, origin, { sha: hex, bytes: null, purl: null, analyze: false });
   }
   // Anything non-empty goes upstream: scan decides what is a PURL.
-  const canonical = normalizePurl(purl);
-  if (!canonical) return json({ error: "missing purl" }, 400);
-  return lookup(env, ctx, origin, { sha: null, bytes: null, purl: canonical, analyze: false });
+  const canonical = purl ? normalizePurl(purl) : null;
+  if (!hex && !canonical) return json({ error: "missing purl" }, 400);
+  // Both are kept when both are given. They are not interchangeable — a digest
+  // names exact bytes, a versioned PURL names whatever sample the corpus holds
+  // for that release — so carrying both is what lets one answer when the other
+  // cannot, and what lets a disagreement between them be noticed at all.
+  return lookup(env, ctx, origin, { sha: hex, bytes: null, purl: canonical, analyze: false });
 }
 
 // `pkg:` is optional, as it is on scan's own routes, and the scheme and type
@@ -343,6 +362,9 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
   let scan = null;
   let scanCtl = null;
   let hedged = false;
+  // The hedge fires once. Without this, a suppressed hedge leaves an
+  // already-resolved promise in the wait set and the loop spins on it.
+  let hedgeSpent = false;
   // /lookup reports what is already known and stops there; only /analyze may
   // spend a scan slot. Both race the same cheap sources first.
   const analyze = (why) => {
@@ -415,13 +437,29 @@ async function runLookup(env, ctx, cache, cacheKey, input, t0) {
     // Nothing cheap is left to wait on, so stop waiting out the hedge.
     if (hopper.done && known.done) analyze("cheap_sources_missed");
 
+    // A bloom hit on the bad set carries no reason — it is a filter, so all it
+    // can say is that this key is in the set. But it says something useful
+    // about where the reason lives: a known-bad sample is by definition one the
+    // corpus already holds, so hopper can almost certainly explain it, and
+    // waiting beats spending a scan slot re-deriving what is already written
+    // down. `conflicted` is the same bet — the filters disagree, and a stored
+    // verdict settles it better than a fresh scan.
+    //
+    // Only the hedge is suppressed. If hopper genuinely misses, the branch
+    // above still starts the analysis, so this delays that decision rather
+    // than removing it.
+    const indexSaysBad = known.value?.bloom === "known-bad" || known.value?.bloom === "conflicted";
+
     const waits = [];
     if (!hopper.done) waits.push(hopper.settled);
     if (!known.done) waits.push(known.settled);
     if (scan && !scan.done) waits.push(scan.settled);
-    if (!scan && input.analyze) waits.push(hedge.fired);
+    if (!scan && input.analyze && !hedgeSpent) waits.push(hedge.fired);
     if (!waits.length) break;
-    if ((await Promise.race(waits)) === HEDGE) analyze("hedge");
+    if ((await Promise.race(waits)) === HEDGE) {
+      hedgeSpent = true;
+      if (!indexSaysBad) analyze("hedge");
+    }
   }
 
   hedge.cancel();
@@ -476,8 +514,23 @@ async function scanLookup(env, ctx, input, scanCtl) {
   const cancelled = { bytes: null, scanned: { cancelled: true } };
   const ids = idFields(ctx, input);
   try {
-    let bytes = input.bytes || null;
-    if (!bytes && input.sha) bytes = await hopperFile(env, scanCtx, input.sha);
+    // Analysis needs the artifact, and the only sources of it are the caller's
+    // upload and a PURL scan can resolve for itself. A digest alone is a
+    // lookup key, not an artifact: beamline used to answer one by pulling the
+    // bytes out of hopper and pushing them to a worker, which moved the whole
+    // artifact twice through this service, capped what could be analyzed at
+    // MAX_BYTES, and put a database-backed read on the hot path — to reach
+    // bytes the worker can fetch for itself, from a static path that needs no
+    // query at all. Lookup by digest is unaffected; only analysis is refused.
+    // Analysis needs the artifact, and the only sources of it are the caller's
+    // upload and a PURL scan can resolve for itself. A digest alone is a lookup
+    // key, not an artifact: answering one meant pulling the bytes out of hopper
+    // and pushing them to a worker, moving the whole artifact twice through
+    // this service, capping analysis at MAX_BYTES, and putting a
+    // database-backed read on the hot path — to reach bytes a worker can fetch
+    // for itself from a static path that needs no query at all. Lookup by
+    // digest is unaffected; only analysis without bytes or a PURL is refused.
+    const bytes = input.bytes || null;
     if (scanCtl.signal.aborted) return cancelled;
     if (bytes) {
       const name = input.filename || input.sha;
@@ -538,17 +591,12 @@ function replyScan(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, t0,
     hopper_status: hopper?.status,
     ...idFields(ctx, input),
   });
-  // The verdict is not ours to file: the scan worker that produced it renews
-  // it on hopper itself, so it survives even when nobody is left waiting here.
-  //
-  // The bytes are ours. Hopper is the artifact store, and only the caller's
-  // upload can reach it — an artifact hopper has never seen cannot be fetched
-  // for a later analysis. Bytes we pulled *from* hopper are not sent back.
-  // A 204 means hopper already holds this artifact and has it queued, so
-  // sending it again would be pure duplication.
-  if (input.bytes && hopper?.status !== 204) {
-    waitUntil(ctx, hopperUpload(env, { ...ctx, signal: undefined }, sha, input.bytes, input.filename || sha));
-  }
+  // Neither the verdict nor the bytes are ours to file. The scan worker that
+  // produced the verdict renews it on hopper itself, and stores the artifact
+  // ahead of it — with the registry record and fetch provenance that beamline
+  // never sees. Beamline uploading too was duplicate work carrying strictly
+  // less information, and it was the only reason this service needed write
+  // access to the corpus at all.
   return serveHit(ctx, cache, cacheKey, res);
 }
 
@@ -568,15 +616,11 @@ async function settle(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, 
 
   // Waiting on hopper's worker is still work being done on the caller's behalf,
   // so a read-only lookup does not do it: it reports what is known and stops.
-  const queued = input.analyze ? await queueAndWait(env, ctx, hopper, input, bytes, scanned) : null;
+  const queued = input.analyze ? await waitForQueued(env, ctx, hopper, input) : null;
   if (queued?.env) {
     note("hopper", 200, { queued: true });
     const res = envelopeResponse(env, queued.env, queued.sha, "hopper", verdictAge(env), null, input.purl);
     return serveHit(ctx, cache, cacheKey, res);
-  }
-  if (queued?.failed) {
-    note("hopper", 503, { err: "upload" });
-    return json({ error: "unavailable" }, 503);
   }
   if (queued?.pending) {
     note("hopper", 202);
@@ -610,23 +654,39 @@ async function settle(env, ctx, cache, cacheKey, input, hopper, bytes, scanned, 
 }
 
 // Scan down, or hopper already has the bytes: upload if needed, promote, wait.
-async function queueAndWait(env, ctx, hopper, input, bytes, scanned) {
-  const shouldWait = scanned?.unavailable || hopper?.status === 204;
-  if (!shouldWait) return null;
+// Wait for a verdict hopper is already working on.
+//
+// Only ever a read. Hopper answers 202 for an artifact it holds but has not
+// analyzed, which is the one outcome worth waiting on rather than giving up on
+// — somebody is producing the answer and it will appear at this same key. So
+// beamline polls until it does.
+//
+// It waits rather than returning 202 straight away because this is a blocking
+// API: a caller asked what a package is, and "ask again later" is a worse
+// answer than a slower one. The 202 still exists as the timeout, for the case
+// where the budget runs out first.
+async function waitForQueued(env, ctx, hopper, input) {
+  // Scan being unavailable is not a reason to wait: nothing is working on it.
+  if (!isQueued(hopper?.status)) return null;
+  const sha = hopper.sha || input.sha || "";
+  if (!SHA_RE.test(sha)) return null;
 
-  let sha = hopper?.sha || input.sha || "";
-  if (bytes && hopper?.status !== 204) {
-    sha = sha || (await sha256Hex(bytes));
-    if (!(await hopperUpload(env, ctx, sha, bytes, input.filename || sha))) {
-      return { failed: true };
-    }
+  const budget = numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS);
+  const poll = numEnv(env, "HOPPER_POLL_MS", HOPPER_POLL_MS);
+  const deadline = Date.now() + budget;
+  for (let attempt = 0; Date.now() < deadline; attempt++) {
+    // Jittered, so a burst of waiters on one sample does not poll in lockstep.
+    const wait = Math.min(backoff(poll, attempt, POLL_MAX_MS), Math.max(0, deadline - Date.now()));
+    if (wait <= 0) break;
+    await sleep(wait, ctx);
+    if (clientAborted(ctx)) return null;
+    const row = await hopperSample(env, ctx, { sha, bytes: null, purl: null });
+    if (row?.status === 200) return { env: row.body, sha: row.sha || sha };
+    // The breaker opening means hopper stopped answering, not that the answer
+    // is slow. Waiting out the budget against a dead dependency helps nobody.
+    if (row == null && hopperBreaker.open()) return null;
   }
-  if (!sha || !SHA_RE.test(sha)) return null;
-
-  const waited = await waitForHopper(env, ctx, sha);
-  if (waited) return waited;
-  if (hopper?.status === 204 || bytes) return { pending: true };
-  return null;
+  return { pending: true };
 }
 
 // What scan already holds for this key, raced across every healthy worker: the
@@ -646,9 +706,13 @@ async function scanKnown(env, ctx, input, cancelSignal) {
   const workers = scanWorkers(env);
   if (!workers.length || cancelSignal?.aborted) return miss;
   const ids = idFields(ctx, input);
-  const path = input.sha
-    ? `/lookup?sha256=${input.sha}`
-    : `/lookup?purl=${encodeURIComponent(input.purl)}`;
+  // Both keys when we have both. scan checks each against its own filters and
+  // merges the answers, so a release the digest missed still decides — one
+  // request, not two, and the worker does the merging where the filters live.
+  const keys = [];
+  if (input.sha) keys.push(`sha256=${input.sha}`);
+  if (input.purl) keys.push(`purl=${encodeURIComponent(input.purl)}`);
+  const path = `/lookup?${keys.join("&")}`;
   const t0 = Date.now();
   const controls = workers.map(() => new AbortController());
   // Another source answered first: drop every arm still in the air.
@@ -744,17 +808,50 @@ async function lookupAsk(env, ctx, path, base, control) {
   }
 }
 
+// Ask hopper about this key, and — when the caller gave us both — about the
+// other one if the first cannot answer.
+//
+// Sequential, not raced. The digest is exact: when it hits, the PURL query
+// would only confirm what we already know, so the common path costs exactly one
+// request and nothing is added to hopper's load. The second query is a genuine
+// second chance: the corpus can know release 1.0 without having seen the bytes
+// the caller is holding.
+//
+// The digest stays the identity throughout. A PURL answer describing different
+// bytes is not this artifact's verdict and is refused rather than served — and
+// that disagreement is worth a log line of its own, because a version whose
+// digest has changed under it is exactly the shape of a re-publish.
 async function hopperSample(env, ctx, input, timeoutMs, cancelSignal) {
+  const first = await hopperSampleKey(env, ctx, input, timeoutMs, cancelSignal, input.sha ? "sha" : "purl");
+  if (!input.sha || !input.purl) return first;
+  if (first?.status === 200 || first == null) return first;
+
+  const second = await hopperSampleKey(env, ctx, input, timeoutMs, cancelSignal, "purl");
+  if (second?.status !== 200) return first ?? second;
+  if (second.sha && second.sha !== input.sha) {
+    logLine("purl_digest_mismatch", {
+      purl: input.purl,
+      asked: input.sha,
+      found: second.sha,
+      rid: ctx?.rid,
+    });
+    return first;
+  }
+  return second;
+}
+
+async function hopperSampleKey(env, ctx, input, timeoutMs, cancelSignal, key) {
   const base = trimSlash(env.HOPPER_URL);
   if (!base || hopperBreaker.open()) return null;
-  const url = input.sha
-    ? `${base}/api/sample/${input.sha}`
-    : `${base}/api/sample?purl=${encodeURIComponent(input.purl)}`;
+  const url =
+    key === "sha"
+      ? `${base}/api/sample/${input.sha}`
+      : `${base}/api/sample?purl=${encodeURIComponent(input.purl)}`;
   const ms = timeoutMs == null ? HOPPER_RPC_MS : timeoutMs;
   const fetchCtx = cancelSignal ? { ...ctx, signal: mergeAbort(ctx && ctx.signal, cancelSignal) } : ctx;
   try {
     // The envelope is read here so it stays inside the request timeout, and
-    // null — anything but a usable 200, 404, or 204 — trips the breaker.
+    // null — anything but a usable 200, 404, or queued — trips the breaker.
     const got = await fetchTimeout(url, { method: "GET", headers: hopperHeaders(env, ctx) }, ms, fetchCtx, async (resp) => {
       const hex = String(resp.headers.get("x-sha256") || "").trim().toLowerCase();
       const sha = (SHA_RE.test(hex) && hex) || input.sha;
@@ -763,7 +860,7 @@ async function hopperSample(env, ctx, input, timeoutMs, cancelSignal) {
         return body && { status: 200, sha, body };
       }
       await drain(resp);
-      if (resp.status === 404 || resp.status === 204) return { status: resp.status, sha };
+      if (resp.status === 404 || isQueued(resp.status)) return { status: resp.status, sha };
       return null;
     });
     if (!got) {
@@ -780,38 +877,7 @@ async function hopperSample(env, ctx, input, timeoutMs, cancelSignal) {
   }
 }
 
-async function hopperFile(env, ctx, sha) {
-  const base = trimSlash(env.HOPPER_URL);
-  if (!base || hopperBreaker.open() || !SHA_RE.test(sha)) return null;
-  const max = maxBody(env);
-  try {
-    const buf = await fetchTimeout(
-            `${base}/api/file/${sha}`,
-      { method: "GET", headers: hopperHeaders(env, ctx) },
-      FILE_TIMEOUT_MS,
-      ctx,
-      async (resp) => {
-        const len = Number(resp.headers.get("content-length"));
-        if (!resp.ok || (Number.isFinite(len) && len > max)) {
-          if (unreachableStatus(resp.status)) hopperBreaker.fail();
-          await drain(resp);
-          return null;
-        }
-        const bytes = await resp.arrayBuffer();
-        return bytes.byteLength > max ? null : bytes;
-      },
-    );
-    if (!buf) return null;
-    hopperBreaker.ok();
-    // Hopper is a cache, not an authority: only bytes that hash to the key we
-    // asked for are worth scanning.
-    return (await sha256Hex(buf)) === sha ? buf : null;
-  } catch (err) {
-    if (clientAborted(ctx)) throw err;
-    hopperBreaker.fail();
-    return null;
-  }
-}
+
 
 // A scan that never reached a verdict is worth asking again: a 5xx, a 429 at
 // capacity, an edge timeout at 120s, a dropped connection — none of those are
@@ -981,6 +1047,8 @@ function sizeBucket(bytes) {
 // One worker's /_/stats, cached. Never throws: a worker that cannot be polled
 // is routed on no evidence rather than excluded, because "I could not ask" is
 // not the same as "it is unhealthy" — the circuit breaker already owns that.
+
+
 async function scanStats(env, ctx, base) {
   const now = Date.now();
   const hit = statsCache.get(base);
@@ -1626,69 +1694,6 @@ async function readScan(resp, start, breaker, worker) {
   return { env: body, sha: shaFromEnvelope(body), ms, totalMs, worker };
 }
 
-async function hopperUpload(env, ctx, sha, bytes, filename) {
-  const base = trimSlash(env.HOPPER_URL);
-  if (!base || hopperBreaker.open() || !bytes || !SHA_RE.test(sha)) return false;
-  const name = safeName(filename || sha);
-  const prov = JSON.stringify({
-    schema_version: "1.0",
-    artifact: { filename: name, sha256: sha, size_bytes: bytes.byteLength },
-    fetch: { collector: "beamline", category: "submitted", at: new Date().toISOString() },
-  });
-  const body = multipart([
-    { name: "provenance", type: "application/json", body: prov },
-    { name: "file", filename: name, body: new Uint8Array(bytes) },
-  ]);
-  try {
-    const status = await fetchTimeout(
-            `${base}/api/upload`,
-      { method: "POST", headers: { ...hopperHeaders(env, ctx), "content-type": body.contentType }, body: body.body },
-      FILE_TIMEOUT_MS,
-      ctx,
-      readStatus,
-    );
-    if (unreachableStatus(status)) {
-      hopperBreaker.fail();
-      return false;
-    }
-    const ok = status >= 200 && status < 300;
-    if (ok) hopperBreaker.ok();
-    return ok;
-  } catch (err) {
-    if (clientAborted(ctx)) throw err;
-    hopperBreaker.fail();
-    return false;
-  }
-}
-
-async function hopperRescan(env, ctx, sha) {
-  const base = trimSlash(env.HOPPER_URL);
-  if (!base || hopperBreaker.open() || !SHA_RE.test(sha)) return;
-  try {
-    await fetchTimeout(`${base}/api/rescan/${sha}`, { method: "POST", headers: hopperHeaders(env, ctx) }, HOPPER_RPC_MS, ctx, readStatus);
-  } catch (err) {
-    if (clientAborted(ctx)) throw err;
-  }
-}
-
-async function waitForHopper(env, ctx, sha) {
-  if (!sha || !SHA_RE.test(sha)) return null;
-  const budget = numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS);
-  const poll = numEnv(env, "HOPPER_POLL_MS", HOPPER_POLL_MS);
-  const deadline = Date.now() + budget;
-  await hopperRescan(env, ctx, sha);
-  for (let attempt = 0; Date.now() < deadline; attempt++) {
-    if (clientAborted(ctx)) return null;
-    const row = await hopperSample(env, ctx, { sha, bytes: null, purl: null });
-    if (row?.status === 200) return { env: row.body, sha: row.sha || sha };
-    if (row == null && hopperBreaker.open()) return null;
-    const wait = Math.min(backoff(poll, attempt, POLL_MAX_MS), Math.max(0, deadline - Date.now()));
-    if (wait <= 0) break;
-    await sleep(wait, ctx);
-  }
-  return null;
-}
-
 // Exponential with full jitter, capped: a burst of waiters on the same sample
 // spreads out instead of polling hopper in lockstep.
 function backoff(base, attempt, cap) {
@@ -1962,11 +1967,6 @@ async function fetchTimeout(url, opts, ms, ctx, read) {
 }
 
 // A body nobody reads pins its connection until the collector notices.
-async function readStatus(resp) {
-  await drain(resp);
-  return resp.status;
-}
-
 async function drain(resp) {
   try {
     await resp.body?.cancel();
