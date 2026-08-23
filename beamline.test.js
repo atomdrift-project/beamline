@@ -622,23 +622,6 @@ test("an inherited finding is not repeated as its own hit", () => {
   assert.equal(view.hits[0].off, 512);
 });
 
-test("PURLs normalize so the pkg: prefix and type case are not two keys", () => {
-  const canonical = "pkg:npm/left-pad@1.3.0";
-  assert.equal(_test.normalizePurl("pkg:npm/left-pad@1.3.0"), canonical);
-  assert.equal(_test.normalizePurl("npm/left-pad@1.3.0"), canonical, "pkg: is optional");
-  assert.equal(_test.normalizePurl("PKG:NPM/left-pad@1.3.0"), canonical, "scheme and type fold");
-  assert.equal(_test.normalizePurl("  npm/left-pad@1.3.0  "), canonical);
-  // The name keeps its case: npm grandfathered in mixed-case package names.
-  assert.equal(_test.normalizePurl("npm/Left-Pad@1.3.0"), "pkg:npm/Left-Pad@1.3.0");
-  // Qualifiers and subpaths ride along untouched.
-  assert.equal(
-    _test.normalizePurl("generic/x@1?download_url=https://e.test/x.tgz#sub"),
-    "pkg:generic/x@1?download_url=https://e.test/x.tgz#sub",
-  );
-  // Unrecognizable input is scan's call to make, not ours.
-  assert.equal(_test.normalizePurl("not-a-purl"), "not-a-purl");
-  assert.equal(_test.normalizePurl("   "), "");
-});
 
 
 

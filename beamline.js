@@ -172,6 +172,13 @@ async function handleV1Lookup(env, ctx, url) {
     );
   }
 
+  // Keyed by the PURL as the caller spelled it, deliberately un-normalized.
+  // Scan answers with the spelling it was asked with, so one cached body is
+  // only a correct answer to the spelling that produced it — canonicalizing
+  // the key here would serve `pkg:npm/x` a body that says `npm/x`, and a
+  // caller matching replies to requests would find neither. Two spellings of
+  // one package cost two entries; the alternative costs correctness.
+  //
   // The budget is part of the question, so it is part of the cache key. Two
   // callers on different budgets are asking different things about the same
   // artifact and must not be served each other's answer.
@@ -529,23 +536,6 @@ async function lastDecision(stream) {
   return found;
 }
 
-// `pkg:` is optional, as it is on scan's own routes, and the scheme and type
-// are case-insensitive per the PURL spec. Everything after the type is left
-// exactly as sent: npm grandfathered in mixed-case names, so folding the rest
-// would merge packages that are genuinely distinct. Scan canonicalizes the
-// remainder its own way; this only has to make the two spellings of one key
-// agree on the cache entry.
-function normalizePurl(raw) {
-  const trimmed = String(raw || "").trim();
-  if (!trimmed) return "";
-  const body = trimmed.replace(/^pkg:/i, "");
-  const slash = body.indexOf("/");
-  // Nothing recognizable to canonicalize: pass it upstream unchanged rather
-  // than rejecting it here. fletch's parser is the authority on what a PURL
-  // is, and a second rule in this file would eventually disagree with it.
-  if (slash <= 0 || slash === body.length - 1) return trimmed;
-  return `pkg:${body.slice(0, slash).toLowerCase()}${body.slice(slash)}`;
-}
 // One worker's answer. An empty `bloom` means it could not give one, so the
 // race keeps waiting on whoever is left.
 // Which worker is already analyzing this artifact, if any.
@@ -1585,7 +1575,6 @@ function trimSlash(s) {
 export const _test = {
   bloomStub,
   verdictResponse,
-  normalizePurl,
   hitLocation,
   shaFromEnvelope,
   customerView,

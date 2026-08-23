@@ -41,7 +41,7 @@ served — it describes different bytes.
 $ curl 'https://api.atomdrift.com/v1/lookup?purl=npm/left-pad@1.3.0'
 {
   "decision": "allow",
-  "purl": "pkg:npm/left-pad@1.3.0",
+  "purl": "npm/left-pad@1.3.0",
   "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
   "severity": "benign",
   "fires_at": -1,
@@ -51,6 +51,12 @@ $ curl 'https://api.atomdrift.com/v1/lookup?purl=npm/left-pad@1.3.0'
   "analyzed_at": "2026-08-01T00:00:00Z"
 }
 ```
+
+`purl` comes back exactly as you sent it, so a reply can be matched to the
+request that asked for it. We canonicalize before looking up — PyPI folds `.`
+and `_` to `-`, `pkg:` is optional — but you never have to know that to read
+your own answer. `sha256` is the identity; compare it when two spellings must
+be proven to be one package.
 
 Repeat `purl` to ask about several. One package answers with one object; a
 repeated parameter answers with a list, in the order asked. The shape follows
@@ -89,10 +95,10 @@ decision. **Read lines until one carries `decision`. That is the answer.**
 ```
 $ curl -sN -X POST \
     'https://api.atomdrift.com/v1/analyze?purl=pypi/tensorflow@2.15.0'
-{"state":"analyzing","elapsed_ms":1002,"phase":"fetch","purl":"pkg:pypi/…"}
-{"state":"analyzing","elapsed_ms":6004,"phase":"unpack","purl":"pkg:pypi/…"}
+{"state":"analyzing","elapsed_ms":1002,"phase":"fetch","purl":"pypi/tens…"}
+{"state":"analyzing","elapsed_ms":6004,"phase":"unpack","purl":"pypi/tens…"}
 {"state":"analyzing","elapsed_ms":11006,"phase":"features+model","purl":"…"}
-{"decision":"allow","purl":"pkg:pypi/tensorflow@2.15.0","fires_at":-1,…}
+{"decision":"allow","purl":"pypi/tensorflow@2.15.0","fires_at":-1,…}
 ```
 
 Progress frames carry `state`, `purl`, `elapsed_ms` and `phase`. They exist
@@ -137,7 +143,7 @@ Every field is always present. Unknown is `null`, empty is `[]`.
 | field | type | |
 | --- | --- | --- |
 | `decision` | string | `allow`, `block`, `unknown`, `unavailable`. |
-| `purl` | string\|null | The package, canonicalized. |
+| `purl` | string\|null | The package, spelled as you asked. |
 | `sha256` | string\|null | The exact bytes analyzed. |
 | `severity` | string\|null | `benign`, `suspicious`, `hostile`. |
 | `fires_at` | int\|null | Tightest budget at which this grades hostile. |
