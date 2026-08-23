@@ -91,13 +91,14 @@ async function main() {
     process.stderr.write("BEAMLINE_URL is required (make stress-test sets it)\n");
     process.exit(2);
   }
-  if (!scanUrl || !hopperUrl) {
-    process.stderr.write("HOPPER_URL and SCAN_URL are required\n");
+  if (!scanUrl) {
+    process.stderr.write("SCAN_URL is required\n");
     process.exit(2);
   }
 
   process.stderr.write(
-    `beamline ${beamlineUrl}\nscan     ${scanUrl}\nhopper   ${hopperUrl}\n` +
+    `beamline ${beamlineUrl}\nscan     ${scanUrl}\n` +
+    (hopperUrl ? `hopper   ${hopperUrl}\n` : "") +
       `${popular ? "popular" : `N=${n}`}${samples ? ` SAMPLES=${samples}` : ""} concurrency=${concurrency}\n`,
   );
   await pingBackends();
@@ -345,7 +346,10 @@ async function submitLegacy(item) {
 // therefore worth exercising exactly as a client would read it.
 async function submitV1(item) {
   const looked = await ask(item, `${beamlineUrl}/v1/lookup?purl=${encodeURIComponent(item.purl)}`, "GET");
-  const known = looked.decision && looked.decision !== "unknown";
+  // Only a real verdict counts as known. `unknown` is the miss this pass exists
+  // to fill, and `unavailable` is our own failure — treating either as an
+  // answer would skip the analysis and report an outage as a cache hit.
+  const known = looked.decision === "allow" || looked.decision === "block";
   if (!analyzeMisses || known) return { ...looked, both: await bothProbeV1(item, looked) };
   const analyzed = await askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}`);
   return { ...analyzed, analyzed: true, lookupMs: looked.ms, both: await bothProbeV1(item, analyzed) };

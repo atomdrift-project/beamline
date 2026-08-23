@@ -1,23 +1,13 @@
-// Beamline: cache → scan lookup → hopper, with scan as a hedge. Zero deps.
+// Beamline: cache, then a scan worker. Zero deps.
 // Cloudflare Worker and `node local.js` share this fetch handler.
 //
-// Hopper GET /api/sample can hang. Wait HOPPER_HEDGE_MS for a 200, then start
-// scan without cancelling hopper. First useful answer wins. Hopper is aborted
-// when we reply, or at HOPPER_LOOKUP_MS, whichever is first.
+// There is one backend. Beamline does not reach the corpus itself: a worker
+// that cannot answer a lookup from its own index asks the corpus, which keeps
+// the credential and the failover in one place instead of two.
 
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DEFAULT_SCAN_TIMEOUT_MS = 1_800_000;
 const LOOKUP_TIMEOUT_MS = 500;
-// How long the analysis arm waits on a silent hopper before starting anyway.
-//
-// A policy number, not a measurement: hopper's lookups are tightly clustered at
-// 25-117ms, so this is not tracking a distribution — it is answering "how long
-// is it worth stalling a caller before spending a scan slot". 500ms is roughly
-// four times the observed p99, so it fires on genuine silence and nothing else.
-// A definite miss does not wait at all; only silence does.
-const HOPPER_HEDGE_MS = 500;
-const HOPPER_LOOKUP_MS = 15_000;
-const HOPPER_RPC_MS = 2_000;
 const BREAKER_FAILS = 5;
 const BREAKER_COOL_MS = 10_000;
 const MEMORY_CACHE_MAX = 1024;
@@ -30,8 +20,7 @@ const SCAN_RETRY_MAX_MS = 30_000;
 // Per isolate, not global: on Workers each isolate counts its own failures and
 // loses them when it is recycled, so a backend outage costs BREAKER_FAILS
 // requests per live isolate, not five in total. Same for inflight — it collapses
-// duplicate work within one isolate; the cache and hopper do it across them.
-const hopperBreaker = makeBreaker();
+// duplicate work within one isolate; the cache does it across them.
 // One breaker per scan worker, keyed by base URL. A single shared breaker would
 // let one sick worker disable scanning altogether.
 const scanBreakers = new Map();
@@ -53,8 +42,8 @@ export function handle(request, env, ctx) {
 }
 
 async function dispatch(request, env, ctx) {
-  // One id for the whole request, logged on every line and sent to hopper and
-  // scan, so a slow lookup can be followed across all three services. A caller
+  // One id for the whole request, logged on every line and sent to scan, so a
+  // slow lookup can be followed across both services. A caller
   // may bring its own; it reaches our logs and outbound headers, so it is
   // filtered and bounded first.
   const rid =
@@ -89,14 +78,14 @@ async function dispatch(request, env, ctx) {
     const bearer = /^Bearer\s+(\S+)/i.exec((request.headers.get("authorization") || "").trim());
     const got = bearer ? bearer[1] : "";
     if (!allowed.some((t) => tokenEq(got, t))) {
-      return json({ error: "unauthorized" }, 401);
+      return v1Error(401, "unauthorized", "Send your API key as `Authorization: Bearer <key>`.");
     }
   }
 
   try {
     if (url.pathname === "/v1/analyze") {
       if (request.method !== "POST") return methodNotAllowed("POST");
-      return await handleV1Analyze(env, ctx, url);
+      return await handleV1Analyze(request, env, ctx, url);
     }
     if (url.pathname === "/v1/lookup") {
       if (request.method !== "GET") return methodNotAllowed("GET");
@@ -106,14 +95,27 @@ async function dispatch(request, env, ctx) {
       if (request.method !== "GET") return methodNotAllowed("GET");
       return await handleRoutes(env, ctx, url);
     }
-    return json({ error: "not found" }, 404);
+    // A mistyped path is the first thing a new caller gets wrong, and bare
+    // `not found` sends them hunting through the docs for a name they most
+    // likely already had right — nearly every miss here is a dropped `/v1`.
+    // Name the routes, and when the last segment is one of ours, say so.
+    const routes = ["/v1/lookup", "/v1/analyze"];
+    const tail = url.pathname.replace(/\/+$/, "");
+    const guess = tail && routes.find((r) => r.endsWith(tail));
+    return v1Error(
+      404,
+      "no_such_route",
+      guess
+        ? `No route ${url.pathname}. Did you mean ${guess}?`
+        : `No route ${url.pathname}. This API serves ${routes.join(" and ")}.`,
+    );
   } catch (err) {
     if (clientAborted(ctx)) {
       logLine("canceled", { rid: ctx.rid, method: request.method, path: url.pathname });
-      return json({ error: "canceled" }, 499);
+      return v1Error(499, "canceled", "The client closed the connection.");
     }
     logLine("error", { rid: ctx.rid, method: request.method, path: url.pathname, err: errText(err) });
-    return json({ error: "internal" }, 500);
+    return v1Error(500, "internal", "Beamline failed to handle the request.");
   }
 }
 
@@ -130,6 +132,11 @@ const V1_MAX_KEYS = 50;
 // `unavailable` is not cached at all — it describes this moment's reachability,
 // and storing it would keep an outage alive after it ended.
 const V1_VERDICT_MAX_AGE = 3600;
+// The largest artifact a caller may hand us directly. A Worker holds an upload
+// in memory to be able to offer it to a second worker when the first refuses,
+// so this is a memory bound as much as a policy one. Anything bigger belongs in
+// a registry, which is what `?purl=` is for.
+const V1_MAX_UPLOAD_BYTES = 16 * 1024 * 1024;
 const V1_UNKNOWN_MAX_AGE = 60;
 
 // GET /v1/lookup — what we know, at the caller's budget. Never analyzes.
@@ -212,8 +219,20 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls) {
           return { status: resp.status, body };
         },
       );
-      // 4xx is this request being wrong, which the next worker would also say.
-      // Passed through verbatim so the caller reads scan's own reason.
+      // A 404 is not this request being wrong. This route never answers one
+      // for a well-formed query — an artifact nobody has analyzed is a 200
+      // carrying `unknown` — so a 404 means the worker has no such route, which
+      // is a fact about the worker. Counted against it and tried elsewhere:
+      // during a partial rollout that is what drains traffic off the workers
+      // that cannot serve yet and onto the ones that can. Relaying it instead
+      // told every caller their package did not exist.
+      if (answered.status === 404) {
+        breakerFor(base).fail();
+        logLine("v1_lookup", { src: "scan", status: 404, worker, no_route: true, ...ids });
+        continue;
+      }
+      // Any other 4xx is this request being wrong, which the next worker would
+      // also say. Passed through verbatim so the caller reads scan's own reason.
       if (answered.status >= 400 && answered.status < 500) {
         breakerFor(base).ok();
         logLine("v1_lookup", { src: "scan", status: answered.status, worker, ms: Date.now() - t0, ...ids });
@@ -300,11 +319,35 @@ function v1Error(status, code, message) {
 // long enough to refuse — `429 At capacity` arrives before any body — so a
 // refusal is still something to route around rather than a decision already
 // half-delivered.
-async function handleV1Analyze(env, ctx, url) {
+async function handleV1Analyze(request, env, ctx, url) {
   const purl = (url.searchParams.get("purl") || "").trim();
   const budgetRaw = url.searchParams.get("false_positive_budget");
-  if (!purl) {
-    return v1Error(400, "missing_package", "Name a package with ?purl=.");
+  // Two ways to name an artifact, and the artifact itself is one of them. A
+  // caller holding bytes nobody has published — a build output, a file off
+  // disk, something pulled from a mirror — has nothing to locate them by, and
+  // asking them to publish it first in order to find out what it is would be
+  // the wrong way round.
+  //
+  // Which is meant is decided by whether any bytes arrived, not by whether a
+  // body exists: a plain POST sends `Content-Length: 0`, so `request.body` is
+  // present and empty for every caller who named a package and sent nothing.
+  // Reading emptiness as an upload turned all of those into a 400.
+  let bytes = null;
+  if (request.body) {
+    const max = numEnv(env, "MAX_BYTES", V1_MAX_UPLOAD_BYTES);
+    let buffered;
+    try {
+      buffered = await request.arrayBuffer();
+    } catch {
+      return v1Error(400, "invalid_body", "Could not read the artifact from the request body.");
+    }
+    if (buffered.byteLength > max) {
+      return v1Error(413, "artifact_too_large", `The artifact exceeds the ${max} byte limit.`);
+    }
+    if (buffered.byteLength > 0) bytes = buffered;
+  }
+  if (!purl && !bytes) {
+    return v1Error(400, "missing_package", "Name a package with ?purl=, or send the artifact as the body.");
   }
   if (budgetRaw !== null && !/^\d{1,5}$/.test(budgetRaw.trim())) {
     return v1Error(
@@ -315,9 +358,12 @@ async function handleV1Analyze(env, ctx, url) {
   }
 
   const query = [];
+  // The PURL rides along with an upload too: scan grafts the registry
+  // provenance onto the report and echoes it in each finding's `pkg`.
+  if (purl) query.push(`purl=${encodeURIComponent(purl)}`);
   if (budgetRaw !== null) query.push(`false_positive_budget=${encodeURIComponent(budgetRaw.trim())}`);
   const path = `/v1/analyze${query.length ? `?${query.join("&")}` : ""}`;
-  const ids = { rid: ctx.rid, purl };
+  const ids = { rid: ctx.rid, purl: purl || undefined, bytes: bytes ? bytes.byteLength : undefined };
   const t0 = Date.now();
 
   // Who is already running it, asked once rather than per attempt. A worker
@@ -325,12 +371,12 @@ async function handleV1Analyze(env, ctx, url) {
   // progress rather than starting another beside it, so a caller who
   // reconnected belongs back on that worker — anywhere else pays for the whole
   // analysis a second time.
-  const busy = await runningWorker(env, ctx, { purl, sha: null }, ids);
+  const busy = purl ? await runningWorker(env, ctx, { purl, sha: null }, ids) : null;
   const tries = numEnv(env, "SCAN_RETRIES", SCAN_RETRIES);
   const backoffBase = numEnv(env, "SCAN_RETRY_BASE_MS", SCAN_RETRY_BASE_MS);
 
   for (let attempt = 0; ; attempt++) {
-    const answered = await v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0);
+    const answered = await v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, bytes);
     if (answered) return answered;
     // Every worker refused. They are busy rather than broken — scan refuses the
     // instant a slot is asked for — so the work is worth offering again once
@@ -347,7 +393,7 @@ async function handleV1Analyze(env, ctx, url) {
   // find out" is an answer about it that their policy may treat differently
   // from "nobody has analyzed this".
   logLine("v1_analyze", { src: "none", status: 200, unavailable: true, ms: Date.now() - t0, ...ids });
-  return new Response(`${JSON.stringify(v1Unavailable(null, purl))}\n`, {
+  return new Response(`${JSON.stringify(v1Unavailable(null, purl || null))}\n`, {
     status: 200,
     headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" },
   });
@@ -355,7 +401,7 @@ async function handleV1Analyze(env, ctx, url) {
 
 // One pass over the fleet. Returns the response, or null when every worker
 // refused and the pass is worth making again.
-async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0) {
+async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, bytes) {
   const workers = scanWorkers(env);
   let ranked = workers.length ? (await rankWorkers(env, ctx, workers, ids, { purl })).workers : [];
   if (busy) {
@@ -368,10 +414,14 @@ async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0) {
     const worker = hostOf(base);
     let upstream;
     try {
+      // The query names the package and the body is the artifact, so a request
+      // that names one carries no body at all. Nothing here declares a content
+      // type: which is meant is decided by what arrives, and a header saying so
+      // could only ever disagree with it.
       upstream = await fetch(`${base}${path}`, {
         method: "POST",
-        headers: { ...scanHeaders(env, ctx), "content-type": "application/json" },
-        body: JSON.stringify({ purl }),
+        headers: scanHeaders(env, ctx),
+        body: bytes,
         signal: ctx.signal,
       });
     } catch {
@@ -383,6 +433,14 @@ async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0) {
     if (upstream.status === 429 || upstream.status >= 500) {
       breakerFor(base).fail();
       logLine("v1_analyze", { src: "scan", status: upstream.status, worker, retry: true, ...ids });
+      continue;
+    }
+    // As on the lookup: a 404 means this worker has no such route, not that the
+    // request was wrong. Counted against it so a partial rollout converges on
+    // the workers that can serve.
+    if (upstream.status === 404) {
+      breakerFor(base).fail();
+      logLine("v1_analyze", { src: "scan", status: 404, worker, no_route: true, ...ids });
       continue;
     }
     breakerFor(base).ok();
@@ -1014,11 +1072,11 @@ async function handleRoutes(env, ctx, url) {
   const rawPurl = (url.searchParams.get("purl") || "").trim();
   const size = rawSize && rawSize.toLowerCase() !== "none" ? parseSize(rawSize) : null;
   if (rawSize && rawSize.toLowerCase() !== "none" && size == null) {
-    return json({ error: "invalid size" }, 400);
+    return v1Error(400, "invalid_size", `Could not read ${rawSize} as a size.`);
   }
 
   const all = urlList(env.SCAN_URL);
-  if (!all.length) return json({ error: "no SCAN_URL configured" }, 503);
+  if (!all.length) return v1Error(503, "no_workers", "No SCAN_URL is configured.");
   // scanWorkers() filters tripped workers out before ranking ever sees them,
   // so a breaker-excluded worker would otherwise just vanish from this view
   // with no explanation — which is precisely when an operator is looking.
@@ -1118,7 +1176,7 @@ function parseSize(raw) {
   return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
 }
 // Exponential with full jitter, capped: a burst of waiters on the same sample
-// spreads out instead of polling hopper in lockstep.
+// spreads out instead of retrying in lockstep.
 function backoff(base, attempt, cap) {
   const ceiling = Math.min(base * 2 ** Math.min(attempt, 10), cap);
   return ceiling <= base ? base : base + Math.random() * (ceiling - base);
@@ -1304,8 +1362,8 @@ function shaFromEnvelope(body) {
   const sha = body?.raw?.files?.[0]?.sha;
   return typeof sha === "string" ? sha.toLowerCase() : "";
 }
-// Hopper and scan are reached over ordinary fetch: each sits behind a
-// Cloudflare Tunnel with a public hostname, so the edge does the routing.
+// Scan is reached over ordinary fetch: each worker sits behind a Cloudflare
+// Tunnel with a public hostname, so the edge does the routing.
 //
 // `read` runs inside the timeout and the client's abort, because a backend
 // that sends headers promptly can still stall mid-body. Nothing may touch the
@@ -1498,9 +1556,10 @@ function json(obj, status) {
 // requires the `Allow` header here; the detail repeats it for anyone reading
 // only the body.
 function methodNotAllowed(allow) {
-  return new Response(JSON.stringify({ error: "method not allowed", detail: `use ${allow}` }), {
+  const body = { error: { code: "method_not_allowed", message: `Use ${allow}.` } };
+  return new Response(JSON.stringify(body), {
     status: 405,
-    headers: { "content-type": "application/json", allow },
+    headers: { "content-type": "application/json", "cache-control": "no-store", allow },
   });
 }
 
@@ -1533,9 +1592,6 @@ export const _test = {
   topHits,
   SHA_RE,
   DEFAULT_SCAN_TIMEOUT_MS,
-  HOPPER_HEDGE_MS,
-  HOPPER_LOOKUP_MS,
-  HOPPER_RPC_MS,
   LOOKUP_TIMEOUT_MS,
   MEMORY_CACHE_MAX,
   BREAKER_FAILS,
@@ -1549,7 +1605,6 @@ export const _test = {
   tokenList,
   numEnv,
   reset() {
-    hopperBreaker.reset();
     scanBreakers.clear();
     inflight.clear();
     getCache.memory = null;

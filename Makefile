@@ -44,8 +44,10 @@ test:
 
 # Start a local beamline (unless BEAMLINE_URL is already set or :$(PORT) is up),
 # pull new npm / PyPI / crates / Go PURLs, submit them, print latency and bugs.
+# HOPPER_URL is optional here and reports the corpus's health alongside the
+# fleet's. Beamline no longer reaches hopper, so a run without it is a complete
+# run — one panel short, not one dependency short.
 stress-test:
-	@test -n "$(HOPPER_URL)" || { echo "HOPPER_URL is required"; exit 1; }
 	@test -n "$(SCAN_URL)" || { echo "SCAN_URL is required"; exit 1; }
 	@url="$(BEAMLINE_URL)"; \
 	started=""; \
@@ -55,8 +57,8 @@ stress-test:
 	    echo "using existing beamline at $$url"; \
 	  else \
 	    echo "starting beamline on :$(PORT)"; \
-	    SCAN_URL="$(SCAN_URL)" HOPPER_URL="$(HOPPER_URL)" PORT="$(PORT)" BEAMLINE_TOKEN="$(BEAMLINE_TOKEN)" \
-	      HOPPER_TOKEN="$(HOPPER_TOKEN)" SCAN_TOKEN="$(SCAN_TOKEN)" \
+	    SCAN_URL="$(SCAN_URL)" PORT="$(PORT)" BEAMLINE_TOKEN="$(BEAMLINE_TOKEN)" \
+	      SCAN_TOKEN="$(SCAN_TOKEN)" \
 	      SCAN_RACE_DELAY_MS="$(SCAN_RACE_DELAY_MS)" SCAN_RETRIES="$(SCAN_RETRIES)" \
 	      node local.js & started=$$!; \
 	    i=0; \
@@ -96,14 +98,18 @@ pop-test:
 	@$(MAKE) --no-print-directory stress-test POPULAR=1 ANALYZE_MISSES=1
 
 # Publish beamline.js as a Cloudflare Worker. 200s land in caches.default.
-# HOPPER_URL and SCAN_URL are the public hostnames of the Cloudflare Tunnels
-# in front of hopper and scan; the Worker reaches them over ordinary fetch and
-# the edge routes into the tunnel. They carry their own authentication.
+# SCAN_URL is the public hostname of the Cloudflare Tunnel in front of scan;
+# the Worker reaches it over ordinary fetch and the edge routes into the tunnel.
+# It carries its own authentication.
+#
+# There is no HOPPER_URL. Beamline does not talk to hopper: a lookup it cannot
+# answer goes to a scan worker, and a worker that does not know asks the corpus
+# itself. Passing one here would configure a service this Worker cannot reach
+# and does not need a credential for.
 # SCAN_URL may list several workers, comma-separated, to race them:
 #   SCAN_URL=https://scan-a.example,https://scan-b.example make deploy-cf
 # Tokens, all three separate, uploaded as Worker secrets after the deploy:
 #   BEAMLINE_TOKEN   # who may call beamline
-#   HOPPER_TOKEN     # beamline -> hopper
 #   SCAN_TOKEN       # beamline -> scan
 # Each takes the environment if set, otherwise the first non-empty line of
 # ~/.tok/<service> — the same file tok.js reads locally, so a deployed Worker
@@ -127,11 +133,8 @@ define put_secret
 endef
 
 deploy-cf:
-	@test -n "$(HOPPER_URL)" || { echo "HOPPER_URL is required"; exit 1; }
 	@test -n "$(SCAN_URL)" || { echo "SCAN_URL is required"; exit 1; }
 	npx --yes $(WRANGLER) deploy \
-	  --var "HOPPER_URL:$(HOPPER_URL)" \
 	  --var "SCAN_URL:$(SCAN_URL)"
 	$(call put_secret,BEAMLINE_TOKEN,beamline)
-	$(call put_secret,HOPPER_TOKEN,hopper)
 	$(call put_secret,SCAN_TOKEN,scan)

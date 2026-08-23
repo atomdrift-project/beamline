@@ -7,6 +7,7 @@ GET  /v1/lookup?purl={purl}                   free, cacheable, never analyzes
 GET  /v1/lookup?sha256={64hex}
 GET  /v1/lookup?purl=a&purl=b                 up to 50 per URL
 POST /v1/analyze?purl={purl}                  spends an analysis slot; streams
+POST /v1/analyze                              the artifact as the raw body
 
 GET  /healthz    (also /_/health)             liveness; no token required
 GET  /_/routes                                the router's own reasoning
@@ -60,6 +61,27 @@ Over 50 packages is a `413`. There is no batch limit on `/v1/analyze` because it
 takes one package.
 
 ## POST /v1/analyze
+
+Name a package, or send the artifact itself. A caller holding bytes nobody
+has published — a build output, a file off disk, something pulled from a
+mirror — has nothing to locate them by, and publishing first in order to find
+out what you have is the wrong way round.
+
+```
+$ curl -sN -X POST --data-binary @suspect.tgz \
+    -H 'Content-Type: application/octet-stream' \
+    'https://api.atomdrift.com/v1/analyze'
+```
+
+The digest is the identity, so two callers uploading the same artifact share one
+analysis exactly as two naming one PURL do. `?purl=` may accompany the bytes:
+it is grafted onto the report as registry provenance and echoed in each
+finding's `pkg`.
+
+Uploads are capped at 16 MiB — the artifact is held in memory so a worker that
+refuses can be offered the same bytes. Anything larger belongs in a registry,
+which is what `?purl=` is for. An empty body is `empty_artifact`; one over the
+cap is `artifact_too_large`.
 
 The reply is newline-delimited JSON: progress while the run is going, then the
 decision. **Read lines until one carries `decision`. That is the answer.**
@@ -187,6 +209,9 @@ reworded.
 | `invalid_purl` | 400 | Not a package URL. |
 | `invalid_sha256` | 400 | Not 64 hexadecimal characters. |
 | `too_many_packages` | 413 | Over 50 in one URL. Use several requests. |
+| `empty_artifact` | 400 | The uploaded body had no bytes. |
+| `artifact_too_large` | 413 | Over the 16 MiB upload cap; use `purl`. |
+| `invalid_body` | 400 | The body could not be read. |
 
 Beamline's own refusals, such as an unauthenticated request or an unknown
 route, answer `{"error":"unauthorized"}` and the like, without a code.

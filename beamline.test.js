@@ -61,10 +61,27 @@ const DEAD = "http://127.0.0.1:1";
 
 
 
-test("unknown route is 404 not found", async () => {
+test("unknown route is 404 and names the routes", async () => {
   const res = await handle(new Request("http://beamline/nope"), {}, {});
   assert.equal(res.status, 404);
-  assert.equal((await res.json()).error, "not found");
+  const { error } = await res.json();
+  assert.equal(error.code, "no_such_route");
+  assert.match(error.message, /\/v1\/lookup and \/v1\/analyze/);
+});
+
+
+
+// The mistake a first-time caller actually makes. `curl /lookup?purl=...` is
+// the right question at the wrong path, and a bare "not found" sends them
+// hunting for a misspelling that isn't there.
+test("a dropped version prefix says so", async () => {
+  for (const path of ["/lookup", "/analyze"]) {
+    const res = await handle(new Request(`http://beamline${path}?purl=pkg:npm/x@1`), {}, {});
+    assert.equal(res.status, 404);
+    const { error } = await res.json();
+    assert.equal(error.code, "no_such_route");
+    assert.match(error.message, new RegExp(`Did you mean /v1${path}\\?`));
+  }
 });
 
 
@@ -76,17 +93,20 @@ test("query purl is not a route", async () => {
 
 
 
-test("hopper hedge defaults", () => {
-  assert.equal(_test.HOPPER_HEDGE_MS, 500);
-  assert.equal(_test.HOPPER_LOOKUP_MS, 15_000);
-  assert.equal(_test.HOPPER_RPC_MS, 2_000);
+// Every knob is read from the environment at the point of use, so a typo in a
+// deploy becomes a silently different timeout rather than a startup failure.
+// The rule that keeps that survivable: anything unparseable falls back to the
+// built-in default, and only a genuine number wins. Zero is a genuine number —
+// it is how a knob gets turned off — while a negative one is a typo.
+test("numEnv keeps a bad knob from becoming a bad default", () => {
+  const k = "SCAN_TIMEOUT_MS";
+  assert.equal(_test.numEnv({}, k, 1000), 1000);
+  assert.equal(_test.numEnv({ [k]: "" }, k, 1000), 1000);
+  assert.equal(_test.numEnv({ [k]: "nope" }, k, 1000), 1000);
+  assert.equal(_test.numEnv({ [k]: "-1" }, k, 1000), 1000);
+  assert.equal(_test.numEnv({ [k]: "0" }, k, 1000), 0);
+  assert.equal(_test.numEnv({ [k]: "20" }, k, 1000), 20);
   assert.equal(_test.BREAKER_FAILS, 5);
-  assert.equal(_test.numEnv({}, "HOPPER_HEDGE_MS", 1000), 1000);
-  assert.equal(_test.numEnv({ HOPPER_HEDGE_MS: "" }, "HOPPER_HEDGE_MS", 1000), 1000);
-  assert.equal(_test.numEnv({ HOPPER_HEDGE_MS: "nope" }, "HOPPER_HEDGE_MS", 1000), 1000);
-  assert.equal(_test.numEnv({ HOPPER_HEDGE_MS: "-1" }, "HOPPER_HEDGE_MS", 1000), 1000);
-  assert.equal(_test.numEnv({ HOPPER_HEDGE_MS: "0" }, "HOPPER_HEDGE_MS", 1000), 0);
-  assert.equal(_test.numEnv({ HOPPER_HEDGE_MS: "20" }, "HOPPER_HEDGE_MS", 1000), 20);
 });
 
 
@@ -702,6 +722,7 @@ function testEnv(url, extra = {}) {
     BEAMLINE_TOKEN: extra.BEAMLINE_TOKEN,
     HOPPER_POLL_MS: extra.HOPPER_POLL_MS ?? "10",
     SCAN_TIMEOUT_MS: extra.SCAN_TIMEOUT_MS ?? "2000",
+    MAX_BYTES: extra.MAX_BYTES,
     HOPPER_HEDGE_MS: extra.HOPPER_HEDGE_MS,
     HOPPER_LOOKUP_MS: extra.HOPPER_LOOKUP_MS,
     // Retries are real behaviour worth exercising, but not at a real clock:
@@ -790,6 +811,8 @@ function mockBackend(opts) {
       }
       if (url.pathname === "/v1/analyze") {
         hits.analyze += 1;
+        if (opts.onAnalyzeBody) opts.onAnalyzeBody(body.toString("utf8"));
+        if (opts.onAnalyzeQuery) opts.onAnalyzeQuery(url);
         const forced = typeof opts.analyzeStatus === "function" ? opts.analyzeStatus() : opts.analyzeStatus;
         if (forced && forced !== 200) {
           return send(res, forced, { error: { code: "at_capacity" } });
@@ -1448,4 +1471,192 @@ test("v1: an authenticated answer is private to the caller", async () => {
   } finally {
     await scan.close();
   }
+});
+
+// A partial rollout, which is what production looked like when this was found:
+// one worker had the route and the others did not. Beamline ranks
+// deterministically, so relaying the first worker's 404 meant every caller was
+// told their package did not exist while a worker that could answer sat idle —
+// measured at 0 successes in 12 requests.
+//
+// A 404 is never this request being wrong: the route answers 200 with
+// `unknown` for an artifact nobody has analyzed. It means the worker has no
+// such route, which is a fact about the worker.
+test("v1: a worker without the route is skipped, not relayed", async () => {
+  const old = await mockBackend({ v1: () => ({ status: 404 }) });
+  const rolled = await mockBackend({
+    v1: () => ({
+      decision: "allow", purl: "pkg:npm/left-pad@1.3.0", sha256: null, severity: "benign",
+      fires_at: -1, reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+    }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: `${old.url},${rolled.url}` });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200, "a worker's missing route was reported to the caller as a missing package");
+    assert.equal((await res.json()).decision, "allow");
+  } finally {
+    await Promise.all([old.close(), rolled.close()]);
+  }
+});
+
+// And it converges: a worker that keeps answering 404 is counted against and
+// drops out of the pool, so a partial rollout drains onto the workers that can
+// serve rather than paying a wasted round trip on every request.
+test("v1: a partial rollout converges on the worker that can serve", async () => {
+  const old = await mockBackend({ v1: () => ({ status: 404 }) });
+  const rolled = await mockBackend({
+    v1: () => ({
+      decision: "allow", purl: "pkg:npm/left-pad@1.3.0", sha256: null, severity: "benign",
+      fires_at: -1, reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+    }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: `${old.url},${rolled.url}` });
+  const url = "http://beamline/v1/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0";
+  try {
+    for (let i = 0; i < _test.BREAKER_FAILS + 1; i++) {
+      const res = await handle(new Request(url), { ...env, cache: _test.memoryCache() }, waitCtx().ctx);
+      assert.equal(res.status, 200);
+    }
+    const before = old.hits.v1;
+    for (let i = 0; i < 3; i++) {
+      await handle(new Request(url), { ...env, cache: _test.memoryCache() }, waitCtx().ctx);
+    }
+    assert.equal(old.hits.v1, before, "the un-rolled worker was still being asked");
+  } finally {
+    await Promise.all([old.close(), rolled.close()]);
+  }
+});
+
+// A 400 is different: the request really is wrong, and the next worker would
+// say so too. It reaches the caller with scan's own reason.
+test("v1: a genuine client error still reaches the caller", async () => {
+  const scan = await mockBackend({ v1: () => ({ status: 400 }) });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 400, "a client error was swallowed as a worker fault");
+  } finally {
+    await scan.close();
+  }
+});
+
+// A caller holding bytes nobody has published — a build output, a file off
+// disk, something pulled from a mirror — has nothing to locate them by. The
+// legacy route took the artifact as the raw body and v1 dropped it, which broke
+// `curl -T` against the API with a 400 saying to name a package.
+test("v1 analyze: the artifact may be the body", async () => {
+  let got = null;
+  const scan = await mockBackend({
+    status: { state: "unknown" },
+    onAnalyzeBody: (body) => {
+      got = body;
+    },
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"sha256":"abc"}'],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze", { method: "POST", body: "hello" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200, "an uploaded artifact was refused");
+    assert.equal(JSON.parse((await res.text()).trim()).decision, "allow");
+    assert.equal(got, "hello", "the bytes did not reach the worker intact");
+  } finally {
+    await scan.close();
+  }
+});
+
+// The locator still rides along when both are sent: scan grafts the registry
+// provenance onto the report and echoes it in each finding's `pkg`.
+test("v1 analyze: an upload may still name the package", async () => {
+  let gotPurl = null;
+  const scan = await mockBackend({
+    status: { state: "unknown" },
+    onAnalyzeQuery: (u) => {
+      gotPurl = u.searchParams.get("purl");
+    },
+    analyzeStream: ['{"decision":"allow","fires_at":-1}'],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fx%401.0.0", { method: "POST", body: "bytes" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(gotPurl, "pkg:npm/x@1.0.0", "the locator was dropped from an upload");
+  } finally {
+    await scan.close();
+  }
+});
+
+// Naming nothing and sending nothing is the bare `curl -X POST` — answered by
+// telling the caller how to name a package, since that is what they are
+// missing.
+test("v1 analyze: naming nothing is refused with a stable code", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const res = await handle(
+    new Request("http://beamline/v1/analyze", { method: "POST" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(res.status, 400);
+  const { error } = await res.json();
+  assert.equal(error.code, "missing_package");
+  // The message has to name both ways in, or a caller holding bytes is told
+  // only about the one they cannot use.
+  assert.match(error.message, /purl/);
+  assert.match(error.message, /body/);
+});
+
+// A plain POST sends `Content-Length: 0`, so every caller who names a package
+// and sends nothing still arrives with a body — an empty one. Reading that as
+// an upload turned every analysis by PURL into a 400, which is how this was
+// found: in production, on the path poppy uses for every release it precaches.
+test("v1 analyze: an empty body is no body, not an empty artifact", async () => {
+  let asked = null;
+  const scan = await mockBackend({
+    status: { state: "unknown" },
+    onAnalyzeQuery: (u) => {
+      asked = u.searchParams.get("purl");
+    },
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/x@1.0.0"}'],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fx%401.0.0", { method: "POST", body: "" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200, "a named package with no bytes was refused");
+    assert.equal(JSON.parse((await res.text()).trim()).decision, "allow");
+    assert.equal(asked, "pkg:npm/x@1.0.0", "the package was not analyzed");
+  } finally {
+    await scan.close();
+  }
+});
+
+// Held in memory so a refused first worker can be offered the same artifact,
+// which makes the cap a memory bound as much as a policy one.
+test("v1 analyze: an oversized artifact is refused by name", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD, MAX_BYTES: "8" });
+  const res = await handle(
+    new Request("http://beamline/v1/analyze", { method: "POST", body: "far too many bytes" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(res.status, 413);
+  assert.equal((await res.json()).error.code, "artifact_too_large");
 });

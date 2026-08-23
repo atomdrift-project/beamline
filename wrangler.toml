@@ -3,11 +3,10 @@ main = "beamline.js"
 compatibility_date = "2026-08-19"
 
 # 200s are stored in caches.default (Cloudflare Cache API) by beamline.js.
-# HOPPER_URL and SCAN_URL are not stored here; make deploy-cf passes them
-# from the environment.
+# SCAN_URL is not stored here; make deploy-cf passes it from the environment.
 
 # logLine emits one object per lookup carrying `src`, which names the layer
-# that answered — cache, scan-cache, bloom, hopper, or scan. Workers Logs
+# that answered — cache or scan. Workers Logs
 # indexes those fields, so the cache hit rate is a query rather than a guess.
 [observability]
 enabled = true

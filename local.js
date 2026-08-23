@@ -18,16 +18,11 @@ const MAX_INFLIGHT = Number(process.env.MAX_INFLIGHT) || 32;
 // Every knob beamline.js reads, so a local run is tunable the same way a
 // deployed Worker is. Anything absent falls back to the built-in default.
 const TUNABLES = [
-  "HOPPER_URL",
   "SCAN_URL",
   "BEAMLINE_TOKEN",
   "MAX_BYTES",
   "SCAN_TIMEOUT_MS",
-  "HOPPER_TOKEN",
   "SCAN_TOKEN",
-  "HOPPER_HEDGE_MS",
-  "HOPPER_LOOKUP_MS",
-  "HOPPER_POLL_MS",
   "SCAN_RETRIES",
   "SCAN_RETRY_BASE_MS",
   "SCAN_RACE_DELAY_MS",
@@ -35,13 +30,11 @@ const TUNABLES = [
 
 const env = Object.fromEntries(TUNABLES.map((k) => [k, process.env[k] || ""]));
 
-// Three separate credentials, each with its own ~/.tok file: BEAMLINE_TOKEN is
-// who may call us, HOPPER_TOKEN and SCAN_TOKEN are how we call them. An unset
-// one falls back to the file, so a local run needs no arguments. Leaving
-// ~/.tok/beamline absent leaves this beamline unauthenticated, exactly as an
-// unset BEAMLINE_TOKEN always has.
+// Two credentials, each with its own ~/.tok file: BEAMLINE_TOKEN is who may
+// call us, SCAN_TOKEN is how we call scan. An unset one falls back to the file,
+// so a local run needs no arguments. Leaving ~/.tok/beamline absent leaves this
+// beamline unauthenticated, exactly as an unset BEAMLINE_TOKEN always has.
 env.BEAMLINE_TOKEN ||= readToken("beamline");
-env.HOPPER_TOKEN ||= readToken("hopper");
 env.SCAN_TOKEN ||= readToken("scan");
 
 // Workaround, not design. On Node 26 fetch does not dispatch a second
@@ -89,7 +82,7 @@ const server = createServer(async (req, res) => {
       headers,
       body: req.method === "GET" || req.method === "HEAD" ? undefined : buf,
     });
-    // A client that hangs up should not leave hopper and scan working.
+    // A client that hangs up should not leave scan working.
     const ac = new AbortController();
     res.on("close", () => {
       if (!res.writableFinished) ac.abort();
