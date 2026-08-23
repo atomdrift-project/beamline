@@ -102,6 +102,8 @@ async function main() {
       `${popular ? "popular" : `N=${n}`}${samples ? ` SAMPLES=${samples}` : ""} concurrency=${concurrency}\n`,
   );
   await pingBackends();
+  // Before the volume pass: the shapes it cannot reach, checked once.
+  const contract = api === "v1" ? await contractProbe() : [];
 
   // POPULAR=1 swaps the live registry feeds for the fixed list above.
   if (popular) {
@@ -112,8 +114,8 @@ async function main() {
     const summary = summarize(rows);
     printReport(rows, summary, []);
     printRace(raceDelta(before, await raceSnapshot()));
-    if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, rows, summary });
-    process.exit(summary.bugs.length ? 1 : 0);
+    if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, rows, summary, contract });
+    process.exit(summary.bugs.length || contract.length ? 1 : 0);
   }
 
   const feeds = await Promise.allSettled([
@@ -144,8 +146,8 @@ async function main() {
   const summary = summarize(rows);
   printReport(rows, summary, feedErrors);
   printRace(raceDelta(before, await raceSnapshot()));
-  if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, rows, summary });
-  process.exit(summary.bugs.length ? 1 : 0);
+  if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, rows, summary, contract });
+  process.exit(summary.bugs.length || contract.length ? 1 : 0);
 }
 
 async function named(eco, fn) {
@@ -1003,15 +1005,107 @@ async function pool(items, width, fn) {
   return out;
 }
 
-async function get(url, ms, extra = {}, method = "GET") {
+async function get(url, ms, extra = {}, method = "GET", body) {
   const headers = { "user-agent": UA, ...extra };
-  const resp = await fetch(url, { method, headers, signal: AbortSignal.timeout(ms) });
+  // Set only when there is one: a GET carrying an explicit `body: undefined` is
+  // an invalid fetch init, not an empty request.
+  const init = { method, headers, signal: AbortSignal.timeout(ms) };
+  if (body !== undefined) init.body = body;
+  const resp = await fetch(url, init);
   const local = beamlineUrl && url.startsWith(beamlineUrl);
   if (!local && !resp.ok) {
     const t = await resp.text().catch(() => "");
     throw new Error(`${url} HTTP ${resp.status}${t ? `: ${t.slice(0, 180)}` : ""}`);
   }
   return resp;
+}
+
+// The three shapes the per-package pass never reaches, checked once per run.
+//
+// Every row above asks about one PURL by coordinate. That leaves the list reply,
+// the digest-only key, and the whole byte-upload route untested — and the upload
+// route is the one that has broken twice: once refusing a `curl -T` for its
+// content-type, once answering `empty_artifact` to every bodyless POST because a
+// plain POST sends `Content-Length: 0`. Both shipped. Neither would have.
+//
+// Returns a list of complaints, folded into the run's bugs so a failure here
+// exits non-zero like any other.
+async function contractProbe() {
+  const issues = [];
+  const auth = token ? { authorization: `Bearer ${token}` } : {};
+  const call = async (path, method = "GET", body, extra = {}) => {
+    const resp = await get(`${beamlineUrl}${path}`, timeoutMs + 10_000, { ...auth, ...extra }, method, body);
+    return { status: resp.status, body: await readJson(resp) };
+  };
+
+  // A list question gets a list answer, in the order asked, each entry naming
+  // the package it is about — which is the only way a caller can tell which
+  // answer belongs to which of fifty questions.
+  const pair = ["pkg:npm/left-pad@1.3.0", "pkg:pypi/requests@2.31.0"];
+  try {
+    const q = pair.map((p) => `purl=${encodeURIComponent(p)}`).join("&");
+    const { status, body } = await call(`/v1/lookup?${q}`);
+    if (status !== 200) issues.push(`list lookup: HTTP ${status}`);
+    else if (!Array.isArray(body)) issues.push("list lookup: two PURLs did not answer with a list");
+    else if (body.length !== pair.length) issues.push(`list lookup: asked ${pair.length}, got ${body.length}`);
+    else {
+      body.forEach((entry, i) => {
+        issues.push(...checkV1(200, entry, pair[i]));
+      });
+    }
+  } catch (e) {
+    issues.push(`list lookup: ${e.message || e}`);
+  }
+
+  // A spelling the canonicalizer would rewrite. PyPI folds `.` and `_` to `-`
+  // per PEP 503, so this is the exact shape that came back answered about a
+  // package the caller had not named.
+  try {
+    const odd = "pkg:pypi/zope.interface@6.1";
+    const { status, body } = await call(`/v1/lookup?purl=${encodeURIComponent(odd)}`);
+    if (status !== 200) issues.push(`spelling: HTTP ${status}`);
+    else issues.push(...checkV1(200, body, odd));
+  } catch (e) {
+    issues.push(`spelling: ${e.message || e}`);
+  }
+
+  // The upload route. A tiny artifact of our own making, so the run neither
+  // depends on a registry nor spends a real analysis slot on something large.
+  try {
+    const artifact = Buffer.from(`stress-probe-${process.pid}-${Date.now()}\n`);
+    const { status, body } = await call("/v1/analyze", "POST", artifact);
+    if (status !== 200) {
+      issues.push(`upload: HTTP ${status} ${JSON.stringify(body?.error || body).slice(0, 120)}`);
+    } else {
+      const decision = Array.isArray(body) ? body[body.length - 1] : body;
+      issues.push(...checkV1(200, decision, null));
+      // Bytes have no coordinate, and the digest is not one: a sha256 in the
+      // `purl` field is how the two routes stop agreeing.
+      if (decision?.purl != null) issues.push(`upload: answered with purl ${decision.purl}`);
+      if (!/^[0-9a-f]{64}$/.test(decision?.sha256 || "")) issues.push("upload: no sha256");
+    }
+  } catch (e) {
+    issues.push(`upload: ${e.message || e}`);
+  }
+
+  // A bodyless POST that names nothing is the caller's mistake, and must say so
+  // rather than being read as an empty upload.
+  try {
+    const { status, body } = await call("/v1/analyze", "POST");
+    if (status !== 400) issues.push(`empty POST: HTTP ${status}, expected 400`);
+    else if (body?.error?.code !== "missing_package") {
+      issues.push(`empty POST: ${JSON.stringify(body?.error?.code)}, expected missing_package`);
+    }
+  } catch (e) {
+    issues.push(`empty POST: ${e.message || e}`);
+  }
+
+  process.stderr.write(
+    issues.length
+      ? `contract ${issues.length} problem(s)\n${issues.map((i) => `  ${i}\n`).join("")}`
+      : "contract ok (list, spelling, upload, empty POST)\n",
+  );
+  return issues;
 }
 
 function trimSlash(s) {

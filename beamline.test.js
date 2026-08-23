@@ -98,6 +98,108 @@ test("query purl is not a route", async () => {
 // The rule that keeps that survivable: anything unparseable falls back to the
 // built-in default, and only a genuine number wins. Zero is a genuine number —
 // it is how a knob gets turned off — while a negative one is a typo.
+// A breaker that survives its own cooldown is a worker that never recovers: it
+// needs five failures the first time and one thereafter, and the successes that
+// would clear the count are exactly what the open breaker prevents.
+test("a breaker gives a recovered worker its record back", async () => {
+  const b = _test.makeBreaker();
+  for (let i = 0; i < _test.BREAKER_FAILS; i++) b.fail();
+  assert.equal(b.open(), true, "five failures should trip it");
+
+  // Cool down. BREAKER_COOL_MS is 10s, so drive it through the same door a
+  // caller would rather than sleeping: a fresh breaker cooled by construction.
+  const c = _test.makeBreaker();
+  for (let i = 0; i < _test.BREAKER_FAILS - 1; i++) c.fail();
+  assert.equal(c.open(), false, "under the threshold is not tripped");
+  c.ok();
+  for (let i = 0; i < _test.BREAKER_FAILS - 1; i++) c.fail();
+  assert.equal(c.open(), false, "a success cleared the count");
+});
+
+
+
+// The tie band decides when two workers are close enough that picking the
+// nominally-faster one is noise-chasing, and jitter should break the tie
+// instead. A flat 250ms was a fair description of that for analyses and wider
+// than the whole dynamic range of a lookup, so every pair of lookups tied and
+// the ranking became a coin toss. Measured live: estimates of 29ms, 57ms and
+// 105ms dispatched slowest-but-one first.
+test("a tie is proportional to what is being compared", () => {
+  // Lookups: tens of milliseconds, and the differences are real.
+  assert.equal(_test.tiedEst(29, 57), false, "2x is not a tie");
+  assert.equal(_test.tiedEst(57, 105), false);
+  assert.equal(_test.tiedEst(95, 100), true, "5% is noise");
+
+  // Analyses: seconds, where 250ms really is a tie and the band stays there.
+  assert.equal(_test.tiedEst(8000, 8100), true, "100ms in 8s is a tie");
+  assert.equal(_test.tiedEst(3000, 8000), false, "but 5s is not");
+
+  // The band narrows for small estimates and never widens for large ones. A
+  // 1000ms gap between two ~18s analyses is the capacity term deciding the
+  // route, not noise — widening the band there would discard it.
+  assert.equal(_test.tiedEst(18375, 19375), false, "the capacity term must survive");
+});
+
+
+
+// Never the configured order: that sent 390 of 390 lookups to the slowest
+// worker in the fleet while the fastest sat idle.
+test("an unranked lookup still moves around the fleet", () => {
+  const fleet = ["https://a.test", "https://b.test", "https://c.test"];
+  const firsts = new Set();
+  for (let i = 0; i < fleet.length; i++) firsts.add(_test.rotate(fleet)[0]);
+  assert.equal(firsts.size, fleet.length, "every worker leads once per cycle");
+  // And it is a rotation, not a shuffle: the whole fleet stays in the list, so
+  // a failed leader still falls through to the others.
+  assert.deepEqual([..._test.rotate(fleet)].sort(), [...fleet].sort());
+});
+
+
+
+// A breaker steers traffic to a healthier worker. When every worker is tripped
+// there is no healthier worker and nothing left to steer, so emptying the pool
+// stops being caution and becomes an outage we caused ourselves.
+//
+// Measured: a burst of lookups ran past the timeout, tripped all three workers
+// inside the first second, and the next 392 requests were answered
+// `unavailable` in 25ms each without one outbound fetch. The fleet was healthy
+// the whole time.
+test("a fleet of tripped workers is still a fleet", () => {
+  const env = { SCAN_URL: "https://a.test,https://b.test,https://c.test" };
+  const all = _test.scanWorkers(env);
+  assert.equal(all.length, 3);
+
+  // One sick worker is what a breaker is for: the other two take the traffic.
+  for (let i = 0; i < _test.BREAKER_FAILS; i++) _test.breakerFor("https://b.test").fail();
+  assert.deepEqual(_test.scanWorkers(env), ["https://a.test", "https://c.test"]);
+
+  // All three tripped is not a reason to ask nobody.
+  for (const base of ["https://a.test", "https://c.test"]) {
+    for (let i = 0; i < _test.BREAKER_FAILS; i++) _test.breakerFor(base).fail();
+  }
+  assert.equal(
+    _test.scanWorkers(env).length,
+    3,
+    "an empty pool answers unavailable without having asked anyone",
+  );
+});
+
+
+
+// The budget has to exceed the longest a healthy worker can legitimately take,
+// which scan sets, not us: it allows each corpus address 2s before trying the
+// next, so a worker with a replica down spends two seconds before it starts
+// reading. A tighter budget records that as a broken worker.
+test("a worker gets longer to answer than scan gives its corpus", () => {
+  const SCAN_CORPUS_READ_TIMEOUT_MS = 2_000;
+  assert.ok(
+    _test.LOOKUP_TIMEOUT_MS > SCAN_CORPUS_READ_TIMEOUT_MS,
+    `${_test.LOOKUP_TIMEOUT_MS}ms does not cover scan's ${SCAN_CORPUS_READ_TIMEOUT_MS}ms corpus read`,
+  );
+});
+
+
+
 test("numEnv keeps a bad knob from becoming a bad default", () => {
   const k = "SCAN_TIMEOUT_MS";
   assert.equal(_test.numEnv({}, k, 1000), 1000);

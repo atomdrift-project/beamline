@@ -7,7 +7,22 @@
 
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DEFAULT_SCAN_TIMEOUT_MS = 1_800_000;
-const LOOKUP_TIMEOUT_MS = 500;
+// How long a worker gets to answer a lookup before we give up on it and hold
+// it against its breaker.
+//
+// It has to exceed the longest a *healthy* worker can legitimately take, or a
+// slow answer is recorded as a broken worker. That ceiling is set by scan, not
+// here: a worker that cannot answer from its own index asks the corpus, and it
+// allows each corpus address 2s (`READ_TIMEOUT` in scan's corpus.rs) before
+// moving to the next. So with a replica down, a perfectly healthy worker can
+// legitimately spend two seconds before it even starts reading.
+//
+// 500ms was inherited from an older shape, when beamline read the corpus itself
+// and hopper answered in 25-117ms. It was never resized when the worker took
+// that job over, which left the budget four times tighter than the work — and a
+// brief excursion past it read as a fleet-wide fault. Raise this if scan's
+// READ_TIMEOUT rises.
+const LOOKUP_TIMEOUT_MS = 3_000;
 const BREAKER_FAILS = 5;
 const BREAKER_COOL_MS = 10_000;
 const MEMORY_CACHE_MAX = 1024;
@@ -209,8 +224,8 @@ async function handleV1Lookup(env, ctx, url) {
 // corpus when it does not know, they now give the same answer. Broadcasting
 // would multiply the load behind them to learn nothing.
 async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls) {
-  const workers = scanWorkers(env);
   const ids = { rid: ctx.rid, sha256: sha || undefined, purl: purls[0] };
+  const workers = await lookupOrder(env, ctx, scanWorkers(env), ids);
   const t0 = Date.now();
 
   for (const base of workers) {
@@ -817,6 +832,7 @@ function predictMs(stats, hint, mix) {
   return base * (1 + CAPACITY_WEIGHT * occupancy(stats));
 }
 
+
 // This worker's average for the cost class the request falls in, or null when
 // it has never done one.
 //
@@ -964,6 +980,140 @@ function capability(stats, sizeHint) {
 // sending to the current best is self-reinforcing: everyone piles onto whichever
 // worker last looked fastest until it is the slowest, then the fleet flips. A
 // little jitter damps that for no measurable loss.
+// Two estimates tie when picking the nominally-faster one would be chasing
+// noise, and jitter should break the tie instead.
+//
+// 250ms alone was right for analyses and wrong for lookups: it is 1.4% of an
+// 18-second estimate and wider than the entire dynamic range of a lookup, so
+// every pair of lookups fell inside it and ranking them degenerated to the coin
+// toss meant only for near-equals. Observed live, with estimates of 29ms, 57ms
+// and 105ms dispatched slowest-but-one first.
+//
+// So the fraction *narrows* the band for small estimates and never widens it.
+// Taking the larger of the two instead would have made a 1000ms gap between two
+// ~18s analyses a tie — and that gap is the capacity term doing its job, which
+// is the one thing here that was already working.
+const TIE_CEILING_MS = 250;
+const TIE_FRACTION = 0.25;
+function tiedEst(a, b) {
+  return Math.abs(a - b) < Math.min(TIE_CEILING_MS, TIE_FRACTION * Math.min(a, b));
+}
+
+// The stats we already hold for a worker, or undefined when we would have to
+// go and ask. Distinct from null, which means we asked and it did not answer.
+function cachedStats(base) {
+  const hit = statsCache.get(base);
+  return hit && Date.now() - hit.at < STATS_TTL_MS ? hit.stats : undefined;
+}
+
+// Round-robin start, per isolate. Used only when there is nothing measured to
+// rank on; the point is merely never to start at the same worker every time.
+let lookupTurn = 0;
+function rotate(workers) {
+  const start = lookupTurn++ % workers.length;
+  return [...workers.slice(start), ...workers.slice(0, start)];
+}
+
+// Measured, 400 lookups per arm against the live fleet, interleaved so every
+// arm saw the same fleet at the same instant. p50 / p90, milliseconds:
+//
+//   latency+load     47 /  51    rdu 99%
+//   latency          49 /  53    rdu 99%
+//   p2c              49 /  99    rdu 68% mci 32%
+//   least-inflight   55 / 154    rdu 58% mci 25% lax 18%
+//   rotate           98 / 160    even thirds
+//   config          156 / 173    lax 100%
+//
+// Two things came out of it. Choosing beats spreading on a fleet whose workers
+// differ — rdu answers a lookup in a third of lax's time, so every request
+// spread onto a slower worker is latency paid for nothing, and the three
+// spreading arms rank last. And least-outstanding is capacity-blind: it sent
+// 18% to the slowest worker in the fleet because it happened to have an empty
+// queue, which is the classic least-connections failure against unequal
+// backends.
+//
+// The load arm is *unproven*, not rejected. It scaled the estimate by lookup
+// concurrency derived from `recent_lookup` over `latency_window_secs`, which is
+// 3600 on scan today — a
+// half-minute experiment barely moves an hour-long window, so the term
+// evaluated to ~0.001 and the two latency arms were the same algorithm. Its 2ms
+// edge is noise. Testing it needs a short window on scan's side, or a fleet
+// under real analysis load.
+// Same order rankPool() produces, and for the same reasons: measurement first,
+// jitter to damp herding between workers we have evidence for, and the
+// operator's own order when we have none. Jitter without that last guard is a
+// coin toss dressed up as a decision — and it makes a worker that should be
+// draining out of the pool accumulate its failures at random.
+function byEst(ranked) {
+  return [...ranked]
+    .sort((x, y) => {
+      if (!tiedEst(x.est, y.est)) return x.est - y.est;
+      if (x.known && y.known) return x.r - y.r;
+      return x.i - y.i;
+    })
+    .map((w) => w.base);
+}
+
+// Measured for /analyze too, 20 analyses per arm at 40-way concurrency, which
+// is enough to make mci's six slots scarce. p50 / p90, and refusals collected:
+//
+//   latency            17.7s / 56.2s    0 x 429
+//   latency+occupancy  17.8s / 56.4s    0 x 429
+//   p2c                26.5s / 57.3s    0 x 429
+//   rotate             34.4s / 61.9s    4 x 429
+//   config             39.1s / 71.2s    7 x 429
+//
+// Ranking is worth 55% of the p50, and the arms that rank collected no capacity
+// refusals at all while the two that do not collected eleven between them.
+//
+// But the capacity term is not what earned that. `latency` scores on service
+// time alone and ties with the production path exactly, because the hard gate
+// in capability() excludes a worker with no free slots before ranking sees it —
+// by the time the multiplier would matter, the worker is about to be removed
+// anyway. And it cannot reorder anything below that: this fleet's service-time
+// predictions span 10-15x (2560, 28415, 39482 in one dispatch), which no
+// occupancy factor of 1.x is going to overturn.
+//
+// So occupancy is kept, unproven either way. It earns its place only when two
+// workers are close on service time and differ in load, and a fleet of three
+// unequal machines never presents that case. A homogeneous fleet would.
+// The order to try workers in for a lookup, at no cost to the lookup.
+//
+// Ranking is worth having here — measured directly, the fastest worker answered
+// a lookup in 95ms and the slowest in 200ms — but rankPool() pays a stats poll
+// to learn that, and on a cold isolate one poll costs more than the request it
+// is optimizing. So this ranks only when every worker's stats are already in
+// hand, and otherwise answers immediately and fetches them behind the response.
+// An isolate is unranked for its first lookup and ranked for the next ten
+// seconds of them.
+//
+// What it must never do is take the configured order. That is what it did
+// before, and it sent 390 of 390 lookups to the slowest worker in the fleet
+// while the fastest sat idle.
+async function lookupOrder(env, ctx, workers, ids) {
+  if (workers.length < 2) return workers;
+  if (!workers.every((base) => cachedStats(base) !== undefined)) {
+    waitUntil(ctx, Promise.all(workers.map((base) => scanStats(env, ctx, base))));
+    return rotate(workers);
+  }
+  const mix = jobMix(workers.map((base) => cachedStats(base)));
+  const hint = { lookup: true };
+  const ranked = workers.map((base, i) => {
+    const stats = cachedStats(base);
+    return {
+      base,
+      stats,
+      i,
+      est: predictMs(stats, hint, mix),
+      known: hasHistory(stats, hint, mix),
+      r: Math.random(),
+    };
+  });
+  const order = byEst(ranked);
+  logLine("lookup_route", { order: order.map(hostOf).join(","), ...ids });
+  return order;
+}
+
 async function rankPool(env, ctx, workers, hint) {
   const polled = await Promise.all(
     workers.map(async (base, i) => ({ base, i, stats: await scanStats(env, ctx, base) })),
@@ -1000,7 +1150,7 @@ async function rankPool(env, ctx, workers, hint) {
     // unreachable is not proof of illness (the breaker owns that), but it is
     // not evidence of health either, and it must never outrank measurement.
     if ((a.stats == null) !== (b.stats == null)) return a.stats == null ? 1 : -1;
-    if (Math.abs(a.est - b.est) >= 250) return a.est - b.est;
+    if (!tiedEst(a.est, b.est)) return a.est - b.est;
     if (a.known && b.known) return a.r - b.r;
     return a.i - b.i;
   });
@@ -1498,8 +1648,23 @@ function urlList(raw) {
 
 // Workers worth asking right now. Empty means every one of them is tripped,
 // and the caller should fail fast rather than pile on.
+// The workers worth trying, healthiest first.
+//
+// A tripped breaker steers traffic to a healthier worker. When every worker is
+// tripped there is no healthier worker, and the breaker has nothing left to
+// steer — so it must not be allowed to empty the pool. Returning nothing here
+// meant answering `unavailable` without having asked anyone, which is not a
+// measurement of the fleet, only of our own bookkeeping.
+//
+// This is not hypothetical: a burst of lookups that ran past the timeout tripped
+// all three workers within the first second, and the next 392 requests were
+// answered `unavailable` in 25ms each without a single outbound fetch. The
+// fleet was healthy throughout. Same rule scan's own corpus reader follows for
+// the same reason — an address believed to be failing still beats no address.
 function scanWorkers(env) {
-  return urlList(env.SCAN_URL).filter((base) => !breakerFor(base).open());
+  const all = urlList(env.SCAN_URL);
+  const live = all.filter((base) => !breakerFor(base).open());
+  return live.length ? live : all;
 }
 
 // Host only: enough to tell workers apart in a log line, without spilling the
@@ -1523,8 +1688,18 @@ function makeBreaker() {
       fails += 1;
       if (fails >= BREAKER_FAILS) openUntil = Date.now() + BREAKER_COOL_MS;
     },
+    // Half-open once the cooldown passes: the worker gets one trial, and a
+    // success clears its record.
+    //
+    // Without this the counter survives the cooldown, so a worker that has
+    // tripped once needs five failures the first time and exactly one ever
+    // after — a hair trigger that no amount of subsequent good behaviour
+    // resets, because the successes that would clear it are the ones the open
+    // breaker is preventing.
     open() {
-      return Date.now() < openUntil;
+      if (Date.now() < openUntil) return true;
+      if (fails >= BREAKER_FAILS) fails = BREAKER_FAILS - 1;
+      return false;
     },
     reset() {
       fails = 0;
@@ -1573,6 +1748,10 @@ function trimSlash(s) {
 }
 
 export const _test = {
+  tiedEst,
+  rotate,
+  scanWorkers,
+  breakerFor,
   bloomStub,
   verdictResponse,
   hitLocation,
