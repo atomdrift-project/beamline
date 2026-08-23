@@ -151,3 +151,102 @@ test("popular jobs interleave ecosystems", () => {
   // of npm and then all of pypi.
   assert.deepEqual(mixed.slice(0, 4).map((j) => j.eco), ["npm", "pypi", "cargo", "golang"]);
 });
+
+// The v1 contract as a client has to read it. The shape never moving is the
+// whole promise — a caller writes one code path against nine keys — so a field
+// that vanishes is a defect the harness must report rather than tolerate.
+test("v1 check: a well-formed decision passes", () => {
+  const ok = {
+    decision: "block",
+    purl: "pkg:npm/evil@1.0.0",
+    sha256: "a".repeat(64),
+    severity: "hostile",
+    fires_at: 3,
+    reason: "Reverse shell in postinstall.",
+    findings: [{ id: "objectives/c2/backdoor", crit: 5 }],
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  assert.deepEqual(_test.checkV1(200, ok, "pkg:npm/evil@1.0.0"), []);
+});
+
+test("v1 check: a missing key is a defect, not a variation", () => {
+  const missing = {
+    decision: "allow",
+    purl: "pkg:npm/fine@1.0.0",
+    sha256: null,
+    severity: "benign",
+    fires_at: -1,
+    findings: [],
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  assert.deepEqual(_test.checkV1(200, missing, "pkg:npm/fine@1.0.0"), ["v1 missing reason"]);
+});
+
+// An outage must carry nothing about the artifact. A caller that can read a
+// severity or a level out of one would eventually branch on it, and would then
+// be treating our own failure as evidence about somebody's package.
+test("v1 check: an outage may not carry evidence", () => {
+  const leaky = {
+    decision: "unavailable",
+    purl: "pkg:npm/x@1.0.0",
+    sha256: null,
+    severity: "benign",
+    fires_at: -1,
+    reason: null,
+    findings: [{ id: "x", crit: 4 }],
+    engine_version: null,
+    analyzed_at: null,
+  };
+  const issues = _test.checkV1(200, leaky, "pkg:npm/x@1.0.0");
+  assert.ok(issues.some((i) => i.includes("fires_at")), issues.join("; "));
+  assert.ok(issues.some((i) => i.includes("severity")), issues.join("; "));
+  assert.ok(issues.some((i) => i.includes("findings")), issues.join("; "));
+});
+
+// A block stops somebody's build. If it cannot say why, the developer it
+// stopped has nothing to act on.
+test("v1 check: a block must be able to say why", () => {
+  const mute = {
+    decision: "block",
+    purl: "pkg:npm/evil@1.0.0",
+    sha256: null,
+    severity: "hostile",
+    fires_at: 3,
+    reason: null,
+    findings: [],
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  assert.deepEqual(_test.checkV1(200, mute, "pkg:npm/evil@1.0.0"), [
+    "block carried neither a reason nor a finding",
+  ]);
+});
+
+test("v1 check: an answer about a different package is a defect", () => {
+  const wrong = {
+    decision: "allow",
+    purl: "pkg:npm/other@2.0.0",
+    sha256: null,
+    severity: "benign",
+    fires_at: -1,
+    reason: null,
+    findings: [],
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  const issues = _test.checkV1(200, wrong, "pkg:npm/asked@1.0.0");
+  assert.equal(issues.length, 1);
+  assert.match(issues[0], /answered about/);
+});
+
+// A miss is a decision now, not a status: v1 answers 200 for a package nobody
+// has analyzed. Classifying on the status alone would count every miss as a
+// success and report a hit rate of 100%.
+test("v1: a miss and an outage are told apart inside a 200", () => {
+  assert.equal(_test.classify({ status: 200, decision: "unknown" }), "miss");
+  assert.equal(_test.classify({ status: 200, decision: "unavailable" }), "note");
+  assert.equal(_test.classify({ status: 200, decision: "allow" }), "ok");
+  assert.equal(_test.classify({ status: 200, decision: "block" }), "ok");
+});

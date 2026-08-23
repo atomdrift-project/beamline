@@ -4,7 +4,6 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
 import { handle, _test } from "./beamline.js";
 
-const HELLO = new TextEncoder().encode("hello");
 const HELLO_SHA = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
 // Node's fetch stalls a second concurrent request to a backend until the event
@@ -36,139 +35,10 @@ test("BEAMLINE_TOKEN accepts a comma-separated list", () => {
   assert.deepEqual(_test.tokenList(""), []);
 });
 
-test("BEAMLINE_TOKEN is required except on /healthz", async () => {
-  const env = { BEAMLINE_TOKEN: "alpha,beta" };
-  const open = await handle(new Request("http://beamline/healthz"), env, {});
-  assert.equal(open.status, 200);
 
-  const denied = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, {});
-  assert.equal(denied.status, 401);
 
-  const wrong = await handle(
-    new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { authorization: "Bearer nope" } }),
-    env,
-    {},
-  );
-  assert.equal(wrong.status, 401);
-});
 
-test("a caller's token authenticates them to us and goes no further", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "scan" }),
-  });
-  const env = {
-    ...testEnv(backend.url),
-    BEAMLINE_TOKEN: "alpha,beta",
-    HOPPER_TOKEN: "hopper-secret",
-    SCAN_TOKEN: "scan-secret",
-  };
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
-        method: "POST",
-        headers: { authorization: "Bearer beta" },
-        body: HELLO,
-      }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 200);
-    const sent = backend.auths.filter((a) => a.path !== "/healthz");
-    assert.ok(sent.length > 0);
-    // The caller's own credential must never leave beamline: holding it lets
-    // you ask beamline questions, not reach a scanner or the sample store.
-    assert.ok(!sent.some((a) => a.authorization === "Bearer beta"), JSON.stringify(sent));
 
-    const forScan = sent.filter((a) => a.path === "/lookup" || a.path.startsWith("/analyze"));
-    const forHopper = sent.filter((a) => a.path.startsWith("/api/"));
-    assert.ok(forScan.length > 0 && forHopper.length > 0, JSON.stringify(sent.map((a) => a.path)));
-    assert.ok(forScan.every((a) => a.authorization === "Bearer scan-secret"), JSON.stringify(forScan));
-    assert.ok(forHopper.every((a) => a.authorization === "Bearer hopper-secret"), JSON.stringify(forHopper));
-  } finally {
-    await backend.close();
-  }
-});
-
-test("cache hit short-circuits the scan lookup and hopper", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: (sha) => ({ status: 200, sha, body: envelope(sha) }),
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    const first = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
-    assert.equal(first.status, 200);
-    assert.equal(first.headers.get("x-beamline-source"), "hopper");
-    await ctx.flush();
-    // Whichever cheap source won, the second request must reach none of them.
-    const spent = { ...backend.hits };
-
-    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    assert.equal(second.status, 200);
-    assert.equal(second.headers.get("x-beamline-source"), "cache");
-    assert.deepEqual(backend.hits, spent);
-    assert.equal(backend.hits.analyze, 0);
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a stored scan verdict answers before hopper is asked", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    verdict: () => ({
-      sha: HELLO_SHA,
-      lvl: 3,
-      eng: "2.8.0",
-      why: "Postinstall launches a reverse shell.",
-      hits: [{ id: "objectives/execution/shell/bash", crit: 5, file: "lib/install.js", desc: "…" }],
-    }),
-  });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
-      testEnv(backend.url),
-      noopCtx(),
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
-    assert.equal(res.headers.get("x-sha256"), HELLO_SHA);
-    const body = await res.json();
-    // The real verdict, not the lvl:-1 stub a bare filter hit produces.
-    assert.equal(body.lvl, 3);
-    assert.equal(body.hits.length, 1);
-    assert.equal(body.why, "Postinstall launches a reverse shell.");
-    // `bloom` is our upstream's business, not part of this API.
-    assert.equal(body.bloom, undefined);
-    // hopper is raced alongside the index, so it may well be asked; what a
-    // stored verdict must never cost is an analysis.
-    assert.equal(backend.hits.analyze, 0);
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a stored verdict is preferred over the filter's benign stub", async () => {
-  const backend = await mockBackend({
-    bloom: "skip",
-    verdict: () => ({ sha: HELLO_SHA, lvl: 0, eng: "2.8.0" }),
-  });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
-      testEnv(backend.url),
-      noopCtx(),
-    );
-    const body = await res.json();
-    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
-    assert.equal(body.lvl, 0, "an analysis outranks a known-good filter hit");
-  } finally {
-    await backend.close();
-  }
-});
 
 test("/_/health answers alongside /healthz", async () => {
   const res = await handle(new Request("http://beamline/_/health"), {}, {});
@@ -176,300 +46,20 @@ test("/_/health answers alongside /healthz", async () => {
   assert.deepEqual(await res.json(), { status: "ok" });
 });
 
-test("bloom skip never calls hopper", async () => {
-  const backend = await mockBackend({
-    bloom: "skip",
-    sample: () => {
-      throw new Error("hopper should not be called");
-    },
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "bloom");
-    const body = await res.json();
-    assert.equal(body.lvl, -1);
-    assert.equal(body.eng, "beamline");
-    assert.equal(body.sha, HELLO_SHA);
-    assert.equal(body.ml, undefined);
-    assert.equal(body.raw, undefined);
-    assert.equal(body.hits, undefined);
-    assert.equal(backend.hits.analyze, 0, "a skip must not cost an analysis");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hopper 200 passes the envelope through", async () => {
-  const stored = envelope(HELLO_SHA, { prob: 0.42, lvl: 5 });
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: stored }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal(res.headers.get("x-sha256"), HELLO_SHA);
-    assert.equal(res.headers.get("x-total-ms"), null);
-    const body = await res.json();
-    assert.equal(body.lvl, 5);
-    assert.equal(body.eng, "mock");
-    assert.equal(body.sha, HELLO_SHA);
-    assert.equal(body.prob, undefined);
-    assert.equal(body.ml, undefined);
-    assert.equal(body.raw, undefined);
-    assert.equal(backend.hits.analyze, 0);
-    assert.equal(backend.hits.analyzePurl, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hopper miss with body posts /analyze and stores the artifact on hopper", async () => {
-  const scanned = envelope(HELLO_SHA, { prob: 0.9, lvl: 0, eng: "scan" });
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: () => scanned,
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal(res.headers.get("x-total-ms"), "17");
-    assert.equal((await res.json()).eng, "scan");
-    assert.equal(backend.hits.analyze, 1);
-    assert.equal(backend.hits.analyzePurl, 0);
-    await ctx.flush();
-    assert.equal(backend.hits.upload, 0);
-    // The verdict is the scan worker's to renew; beamline only contributes the
-    // bytes, which are the one thing hopper cannot get anywhere else.
-    assert.equal(backend.hits.result, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("PURL miss posts /analyze-purl", async () => {
-  const sha = HELLO_SHA;
-  const scanned = envelope(sha, { eng: "purl-scan" });
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: (body) => {
-      assert.equal(body.purl, "pkg:npm/left-pad@1.3.0");
-      return scanned;
-    },
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal(res.headers.get("x-sha256"), sha);
-    assert.equal((await res.json()).purl, "pkg:npm/left-pad@1.3.0");
-    assert.equal(backend.hits.analyzePurl, 1);
-    assert.equal(backend.hits.analyze, 0);
-    await ctx.flush();
-    assert.equal(backend.hits.upload, 0);
-    assert.equal(backend.hits.result, 0, "the scan worker files the verdict, not beamline");
-  } finally {
-    await backend.close();
-  }
-});
 
 const DEAD = "http://127.0.0.1:1";
 
-test("scan down still serves a hopper hit", async () => {
-  const stored = envelope(HELLO_SHA, { eng: "hopper-only" });
-  const backend = await mockBackend({
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: stored }),
-  });
-  const env = testEnv(backend.url, { SCAN_URL: DEAD });
-  try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "hopper-only");
-    assert.equal(backend.hits.analyze, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hopper down still scans posted bytes", async () => {
-  const scanned = envelope(HELLO_SHA, { eng: "scan-only" });
-  const backend = await mockBackend({ bloom: "unknown", analyze: () => scanned });
-  const env = testEnv(backend.url, { HOPPER_URL: DEAD });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal((await res.json()).eng, "scan-only");
-    await ctx.flush();
-    assert.equal(backend.hits.sample, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hopper down still scans a PURL", async () => {
-  const sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-  const scanned = envelope(sha, { eng: "purl-only" });
-  const backend = await mockBackend({
-    bloom: "unknown",
-    analyzePurl: () => scanned,
-  });
-  const env = testEnv(backend.url, { HOPPER_URL: DEAD });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal(backend.hits.analyzePurl, 1);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hopper down without bytes is 503, not a miss", async () => {
-  const backend = await mockBackend({ bloom: "unknown" });
-  const env = testEnv(backend.url, { HOPPER_URL: DEAD });
-  try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    assert.equal(res.status, 503);
-    assert.equal((await res.json()).error, "unavailable");
-    assert.equal(backend.hits.analyze, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("PURL hopper miss with scan down is 503, not a miss", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-  });
-  const env = testEnv(backend.url, { SCAN_URL: DEAD });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 503);
-    assert.equal((await res.json()).error, "unavailable");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("an unavailable lookup does not disable /analyze", async () => {
-  const scanned = envelope(HELLO_SHA, { eng: "scan" });
-  const backend = await mockBackend({
-    bloomStatus: 404,
-    sample: () => ({ status: 404 }),
-    analyze: () => scanned,
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal(backend.hits.analyze, 1);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("scan down and hopper has never seen it is 503, not a queue", async () => {
-  // Beamline used to upload the bytes here and wait for a hopper worker to pick
-  // them up. It no longer writes at all, so an artifact hopper does not already
-  // hold has nobody working on it and nothing to wait for — the honest answer
-  // is that the service is unavailable, and the scan fleet is the capacity.
-  const backend = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const env = testEnv(backend.url, { SCAN_URL: DEAD });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 503);
-    assert.equal(backend.hits.upload, 0);
-    assert.equal(backend.hits.rescan, 0);
-    assert.equal(backend.hits.analyze, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("scan down on a pending hopper sample waits for the worker", async () => {
-  let samples = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => {
-      samples += 1;
-      if (samples === 1) return { status: 204, sha: HELLO_SHA };
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-worker" }) };
-    },
-  });
-  const env = testEnv(backend.url, { SCAN_URL: DEAD });
-  try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, noopCtx());
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal(backend.hits.upload, 0);
-    assert.equal(backend.hits.rescan, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("scan down wait timeout returns 202 pending", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 204, sha: HELLO_SHA }),
-  });
-  const env = testEnv(backend.url, { SCAN_URL: DEAD, SCAN_TIMEOUT_MS: "80" });
-  try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, noopCtx());
-    assert.equal(res.status, 202);
-    // Jittered to spread the retry herd; the contract is a whole number of
-    // seconds inside the advertised window, not one fixed value.
-    const retry = Number(res.headers.get("retry-after"));
-    assert.ok(Number.isInteger(retry) && retry >= 3 && retry <= 8, `retry-after ${retry}`);
-    assert.deepEqual(await res.json(), { state: "pending" });
-  } finally {
-    await backend.close();
-  }
-});
 
 test("unknown route is 404 not found", async () => {
   const res = await handle(new Request("http://beamline/nope"), {}, {});
@@ -477,68 +67,14 @@ test("unknown route is 404 not found", async () => {
   assert.equal((await res.json()).error, "not found");
 });
 
-test("a known route with the wrong method is 405, not 404", async () => {
-  // Dropping the body to analyze a PURL also drops the POST that
-  // `--data-binary` was implying, so this is the mistake callers actually make.
-  // A 404 would send them looking for a misspelled path.
-  const cases = [
-    ["http://beamline/analyze", "GET", "POST"],
-    ["http://beamline/lookup", "POST", "GET"],
-    ["http://beamline/healthz", "POST", "GET"],
-    ["http://beamline/_/health", "DELETE", "GET"],
-  ];
-  for (const [uri, method, allow] of cases) {
-    const res = await handle(new Request(uri, { method }), {}, {});
-    assert.equal(res.status, 405, `${method} ${uri}`);
-    assert.equal(res.headers.get("allow"), allow, `${method} ${uri} must name the method that works`);
-    assert.equal((await res.json()).error, "method not allowed");
-  }
-});
 
-test("the method check on a guarded route runs after the token check", async () => {
-  // A 405 tells the caller the route exists. That is fine once they are known
-  // to us, but an unauthenticated prod of /analyze must not learn it.
-  const res = await handle(new Request("http://beamline/analyze"), { BEAMLINE_TOKEN: "secret" }, {});
-  assert.equal(res.status, 401);
-  // Health answers before the token check, so its 405 is reachable unauthenticated.
-  const health = await handle(new Request("http://beamline/healthz", { method: "POST" }), { BEAMLINE_TOKEN: "secret" }, {});
-  assert.equal(health.status, 405);
-});
 
 test("query purl is not a route", async () => {
   const res = await handle(new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"), {}, {});
   assert.equal(res.status, 404);
 });
 
-test("multipart POST is 415", async () => {
-  const res = await handle(
-    new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
-      method: "POST",
-      headers: { "content-type": "multipart/form-data; boundary=x" },
-      body: "--x--",
-    }),
-    {},
-    {},
-  );
-  assert.equal(res.status, 415);
-  assert.equal((await res.json()).error, "unsupported media type");
-});
 
-test("hopper miss without bytes is unknown sample", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    assert.equal(res.status, 404);
-    assert.equal((await res.json()).error, "unknown sample");
-    assert.equal(backend.hits.analyze, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
 test("hopper hedge defaults", () => {
   assert.equal(_test.HOPPER_HEDGE_MS, 500);
@@ -553,646 +89,26 @@ test("hopper hedge defaults", () => {
   assert.equal(_test.numEnv({ HOPPER_HEDGE_MS: "20" }, "HOPPER_HEDGE_MS", 1000), 20);
 });
 
-test("hopper 404 does not wait for the hedge before scanning", async () => {
-  const scanned = envelope(HELLO_SHA, { eng: "scan" });
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: () => scanned,
-  });
-  const env = testEnv(backend.url);
-  const t0 = Date.now();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.ok(Date.now() - t0 < 500, `waited ${Date.now() - t0}ms for a fast hopper 404`);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("slow hopper 200 beats in-flight scan and does not submit", async () => {
-  const stored = envelope(HELLO_SHA, { eng: "hopper-late" });
-  const scanned = envelope(HELLO_SHA, { eng: "scan-waste" });
-  const logs = captureLogs();
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(80);
-      return { status: 200, sha: HELLO_SHA, body: stored };
-    },
-    analyze: async () => {
-      await delay(200);
-      return scanned;
-    },
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  _test.muteLogs(false);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "hopper-late");
-    await ctx.flush();
-    assert.equal(backend.hits.result, 0);
-    assert.equal(backend.hits.upload, 0);
-    const hedge = logs.rows.find((r) => r.event === "hedge");
-    const abort = logs.rows.find((r) => r.event === "abort");
-    const lookup = logs.rows.filter((r) => r.event === "lookup").pop();
-    assert.ok(hedge, "expected hedge log");
-    assert.ok(abort && abort.target.includes("analysis"), JSON.stringify(abort));
-    assert.equal(abort && abort.why, "hopper_hit");
-    assert.equal(lookup.src, "hopper");
-    assert.equal(lookup.hedged, true);
-    assert.equal(lookup.status, 200);
-  } finally {
-    logs.restore();
-    await backend.close();
-  }
-});
 
-test("hedge serves scan if hopper stays silent, then aborts hopper", async () => {
-  const scanned = envelope(HELLO_SHA, { eng: "scan-hedge" });
-  const logs = captureLogs();
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(120);
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "too-late" }) };
-    },
-    analyze: () => scanned,
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  _test.muteLogs(false);
-  try {
-    const t0 = Date.now();
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    const ms = Date.now() - t0;
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal((await res.json()).eng, "scan-hedge");
-    assert.ok(ms < 300, `scan hedge took ${ms}ms; hopper should have been abandoned`);
-    await ctx.flush();
-    assert.equal(backend.hits.result, 0, "the scan worker files the verdict, not beamline");
-    assert.equal(backend.hits.upload, 0);
-    const abort = logs.rows.find((r) => r.event === "abort");
-    const lookup = logs.rows.filter((r) => r.event === "lookup").pop();
-    assert.equal(abort && abort.target, "hopper");
-    assert.equal(abort && abort.why, "scan_hit");
-    assert.equal(lookup.src, "scan");
-    assert.equal(lookup.hedged, true);
-  } finally {
-    logs.restore();
-    await backend.close();
-  }
-});
 
-test("fast hopper 200 does not hedge or start scan", async () => {
-  const logs = captureLogs();
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-fast" }) }),
-    analyze: () => envelope(HELLO_SHA, { eng: "scan" }),
-  });
-  const env = testEnv(backend.url);
-  _test.muteLogs(false);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal(backend.hits.analyze, 0);
-    assert.equal(backend.hits.analyzePurl, 0);
-    assert.ok(!logs.rows.some((r) => r.event === "hedge"));
-    assert.ok(!logs.rows.some((r) => r.event === "analyze"), "analysis must not start");
-    const lookup = logs.rows.filter((r) => r.event === "lookup").pop();
-    assert.equal(lookup.hedged, false);
-  } finally {
-    logs.restore();
-    await backend.close();
-  }
-});
 
-test("invalid HOPPER_HEDGE_MS uses the default, not zero", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(40);
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) };
-    },
-    analyze: () => envelope(HELLO_SHA, { eng: "scan" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "nope" });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal(backend.hits.analyze, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hedged PURL: slow hopper 200 beats analyze-purl and does not submit", async () => {
-  const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(80);
-      return { status: 200, sha, body: envelope(sha, { eng: "hopper-purl" }) };
-    },
-    analyzePurl: async () => {
-      await delay(200);
-      return envelope(sha, { eng: "scan-purl" });
-    },
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "hopper-purl");
-    await ctx.flush();
-    assert.equal(backend.hits.analyzePurl, 1);
-    assert.equal(backend.hits.analyze, 0);
-    assert.equal(backend.hits.result, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hedged PURL: scan wins if hopper stays silent", async () => {
-  const sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(200);
-      return { status: 200, sha, body: envelope(sha, { eng: "too-late" }) };
-    },
-    analyzePurl: () => envelope(sha, { eng: "purl-hedge" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const t0 = Date.now();
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal((await res.json()).eng, "purl-hedge");
-    assert.ok(Date.now() - t0 < 150);
-    await ctx.flush();
-    assert.equal(backend.hits.result, 0, "the scan worker files the verdict, not beamline");
-    assert.equal(backend.hits.analyze, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("a slow hopper 200 still wins after the hedge started an analysis", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(80);
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-sha" }) };
-    },
-    // Slower than hopper: the hedge starts it at 20ms, hopper answers at 80ms,
-    // and the point is that a hopper answer already in flight still wins.
-    analyzePurl: async () => {
-      await delay(200);
-      return envelope(HELLO_SHA, { eng: "scan" });
-    },
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "hopper-sha");
-    await ctx.flush();
-    assert.equal(backend.hits.result, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("the hedge starts an analysis rather than waiting out a silent hopper", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(200);
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "too-late" }) };
-    },
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "from-scan" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const t0 = Date.now();
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal((await res.json()).eng, "from-scan");
-    assert.ok(Date.now() - t0 < 150, "waited out the slow hopper instead of hedging");
-    await ctx.flush();
-    assert.equal(backend.hits.analyzePurl, 1);
-    assert.equal(backend.hits.result, 0, "the scan worker files the verdict, not beamline");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("slow hopper 404 after hedge still scans and submits", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(60);
-      return { status: 404 };
-    },
-    analyze: () => envelope(HELLO_SHA, { eng: "after-404" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    await ctx.flush();
-    assert.equal(backend.hits.result, 0, "the scan worker files the verdict, not beamline");
-    assert.equal(backend.hits.upload, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("slow hopper 204 after hedge does not re-upload when scan wins", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(40);
-      return { status: 204, sha: HELLO_SHA };
-    },
-    analyze: async () => {
-      await delay(80);
-      return envelope(HELLO_SHA, { eng: "scan-204" });
-    },
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    await ctx.flush();
-    assert.equal(backend.hits.upload, 0);
-    assert.equal(backend.hits.result, 0, "the scan worker files the verdict, not beamline");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hedged hopper 204 with scan down still waits for the hopper worker", async () => {
-  let samples = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      samples += 1;
-      if (samples === 1) {
-        await delay(40);
-        return { status: 204, sha: HELLO_SHA };
-      }
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-worker" }) };
-    },
-  });
-  const env = testEnv(backend.url, { SCAN_URL: DEAD, HOPPER_HEDGE_MS: "20" });
-  try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }), env, noopCtx());
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "hopper-worker");
-    assert.equal(backend.hits.rescan, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("scan win populates cache; late hopper does not change it", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(120);
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "too-late" }) };
-    },
-    analyze: () => envelope(HELLO_SHA, { eng: "scan-cached" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const first = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(first.headers.get("x-beamline-source"), "scan");
-    await ctx.flush();
-    const second = await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
-      env,
-      noopCtx(),
-    );
-    assert.equal(second.status, 200);
-    assert.equal(second.headers.get("x-beamline-source"), "cache");
-    assert.equal((await second.json()).eng, "scan-cached");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hopper win after hedge populates cache with hopper", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(80);
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-cached" }) };
-    },
-    analyze: async () => {
-      await delay(200);
-      return envelope(HELLO_SHA, { eng: "scan-waste" });
-    },
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const first = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(first.headers.get("x-beamline-source"), "hopper");
-    await ctx.flush();
-    const second = await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
-      env,
-      noopCtx(),
-    );
-    assert.equal(second.headers.get("x-beamline-source"), "cache");
-    assert.equal((await second.json()).eng, "hopper-cached");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("response is not blocked on the cache write", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
-  });
-  const inner = _test.memoryCache();
-  const env = {
-    ...testEnv(backend.url),
-    cache: {
-      match: (req) => inner.match(req),
-      put: () => new Promise(() => {}),
-    },
-  };
-  try {
-    const t0 = Date.now();
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    const ms = Date.now() - t0;
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.ok(ms < 200, `cache put blocked the response for ${ms}ms`);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("cache put failure does not fail the lookup", async () => {
-  const logs = captureLogs();
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
-  });
-  const inner = _test.memoryCache();
-  const env = {
-    ...testEnv(backend.url),
-    cache: {
-      match: (req) => inner.match(req),
-      put: async () => {
-        throw new Error("cache full");
-      },
-    },
-  };
-  const ctx = waitCtx();
-  _test.muteLogs(false);
-  try {
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
-    assert.equal(res.status, 200);
-    await ctx.flush();
-    assert.ok(logs.rows.some((r) => r.event === "wait_error"));
-  } finally {
-    logs.restore();
-    await backend.close();
-  }
-});
 
-test("never-returning hopper does not wait out the lookup budget after scan wins", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => new Promise(() => {}),
-    analyze: () => envelope(HELLO_SHA, { eng: "scan" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20", HOPPER_LOOKUP_MS: "2000" });
-  const ctx = waitCtx();
-  try {
-    const t0 = Date.now();
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    const ms = Date.now() - t0;
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.ok(ms < 300, `waited ${ms}ms; hopper abort should not wait for HOPPER_LOOKUP_MS`);
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
 
-test("aborting hopper on scan win does not trip the hopper breaker", async () => {
-  let n = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async (sha) => {
-      n += 1;
-      if (n <= _test.BREAKER_FAILS) {
-        await delay(80);
-        return { status: 200, sha, body: envelope(sha, { eng: "too-late" }) };
-      }
-      return { status: 200, sha, body: envelope(sha, { eng: "still-up" }) };
-    },
-    analyze: () => envelope(HELLO_SHA, { eng: "scan" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "15" });
-  try {
-    for (let i = 0; i < _test.BREAKER_FAILS; i++) {
-      const ctx = waitCtx();
-      const res = await handle(
-        new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-        { ...env, cache: _test.memoryCache() },
-        ctx.ctx,
-      );
-      assert.equal(res.headers.get("x-beamline-source"), "scan");
-      await ctx.flush();
-    }
-    const res = await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
-      { ...env, cache: _test.memoryCache() },
-      noopCtx(),
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "still-up");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("aborting scan on hopper win does not trip the scan breaker", async () => {
-  let n = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async (sha) => {
-      n += 1;
-      if (n <= _test.BREAKER_FAILS) {
-        await delay(50);
-        return { status: 200, sha, body: envelope(sha, { eng: "hopper-late" }) };
-      }
-      return { status: 404 };
-    },
-    analyze: async () => {
-      await delay(200);
-      return envelope(HELLO_SHA, { eng: "scan" });
-    },
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "15" });
-  try {
-    for (let i = 0; i < _test.BREAKER_FAILS; i++) {
-      const ctx = waitCtx();
-      const res = await handle(
-        new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-        { ...env, cache: _test.memoryCache() },
-        ctx.ctx,
-      );
-      assert.equal(res.headers.get("x-beamline-source"), "hopper");
-      await ctx.flush();
-    }
-    const ctx = waitCtx();
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      { ...env, cache: _test.memoryCache() },
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
 
-test("hopper lookup timeout trips the breaker", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => new Promise(() => {}),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "5", HOPPER_LOOKUP_MS: "40" });
-  try {
-    for (let i = 0; i < _test.BREAKER_FAILS; i++) {
-      const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-      assert.equal(res.status, 503);
-    }
-    const before = backend.hits.sample;
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    assert.equal(res.status, 503);
-    assert.equal(backend.hits.sample, before);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("client abort during the hedge wait is 499", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => new Promise(() => {}),
-    analyze: () => envelope(HELLO_SHA, { eng: "scan" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "200" });
-  const ac = new AbortController();
-  try {
-    const p = handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO, signal: ac.signal }),
-      env,
-      { waitUntil() {}, signal: ac.signal },
-    );
-    await delay(30);
-    ac.abort();
-    const res = await p;
-    assert.equal(res.status, 499);
-    assert.equal((await res.json()).error, "canceled");
-  } finally {
-    await backend.close();
-  }
-});
 
 // A caller whose connection drops has not withdrawn the question. Beamline
 // hands the analysis to waitUntil precisely so it outlives them, so whoever
@@ -1210,370 +126,429 @@ test("client abort during the hedge wait is 499", async () => {
 // would open the breaker of whichever worker drew the heaviest samples first,
 // and a fleet-wide slow patch would take every worker out at once — the same
 // inversion that 429 caused before it was excluded.
-test("the edge ceiling does not trip a worker's breaker", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => ({ status: 524, body: "error code: 524" }),
-  });
-  const env = testEnv(backend.url, { DETACH_POLL_MS: "10", SCAN_TIMEOUT_MS: "120" });
-  const url = `http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`;
-  try {
-    for (let i = 0; i < _test.BREAKER_FAILS + 2; i++) {
-      await handle(new Request(url, { method: "POST" }), env, waitCtx().ctx);
-      _test.reset();
-    }
-    const before = backend.hits.analyzePurl;
-    await handle(new Request(url, { method: "POST" }), env, waitCtx().ctx);
-    assert.ok(backend.hits.analyzePurl > before, "the worker was taken out of the fleet by edge timeouts");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("an analysis cut loose at the edge ceiling is waited out, not failed", async () => {
-  const sha = HELLO_SHA;
-  const scanned = envelope(sha, { eng: "purl-scan" });
-  let landed = false;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    // The worker finishes after the cut, so the index answers from the second
-    // poll onward — exactly what production does minutes later.
-    verdict: () => (landed ? scanned : null),
-    analyzePurl: () => {
-      landed = true;
-      return { status: 524, body: "error code: 524" };
-    },
-  });
-  const env = testEnv(backend.url, { DETACH_POLL_MS: "10" });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 200, "the edge ceiling was reported to the caller as a failure");
-    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
-    assert.equal((await res.json()).purl, "pkg:npm/left-pad@1.3.0");
-  } finally {
-    await backend.close();
-  }
-});
 
 // The wait is bounded by the caller's budget, not handed a fresh one at every
 // ceiling: a worker that never files a verdict must still give up and say so.
-test("a detached analysis that never lands still ends within the budget", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => ({ status: 524, body: "error code: 524" }),
-  });
-  const env = testEnv(backend.url, { DETACH_POLL_MS: "10", SCAN_TIMEOUT_MS: "300" });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 503);
-  } finally {
-    await backend.close();
-  }
-});
 
 // The reconnect guarantee across isolates. Beamline's own single-flight lives
 // in one isolate, and a caller who reconnects usually lands in another — so the
 // only thing that knows an analysis is already running is the worker running
 // it. Scan attaches a second request for the same key to the run in progress,
 // which makes the reconnect free, but only if it arrives at that worker.
-test("a reconnect is routed to the worker already analyzing it", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const idle = await mockBackend({
-    bloom: "unknown",
-    status: { state: "unknown" },
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "idle" }),
-  });
-  const busy = await mockBackend({
-    bloom: "unknown",
-    status: { state: "running", elapsed_ms: 143_000, attached: 0 },
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "busy" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${idle.url},${busy.url}` });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "busy", "the reconnect started a second analysis elsewhere");
-    assert.equal(idle.hits.analyzePurl, 0, "a duplicate analysis was dispatched to an idle worker");
-    assert.equal(busy.hits.analyzePurl, 1);
-  } finally {
-    await Promise.all([hopper.close(), idle.close(), busy.close()]);
-  }
-});
 
 // Affinity is a preference, not a pin. A run we cannot reach is not worth
 // waiting for, so a worker whose breaker is open must not capture the request.
-test("affinity does not strand a request on an unreachable worker", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const well = await mockBackend({
-    bloom: "unknown",
-    status: { state: "unknown" },
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "well" }),
+
+// --- /v1/analyze --------------------------------------------------------
+
+// The body is passed through untouched. Buffering it to hand back one tidy
+// object would put the silence back on the hop between us and the caller —
+// the hop with a proxy we do not control on it, and the one this whole design
+// exists to keep talking.
+test("v1 analyze: progress reaches the caller, not just the decision", async () => {
+  const scan = await mockBackend({
+    analyzeStream: [
+      '{"state":"analyzing","purl":"pkg:npm/evil@1.0.0","elapsed_ms":1002,"phase":"unpack"}',
+      '{"state":"analyzing","purl":"pkg:npm/evil@1.0.0","elapsed_ms":6004,"phase":"features+model"}',
+      '{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}',
+    ],
   });
-  // Claims to be running the analysis, but every dispatch to it fails.
-  const sick = await mockBackend({
-    bloom: "unknown",
-    status: { state: "running", elapsed_ms: 1000, attached: 0 },
-    analyzePurl: () => ({ status: 500, body: { error: "boom" } }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${sick.url},${well.url}`, SCAN_RETRIES: "0" });
-  const url = `http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0`;
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
   try {
-    for (let i = 0; i < _test.BREAKER_FAILS; i++) {
-      await handle(new Request(url, { method: "POST" }), { ...env, cache: _test.memoryCache() }, waitCtx().ctx);
-    }
-    const before = well.hits.analyzePurl;
     const res = await handle(
-      new Request(url, { method: "POST" }),
-      { ...env, cache: _test.memoryCache() },
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", { method: "POST" }),
+      env,
       waitCtx().ctx,
     );
-    assert.equal(res.status, 200, "affinity held the request on a worker with an open breaker");
-    assert.equal((await res.json()).eng, "well");
-    assert.ok(well.hits.analyzePurl > before);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "application/x-ndjson");
+    const lines = (await res.text()).trim().split("\n");
+    assert.equal(lines.length, 3, "the caller was handed only the answer, not the run");
+    assert.equal(JSON.parse(lines[0]).phase, "unpack");
+    assert.equal(JSON.parse(lines[2]).decision, "block");
   } finally {
-    await Promise.all([hopper.close(), well.close(), sick.close()]);
+    await scan.close();
   }
 });
 
-test("a client that disconnects and reconnects joins the same analysis", async () => {
-  const sha = HELLO_SHA;
-  const scanned = envelope(sha, { eng: "purl-scan" });
-  // The analysis is held open rather than timed, so the reconnect cannot
-  // accidentally land after it finished and pass for the wrong reason.
-  let began;
-  let finish;
-  const begun = new Promise((r) => (began = r));
-  const held = new Promise((r) => (finish = r));
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: async () => {
-      began();
-      await held;
-      return scanned;
-    },
+// Scan refuses before it streams, which is what keeps a refusal something to
+// route around: nothing has reached the caller yet, so the work can still go
+// somewhere that will take it.
+test("v1 analyze: a busy worker is routed around before any byte is sent", async () => {
+  const busy = await mockBackend({ analyzeStatus: 429 });
+  const free = await mockBackend({
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/fine@1.0.0"}'],
   });
-  // Long enough that the held analysis cannot time out and be retried while the
-  // test is watching — a retry would look exactly like a restarted analysis.
-  const env = testEnv(backend.url, { SCAN_TIMEOUT_MS: "60000" });
-  const url = `http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`;
-  const ac = new AbortController();
-  const first = waitCtx();
-  const second = waitCtx();
-  try {
-    const gone = handle(new Request(url, { method: "POST", signal: ac.signal }), env, first.ctx);
-    await begun;
-    ac.abort();
-    assert.equal((await gone).status, 499, "the caller who left is told so");
-    assert.equal(_test.flightCount(), 1, "the analysis was abandoned when its caller left");
-
-    // The reconnect must attach to the running analysis, not start its own. A
-    // caller going solo would consult the filter and dispatch within a tick or
-    // two, so the wait below is room to do the wrong thing visibly; the
-    // analysis itself is held, so it cannot finish early and pass by accident.
-    const back = handle(new Request(url, { method: "POST" }), env, second.ctx);
-    await delay(100);
-    assert.equal(backend.hits.bloom, 1, "the reconnect ran its own lookup instead of joining");
-    assert.equal(backend.hits.analyzePurl, 1, "the reconnect restarted the analysis rather than joining it");
-    finish();
-
-    const res = await back;
-    assert.equal(res.status, 200, "the reconnecting caller inherited the disconnect");
-    assert.equal((await res.json()).purl, "pkg:npm/left-pad@1.3.0");
-    assert.equal(backend.hits.analyzePurl, 1, "one disconnect cost a second full analysis");
-    await first.flush();
-    await second.flush();
-  } finally {
-    finish();
-    await backend.close();
-  }
-});
-
-test("concurrent hedged lookups share one origin fetch", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(40);
-      return { status: 404 };
-    },
-    analyze: async () => {
-      await delay(30);
-      return envelope(HELLO_SHA, { eng: "once" });
-    },
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "15" });
-  try {
-    const ctx = waitCtx();
-    const [a, b] = await Promise.all([
-      handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx),
-      handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx),
-    ]);
-    assert.equal(a.status, 200);
-    assert.equal(b.status, 200);
-    assert.equal(a.headers.get("x-beamline-source"), "scan");
-    assert.equal(b.headers.get("x-beamline-source"), "scan");
-    assert.equal(backend.hits.sample, 1);
-    assert.equal(backend.hits.analyze, 1);
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("when both arms finish, hopper 200 wins", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
-    analyze: async () => {
-      await delay(80);
-      return envelope(HELLO_SHA, { eng: "scan" });
-    },
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "0" });
-  const ctx = waitCtx();
+  const env = testEnv(DEAD, { SCAN_URL: `${busy.url},${free.url}` });
   try {
     const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Ffine%401.0.0", { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.equal(JSON.parse((await res.text()).trim()).decision, "allow");
+    assert.ok(busy.hits.analyze > 0, "the busy worker was never asked");
+  } finally {
+    await Promise.all([busy.close(), free.close()]);
+  }
+});
+
+// Analyzing warms the cache the cheap route reads: the verdict a run just
+// produced is exactly what the next lookup wants, and it should not have to ask
+// a worker for it.
+test("v1 analyze: the decision lands where /v1/lookup will find it", async () => {
+  const scan = await mockBackend({
+    analyzeStream: [
+      '{"state":"analyzing","purl":"pkg:npm/evil@1.0.0","elapsed_ms":1002,"phase":"unpack"}',
+      '{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}',
+    ],
+    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
+  try {
+    const analyzed = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", { method: "POST" }),
       env,
       ctx.ctx,
     );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "hopper");
+    await analyzed.text();
     await ctx.flush();
-    assert.equal(backend.hits.result, 0);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("scan 415 passes through error and detail, not 404", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: () => ({
-      status: 415,
-      body: { error: "unsupported file type", detail: "not a recognized binary" },
-      headers: { "x-total-ms": "9" },
-    }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
+    const looked = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
       env,
       waitCtx().ctx,
     );
-    assert.equal(res.status, 415);
-    assert.equal(res.headers.get("x-total-ms"), "9");
-    assert.deepEqual(await res.json(), {
-      error: "unsupported file type",
-      detail: "not a recognized binary",
-    });
-    assert.equal(backend.hits.upload, 0);
-    assert.equal(backend.hits.result, 0);
+    assert.equal(looked.headers.get("x-beamline-source"), "cache", "the fresh verdict was not cached");
+    assert.equal((await looked.json()).decision, "block", "the lookup did not see what the analysis found");
   } finally {
-    await backend.close();
+    await scan.close();
   }
 });
 
-test("scan 400 on a PURL passes through, not 404", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => ({ status: 400, body: { error: "not a package URL" } }),
+// A stream that ends without a decision was cut short. Caching it would turn
+// one dropped connection into a wrong answer served from the edge for an hour.
+test("v1 analyze: a truncated stream is not cached", async () => {
+  const scan = await mockBackend({
+    analyzeStream: ['{"state":"analyzing","purl":"pkg:npm/half@1.0.0","elapsed_ms":1002,"phase":"unpack"}'],
+    v1: () => ({ decision: "unknown", purl: "pkg:npm/half@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
-  const env = testEnv(backend.url);
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
   try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=not-a-purl`, { method: "POST" }), env, noopCtx());
-    assert.equal(res.status, 400);
-    assert.equal((await res.json()).error, "not a package URL");
-    assert.equal(backend.hits.analyze, 0);
+    const analyzed = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fhalf%401.0.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    await analyzed.text();
+    await ctx.flush();
+
+    const looked = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fhalf%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.notEqual(looked.headers.get("x-beamline-source"), "cache", "half an answer was cached as a whole one");
   } finally {
-    await backend.close();
+    await scan.close();
   }
 });
 
-test("scan 504 without hopper bytes is a timeout, not unavailable", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => ({
-      status: 504,
-      body: { error: "analysis timeout", timeout_secs: 1800 },
+// A worker mid-analysis attaches a second request for the same key to the run
+// already going, so a caller who reconnected belongs back on it. Anywhere else
+// pays for the whole analysis a second time — which on the samples this matters
+// for is twenty minutes of a slot.
+test("v1 analyze: a reconnect is sent back to the worker already running it", async () => {
+  const idle = await mockBackend({
+    status: { state: "unknown" },
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/slow@1.0.0"}'],
+  });
+  const busy = await mockBackend({
+    status: { state: "running", elapsed_ms: 143_000, attached: 0 },
+    analyzeStream: ['{"decision":"block","fires_at":3,"purl":"pkg:npm/slow@1.0.0","reason":"x"}'],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: `${idle.url},${busy.url}` });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fslow%401.0.0", { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(JSON.parse((await res.text()).trim()).decision, "block", "the reconnect started a second analysis");
+    assert.equal(idle.hits.analyze, 0, "a duplicate analysis was dispatched to an idle worker");
+  } finally {
+    await Promise.all([idle.close(), busy.close()]);
+  }
+});
+
+// A fleet with every slot full is busy, not broken: scan refuses the instant a
+// slot is asked for, so nothing has been attempted at length. Answering
+// "we could not find out" on the first refusal would report an outage for a
+// question we never really put.
+test("v1 analyze: a fully busy fleet is asked again rather than given up on", async () => {
+  let asked = 0;
+  const worker = await mockBackend({
+    status: { state: "unknown" },
+    analyzeStatus: () => (++asked < 3 ? 429 : 200),
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/busy@1.0.0"}'],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: worker.url, SCAN_RETRY_BASE_MS: "5" });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fbusy%401.0.0", { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(JSON.parse((await res.text()).trim()).decision, "allow", "gave up while the fleet was merely busy");
+    assert.ok(asked >= 3, `asked ${asked} times, want a retry after each refusal`);
+  } finally {
+    await worker.close();
+  }
+});
+
+test("v1 analyze: every worker down answers unavailable, not an error", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const res = await handle(
+    new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fx%401.0.0", { method: "POST" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse((await res.text()).trim()).decision, "unavailable");
+});
+
+test("v1 analyze: naming nothing is refused, and the route is POST only", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const bare = await handle(
+    new Request("http://beamline/v1/analyze", { method: "POST" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(bare.status, 400);
+  assert.equal((await bare.json()).error.code, "missing_package");
+
+  const wrong = await handle(
+    new Request("http://beamline/v1/analyze?purl=x"),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(wrong.status, 405);
+});
+
+// --- /v1/lookup ---------------------------------------------------------
+//
+// Beamline's job on this route is the edge: authenticate, cache, pick a worker.
+// It asks no second source and reconciles nothing, because scan answers the
+// question completely now — a worker that misses its own index asks the corpus
+// itself.
+
+// Every worker down must not be a 5xx. The caller asked what we know about some
+// packages, and "we could not find out" is an answer about each of them — one
+// their policy may treat differently from "nobody has analyzed this". A 503
+// collapses those two, and a client that catches errors and proceeds fails open
+// on both.
+test("v1: every worker down answers unavailable, not an error", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const res = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0"),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(res.status, 200, "an outage was reported as a request failure");
+  const body = await res.json();
+  assert.equal(body.decision, "unavailable");
+  assert.notEqual(body.decision, "unknown", "an outage was reported as a fact about the package");
+  assert.equal(body.fires_at, null);
+  assert.deepEqual(body.findings, []);
+  assert.equal(res.headers.get("cache-control"), "no-store", "an outage was made cacheable");
+});
+
+// The answer scan gives is the answer the caller gets: beamline adds delivery
+// headers and nothing else. Anything it rewrote here would be a second opinion
+// about a verdict, from the one service that did not compute it.
+test("v1: a worker's answer is passed through intact", async () => {
+  const decided = {
+    decision: "block",
+    purl: "pkg:npm/evil@1.0.0",
+    sha256: HELLO_SHA,
+    severity: "hostile",
+    fires_at: 3,
+    reason: "Postinstall launches a reverse shell.",
+    findings: [{ id: "objectives/c2/backdoor", crit: 5 }],
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  const scan = await mockBackend({ v1: () => decided });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), decided);
+    assert.equal(res.headers.get("x-beamline-source"), "scan");
+  } finally {
+    await scan.close();
+  }
+});
+
+// A verdict is immutable for the engine that produced it, so it caches for an
+// hour. Not knowing is not: it stops being true the moment anything analyzes
+// the artifact, which on this route is often seconds later.
+test("v1: a verdict caches for longer than an absence", async () => {
+  const scan = await mockBackend({
+    v1: (u) => ({
+      decision: u.searchParams.get("purl").includes("evil") ? "block" : "unknown",
+      purl: u.searchParams.get("purl"),
+      sha256: null,
+      severity: null,
+      fires_at: null,
+      reason: null,
+      findings: [],
+      engine_version: null,
+      analyzed_at: null,
     }),
   });
-  const env = testEnv(backend.url);
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
   try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
+    const bad = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
       env,
-      noopCtx(),
+      waitCtx().ctx,
     );
-    assert.equal(res.status, 504);
-    assert.deepEqual(await res.json(), { error: "analysis timeout", timeout_secs: 1800 });
+    assert.match(bad.headers.get("cache-control"), /max-age=3600/);
+
+    const nothing = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fquiet%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.match(nothing.headers.get("cache-control"), /max-age=60/, "an absence was cached as a verdict");
   } finally {
-    await backend.close();
+    await scan.close();
   }
 });
 
-test("scan 429 without hopper bytes passes through", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => ({
-      status: 429,
-      body: { error: "At capacity (4/4 active analyses)" },
+// Two callers on different budgets are asking different questions about one
+// artifact. Serving the second the first's answer would enforce somebody else's
+// policy — silently, and for as long as the entry lives.
+test("v1: the budget is part of the cache key", async () => {
+  let asked = 0;
+  const scan = await mockBackend({
+    v1: (u) => {
+      asked += 1;
+      const budget = Number(u.searchParams.get("false_positive_budget") || 25);
+      return {
+        decision: budget >= 500 ? "block" : "allow",
+        purl: "pkg:npm/borderline@1.0.0",
+        sha256: null,
+        severity: null,
+        fires_at: 500,
+        reason: null,
+        findings: [],
+        engine_version: "2.8.0",
+        analyzed_at: "2026-08-01T00:00:00Z",
+      };
+    },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ask = async (budget) => {
+    const ctx = waitCtx();
+    const res = await handle(
+      new Request(`http://beamline/v1/lookup?purl=pkg%3Anpm%2Fborderline%401.0.0&false_positive_budget=${budget}`),
+      env,
+      ctx.ctx,
+    );
+    await ctx.flush();
+    return (await res.json()).decision;
+  };
+  try {
+    assert.equal(await ask(25), "allow");
+    assert.equal(await ask(1000), "block", "a second budget was served the first one's decision");
+    assert.equal(asked, 2);
+    // And the same budget is served from cache rather than re-asked.
+    assert.equal(await ask(25), "allow");
+    assert.equal(asked, 2, "a cached budget was asked again");
+  } finally {
+    await scan.close();
+  }
+});
+
+// A malformed budget is refused rather than replaced by the default, for the
+// same reason scan refuses it: a caller who meant to loosen theirs and silently
+// got the strict one back would see verdicts they never asked for.
+test("v1: a malformed budget is refused", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const res = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0&false_positive_budget=loose"),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error.code, "invalid_false_positive_budget");
+});
+
+test("v1: naming nothing is refused with a stable code", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const res = await handle(new Request("http://beamline/v1/lookup"), env, waitCtx().ctx);
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error.code, "missing_package");
+});
+
+test("v1: GET only", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const res = await handle(
+    new Request("http://beamline/v1/lookup?purl=x", { method: "POST" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(res.status, 405);
+});
+
+// A sick worker must not end the lookup: the next one is asked, and the caller
+// never learns there was a first.
+test("v1: a failing worker falls through to a healthy one", async () => {
+  const sick = await mockBackend({ v1: () => ({ status: 500 }) });
+  const well = await mockBackend({
+    v1: () => ({
+      decision: "allow",
+      purl: "pkg:npm/fine@1.0.0",
+      sha256: null,
+      severity: "benign",
+      fires_at: -1,
+      reason: null,
+      findings: [],
+      engine_version: "2.8.0",
+      analyzed_at: "2026-08-01T00:00:00Z",
     }),
   });
-  const env = testEnv(backend.url);
+  const env = testEnv(DEAD, { SCAN_URL: `${sick.url},${well.url}` });
   try {
     const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Ffine%401.0.0"),
       env,
-      noopCtx(),
+      waitCtx().ctx,
     );
-    assert.equal(res.status, 429);
-    assert.equal((await res.json()).error, "At capacity (4/4 active analyses)");
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).decision, "allow");
   } finally {
-    await backend.close();
+    await Promise.all([sick.close(), well.close()]);
   }
 });
 
-test("scan down does not wait when hopper rejects the upload", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    uploadStatus: 500,
-  });
-  const env = testEnv(backend.url, { SCAN_URL: DEAD });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 503);
-    assert.equal(backend.hits.rescan, 0);
-  } finally {
-    await backend.close();
-  }
-});
+
+
+
+
+
+
+
 
 test("hits carry the byte offset and line the match fired on", () => {
   const envl = {
@@ -1645,122 +620,10 @@ test("PURLs normalize so the pkg: prefix and type case are not two keys", () => 
   assert.equal(_test.normalizePurl("   "), "");
 });
 
-test("/lookup needs at least one key", async () => {
-  const backend = await mockBackend({ bloom: "unknown" });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(new Request("http://beamline/lookup"), env, noopCtx());
-    assert.equal(res.status, 400);
-    assert.match((await res.json()).error, /provide sha256, purl, or both/);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("both keys is the optimized path, not an error", async () => {
-  // A caller who already knows the digest and the PURL can hand us both. The
-  // digest is asked first because it names exact bytes; the PURL is the second
-  // chance when the corpus has the release but not those bytes.
-  let byPurl = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: (sha, url) => {
-      if (url && url.searchParams.get("purl")) {
-        byPurl += 1;
-        return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "by-purl" }) };
-      }
-      return { status: 404 };
-    },
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "by-purl");
-    assert.equal(byPurl, 1, "the PURL should have been the second chance");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("a digest hit does not spend a second query on the PURL", async () => {
-  let byPurl = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: (sha, url) => {
-      if (url && url.searchParams.get("purl")) byPurl += 1;
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "by-sha" }) };
-    },
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
-      env,
-      noopCtx(),
-    );
-    assert.equal((await res.json()).eng, "by-sha");
-    assert.equal(byPurl, 0, "an exact hit must not cost hopper a second query");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("a PURL answer describing different bytes is refused, not served", async () => {
-  // The release resolves to a digest the caller did not ask about: a re-publish,
-  // or worse. Serving it would answer a question nobody asked.
-  const other = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: (sha, url) => {
-      if (url && url.searchParams.get("purl")) {
-        return { status: 200, sha: other, body: envelope(other, { eng: "different-artifact" }) };
-      }
-      return { status: 404 };
-    },
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 404, "a verdict for other bytes is not this artifact's verdict");
-  } finally {
-    await backend.close();
-  }
-});
 
-test("a PURL asked for two ways shares one cache entry", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    verdict: () => ({ sha: HELLO_SHA, lvl: -1, eng: "2.8.0" }),
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    // Canonical, then bare, then bare with the type in caps.
-    for (const uri of [
-      "http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0",
-      "http://beamline/lookup?purl=npm%2Fleft-pad%401.3.0",
-      "http://beamline/lookup?purl=NPM%2Fleft-pad%401.3.0",
-    ]) {
-      const res = await handle(new Request(uri), env, ctx.ctx);
-      assert.equal(res.status, 200);
-      // The cache write is deliberately off the response path, so let it land
-      // before asking whether the next spelling hits it.
-      await ctx.flush();
-    }
-    assert.equal(backend.hits.bloom, 1, "one spelling reached scan; the rest were cached");
-  } finally {
-    await backend.close();
-  }
-});
 
 test("customer view is sha/purl/lvl/eng plus at most three notable hits", () => {
   const envl = {
@@ -1830,843 +693,13 @@ test("clean samples have no hits even if traits are present", () => {
   assert.equal(view.why, undefined);
 });
 
-test("the handler never encodes the body itself", async () => {
-  // Cloudflare's edge compresses Worker responses. A Worker that also
-  // compresses double-encodes: gzip-in-gzip for a client that asked for gzip,
-  // and a gzip body with no Content-Encoding for one that asked for identity.
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "plain" }) }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    for (const accept of ["gzip", "identity", "gzip, deflate, br"]) {
-      const res = await handle(
-        new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { "accept-encoding": accept } }),
-        { ...env, cache: _test.memoryCache() },
-        noopCtx(),
-      );
-      assert.equal(res.status, 200);
-      assert.equal(res.headers.get("content-encoding"), null, `encoded for accept-encoding: ${accept}`);
-      // Readable as-is, with no decompression step.
-      assert.equal((await res.json()).eng, "plain");
-    }
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a token-protected reply is private to the client but still cacheable by us", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
-  });
-  const inner = _test.memoryCache();
-  const stored = [];
-  const env = {
-    ...testEnv(backend.url),
-    BEAMLINE_TOKEN: "alpha",
-    cache: {
-      match: (req) => inner.match(req),
-      put: (req, res) => {
-        stored.push(res.headers.get("cache-control"));
-        return inner.put(req, res);
-      },
-    },
-  };
-  const headers = { authorization: "Bearer alpha" };
-  const ctx = waitCtx();
-  try {
-    const first = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers }), env, ctx.ctx);
-    assert.equal(first.status, 200);
-    assert.match(first.headers.get("cache-control"), /^private,/);
-    await ctx.flush();
-    assert.equal(stored.length, 1);
-    assert.ok(!stored[0].includes("private"), `stored as ${stored[0]}`);
-
-    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers }), env, noopCtx());
-    assert.equal(second.status, 200);
-    assert.equal(second.headers.get("x-beamline-source"), "cache");
-    assert.equal(backend.hits.sample, 1);
-  } finally {
-    await backend.close();
-  }
-});
-
-test("background work is registered on the context the request arrived on", async () => {
-  // Regression: dispatch spread the ExecutionContext to attach a request id,
-  // which dropped the prototype's waitUntil. Production then served a 100%
-  // cache miss rate while every test passed — under Node the put runs anyway,
-  // so asserting that the cache eventually filled proves nothing. The invariant
-  // that actually broke is that the runtime was *told* to keep the work alive,
-  // so that is what this asserts.
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
-  });
-  const host = hostCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
-      testEnv(backend.url),
-      host.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.ok(host.registered() > 0, "nothing was handed to waitUntil; background work would be cancelled");
-    await host.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a verdict is cached for an hour, and the life is tunable", async () => {
-  const mk = async (extra) => {
-    const backend = await mockBackend({
-      bloom: "unknown",
-      sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
-    });
-    try {
-      const env = { ...testEnv(backend.url), ...extra };
-      const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-      assert.equal(res.status, 200);
-      return res.headers.get("cache-control");
-    } finally {
-      await backend.close();
-    }
-  };
-  // Short by default: while the service is still moving, a wrong verdict must
-  // age out of every colo within the hour rather than within the day.
-  assert.match(await mk({}), /max-age=3600$/);
-  // And raisable without a code change, for when the answers have settled.
-  assert.match(await mk({ VERDICT_MAX_AGE: "86400" }), /max-age=86400$/);
-});
-
-test("a lookup logs the layer that answered, so cache hits are countable", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  const log = captureLogs();
-  _test.muteLogs(false);
-  try {
-    await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
-    await ctx.flush();
-    await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-  } finally {
-    _test.muteLogs(true);
-    log.restore();
-    await backend.close();
-  }
-  const sources = log.rows.filter((r) => r.event === "lookup").map((r) => r.src);
-  // The first request pays for the answer, the second is the hit. Both name a
-  // source: a hit rate nothing reports is a hit rate nobody knows.
-  assert.ok(sources.includes("hopper"), `sources were ${JSON.stringify(sources)}`);
-  assert.ok(sources.includes("cache"), `sources were ${JSON.stringify(sources)}`);
-});
-
-test("a cached answer is the same answer, on every path that produces one", async () => {
-  const stored = () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) });
-  const cases = [
-    {
-      what: "hopper hit, authenticated",
-      backend: { bloom: "unknown", sample: stored },
-      extra: { BEAMLINE_TOKEN: "alpha" },
-      make: () =>
-        new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { authorization: "Bearer alpha" } }),
-    },
-    {
-      what: "hopper hit, open deployment",
-      backend: { bloom: "unknown", sample: stored },
-      extra: {},
-      make: () => new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
-    },
-    {
-      what: "definite miss, authenticated",
-      backend: { bloom: "unknown", sample: () => ({ status: 404 }) },
-      extra: { BEAMLINE_TOKEN: "alpha" },
-      make: () =>
-        new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { authorization: "Bearer alpha" } }),
-    },
-    {
-      what: "purl asked of hopper, authenticated",
-      backend: { bloom: "unknown", sample: stored },
-      extra: { BEAMLINE_TOKEN: "alpha" },
-      make: () =>
-        new Request(`http://beamline/lookup?purl=${encodeURIComponent("pkg:gem/rails@8.1.3.1")}`, {
-          headers: { authorization: "Bearer alpha" },
-        }),
-    },
-  ];
-  for (const c of cases) {
-    const backend = await mockBackend(c.backend);
-    try {
-      await assertSameThroughCache({ ...testEnv(backend.url), ...c.extra }, c.make, c.what);
-    } finally {
-      await backend.close();
-    }
-  }
-});
-
-test("a reply from cache is as private to the client as a fresh one", async () => {
-  // serveHit stores the copy as `public` because Cloudflare will not hold a
-  // `private` one. That rewrite must not reach the caller: found in production
-  // once the cache started serving, where an authenticated verdict came back
-  // marked public — and the zone then restamped max-age to its browser TTL,
-  // so a cached answer advertised a different life than a fresh one.
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
-  });
-  const env = { ...testEnv(backend.url), BEAMLINE_TOKEN: "alpha" };
-  const headers = { authorization: "Bearer alpha" };
-  const ctx = waitCtx();
-  try {
-    const first = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers }), env, ctx.ctx);
-    assert.equal(first.status, 200);
-    await ctx.flush();
-
-    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers }), env, noopCtx());
-    assert.equal(second.headers.get("x-beamline-source"), "cache");
-    assert.equal(second.headers.get("cache-control"), first.headers.get("cache-control"));
-    assert.match(second.headers.get("cache-control"), /^private, max-age=3600$/);
-  } finally {
-    await backend.close();
-  }
-});
-
-test("an unauthenticated deployment still serves a public cached reply", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper" }) }),
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
-    await ctx.flush();
-    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    assert.equal(second.headers.get("x-beamline-source"), "cache");
-    assert.match(second.headers.get("cache-control"), /^public, max-age=3600$/);
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a definite miss is cached, so a hot unknown sha stops replaying the pipeline", async () => {
-  const backend = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    const first = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
-    assert.equal(first.status, 404);
-    await ctx.flush();
-
-    const second = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
-    assert.equal(second.status, 404);
-    assert.equal(second.headers.get("x-beamline-source"), "cache");
-    assert.equal((await second.json()).error, "unknown sample");
-    assert.equal(backend.hits.bloom, 1);
-    assert.equal(backend.hits.sample, 1);
-  } finally {
-    await backend.close();
-  }
-});
-
-test("one request id reaches every backend and every log line", async () => {
-  const logs = captureLogs();
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA) }),
-  });
-  const env = testEnv(backend.url);
-  _test.muteLogs(false);
-  try {
-    await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, { headers: { "cf-ray": "abc123-SJC" } }),
-      env,
-      noopCtx(),
-    );
-    assert.ok(backend.auths.length > 0);
-    assert.ok(
-      backend.auths.every((a) => a.rid === "abc123-SJC"),
-      JSON.stringify(backend.auths),
-    );
-    assert.ok(logs.rows.length > 0);
-    assert.ok(logs.rows.every((r) => r.rid === "abc123-SJC"), JSON.stringify(logs.rows));
-  } finally {
-    logs.restore();
-    await backend.close();
-  }
-});
-
-test("a caller's own request id is honored, filtered, and bounded", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA) }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`, {
-        headers: { "x-request-id": "mine-42", "cf-ray": "ignored" },
-      }),
-      env,
-      noopCtx(),
-    );
-    assert.ok(backend.auths.every((a) => a.rid === "mine-42"), JSON.stringify(backend.auths));
-
-    const fresh = await mockBackend({
-      bloom: "unknown",
-      sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA) }),
-    });
-    await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA.replace(/.$/, "a")}`, {
-        headers: { "x-request-id": `bad/id@ ${"x".repeat(200)}` },
-      }),
-      { ...testEnv(fresh.url), cache: _test.memoryCache() },
-      noopCtx(),
-    );
-    const seen = fresh.auths[0].rid;
-    assert.match(seen, /^badidx+$/, seen);
-    assert.equal(seen.length, 64);
-    await fresh.close();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a scan that never reached a verdict is retried until it does", async () => {
-  let calls = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: () => {
-      calls += 1;
-      if (calls === 1) return { status: 503, body: { error: "unavailable" } };
-      if (calls === 2) return { status: 429, body: { error: "At capacity (4/4 active analyses)" } };
-      if (calls === 3) return { status: 502, body: { error: "bad gateway" } };
-      return envelope(HELLO_SHA, { eng: "eventually" });
-    },
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx);
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    assert.equal((await res.json()).eng, "eventually");
-    assert.equal(calls, 4, "three transient failures, then the answer");
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a rejection is an answer, so it is not retried", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: () => ({ status: 415, body: { error: "unsupported file type" } }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(res.status, 415);
-    assert.equal((await res.json()).error, "unsupported file type");
-    assert.equal(backend.hits.analyze, 1, "a verdict must not be asked for twice");
-  } finally {
-    await backend.close();
-  }
-});
-
-test("scan reporting its own analysis timeout is not retried", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => ({ status: 504, body: { error: "analysis timeout", timeout_secs: 1800 } }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 504);
-    assert.deepEqual(await res.json(), { error: "analysis timeout", timeout_secs: 1800 });
-    // Re-running a sample scan already gave up on spends the budget twice.
-    assert.equal(backend.hits.analyzePurl, 1);
-  } finally {
-    await backend.close();
-  }
-});
-
-test("retries stop once the breaker opens rather than burning attempts", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: () => ({ status: 500, body: { error: "boom" } }),
-    // Refuse the upload so the lookup ends here instead of going on to wait on
-    // a hopper worker; this test is only about how often scan is asked.
-    uploadStatus: 500,
-  });
-  const env = testEnv(backend.url, { SCAN_RETRIES: "50" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx);
-    assert.equal(res.status, 503);
-    // BREAKER_FAILS consecutive failures open the circuit; the loop stops there
-    // instead of running all 50 attempts against a backend known to be down.
-    assert.ok(
-      backend.hits.analyze <= _test.BREAKER_FAILS + 1,
-      `kept asking an open circuit: ${backend.hits.analyze} calls`,
-    );
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("concurrent lookups of one sample share a single retry sequence", async () => {
-  let calls = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(20);
-      return { status: 404 };
-    },
-    analyze: async () => {
-      calls += 1;
-      await delay(20);
-      if (calls <= 2) return { status: 503, body: { error: "unavailable" } };
-      return envelope(HELLO_SHA, { eng: "shared" });
-    },
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    const answers = await Promise.all(
-      Array.from({ length: 5 }, () =>
-        handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx),
-      ),
-    );
-    for (const res of answers) {
-      assert.equal(res.status, 200);
-      assert.equal((await res.json()).eng, "shared");
-    }
-    // Five clients, one flight: two failures and one success, not five of each.
-    assert.equal(calls, 3, `retries fanned out: ${calls} scan calls`);
-    assert.equal(backend.hits.sample, 1);
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("the fastest worker wins, the loser is dropped, and hopper is told once", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const fast = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "fast" }) });
-  const slow = await mockBackend({
-    bloom: "unknown",
-    analyze: async () => {
-      await delay(400);
-      return envelope(HELLO_SHA, { eng: "slow" });
-    },
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${slow.url},${fast.url}` });
-  const ctx = waitCtx();
-  try {
-    const t0 = Date.now();
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx);
-    const ms = Date.now() - t0;
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "fast", "the slower worker must not decide the answer");
-    assert.ok(ms < 300, `waited ${ms}ms for a loser we should have dropped`);
-
-    await ctx.flush();
-    // Both workers ran, but only the winner's verdict is written back.
-    assert.equal(slow.hits.analyze, 1);
-    assert.equal(fast.hits.analyze, 1);
-    assert.equal(hopper.hits.result, 0, "the winning worker files its own verdict; beamline files none");
-  } finally {
-    await Promise.all([hopper.close(), fast.close(), slow.close()]);
-  }
-});
-
-test("a PURL lookup races the same way", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const fast = await mockBackend({ bloom: "unknown", analyzePurl: () => envelope(HELLO_SHA, { eng: "fast" }) });
-  const slow = await mockBackend({
-    bloom: "unknown",
-    analyzePurl: async () => {
-      await delay(400);
-      return envelope(HELLO_SHA, { eng: "slow" });
-    },
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${slow.url},${fast.url}` });
-  try {
-    const t0 = Date.now();
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=pkg%3Anpm%2Fleft-pad%401.3.0`, { method: "POST" }), env, waitCtx().ctx);
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "fast");
-    assert.ok(Date.now() - t0 < 300);
-  } finally {
-    await Promise.all([hopper.close(), fast.close(), slow.close()]);
-  }
-});
-
-test("a dead worker does not stop the race", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const alive = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "alive" }) });
-  const env = testEnv(hopper.url, { SCAN_URL: `${DEAD},${alive.url}` });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx);
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "alive");
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), alive.close()]);
-  }
-});
-
-test("a stagger lets the first worker answer before the next is asked", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const first = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "first" }) });
-  const second = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "second" }) });
-  const env = testEnv(hopper.url, {
-    SCAN_URL: `${first.url},${second.url}`,
-    SCAN_RACE_DELAY_MS: "5000",
-  });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx);
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "first");
-    // The second worker was never asked, so the race cost one slot, not two.
-    assert.equal(second.hits.analyze, 0);
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), first.close(), second.close()]);
-  }
-});
-
-test("a worker with an open breaker is skipped while the others keep serving", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const sick = await mockBackend({ bloom: "unknown", analyze: () => ({ status: 500, body: { error: "boom" } }) });
-  const well = await mockBackend({
-    bloom: "unknown",
-    // Slow enough that the sick worker's 500 always lands first, so its
-    // breaker trips on a fixed count instead of a race.
-    analyze: async () => {
-      await delay(25);
-      return envelope(HELLO_SHA, { eng: "well" });
-    },
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${sick.url},${well.url}` });
-  try {
-    for (let i = 0; i < _test.BREAKER_FAILS + 2; i++) {
-      const body = new TextEncoder().encode(`sample-${i}`);
-      const res = await handle(
-        new Request(`http://beamline/analyze?sha256=${await shaHex(body)}`, { method: "POST", body }),
-        { ...env, cache: _test.memoryCache() },
-        waitCtx().ctx,
-      );
-      assert.equal(res.status, 200, `lookup ${i} should still be served by the healthy worker`);
-      assert.equal((await res.json()).eng, "well");
-    }
-    // Once its breaker opened the sick worker stops being asked; the healthy
-    // one carries every lookup.
-    assert.ok(
-      sick.hits.analyze <= _test.BREAKER_FAILS,
-      `kept asking a tripped worker: ${sick.hits.analyze} calls`,
-    );
-    assert.equal(well.hits.analyze, _test.BREAKER_FAILS + 2);
-  } finally {
-    await Promise.all([hopper.close(), sick.close(), well.close()]);
-  }
-});
-
-test("a peer's stored verdict is worth waiting out an unknown for", async () => {
-  const hopper = await mockBackend({ sample: () => ({ status: 404 }) });
-  // Nothing to say, and quick about it.
-  const quick = await mockBackend({ bloom: "unknown" });
-  // Holds the analysis, and is the slower of the two.
-  const holder = await mockBackend({
-    bloom: "unknown",
-    bloomDelayMs: 60,
-    verdict: () => ({ sha: HELLO_SHA, lvl: 2, eng: "2.8.0" }),
-    analyze: () => envelope(HELLO_SHA, { eng: "should-not-run" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${quick.url},${holder.url}` });
-  try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, waitCtx().ctx);
-    assert.equal(res.status, 200);
-    // A verdict lives only on the worker that ran the analysis, so one peer
-    // answering "unknown sample" first must not end the race.
-    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
-    assert.equal((await res.json()).lvl, 2);
-    assert.equal(holder.hits.analyze, 0, "the stored verdict is the answer");
-  } finally {
-    await Promise.all([hopper.close(), quick.close(), holder.close()]);
-  }
-});
-
-test("a definite filter decision still ends the race immediately", async () => {
-  const hopper = await mockBackend({ sample: () => ({ status: 404 }) });
-  const quick = await mockBackend({ bloom: "skip" });
-  const sluggish = await mockBackend({ bloom: "unknown", bloomDelayMs: 400 });
-  const env = testEnv(hopper.url, { SCAN_URL: `${sluggish.url},${quick.url}` });
-  try {
-    const t0 = Date.now();
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, waitCtx().ctx);
-    const ms = Date.now() - t0;
-    assert.equal(res.headers.get("x-beamline-source"), "bloom");
-    assert.ok(ms < 300, `waited ${ms}ms; a skip needs no second opinion`);
-  } finally {
-    await Promise.all([hopper.close(), quick.close(), sluggish.close()]);
-  }
-});
-
-test("bloom is raced and the first answer wins, slow worker dropped", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const quick = await mockBackend({ bloom: "skip" });
-  const sluggish = await mockBackend({
-    bloom: () => "unknown",
-    bloomDelayMs: 400,
-    analyze: () => envelope(HELLO_SHA, { eng: "should-not-run" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${sluggish.url},${quick.url}` });
-  try {
-    const t0 = Date.now();
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, waitCtx().ctx);
-    const ms = Date.now() - t0;
-    assert.equal(res.status, 200);
-    // The quick worker said skip first, so that is the answer and nothing is
-    // analyzed at all.
-    assert.equal(res.headers.get("x-beamline-source"), "bloom");
-    assert.equal((await res.json()).lvl, -1);
-    assert.ok(ms < 300, `waited ${ms}ms on the slow worker's bloom`);
-    assert.equal(sluggish.hits.analyze, 0, "a skip must not cost an analysis");
-  } finally {
-    await Promise.all([hopper.close(), quick.close(), sluggish.close()]);
-  }
-});
-
-test("an edge timeout is not retried into the same ceiling", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  // What Cloudflare returns when the origin outruns its proxy read timeout.
-  const stalled = await mockBackend({ bloom: "unknown", analyze: () => ({ status: 524, body: { error: "origin timeout" } }) });
-  const env = testEnv(hopper.url, { SCAN_URL: stalled.url, SCAN_TIMEOUT_MS: "60" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }), env, ctx.ctx);
-    // Unavailable rather than a retry storm. It was 202 when beamline could
-    // hand the work to hopper's queue; with beamline read-only, hopper has
-    // never seen this artifact and there is no queue to hand it to. The
-    // property under test is unchanged: one attempt, not a quarter hour of
-    // re-analysis into the same wall.
-    assert.equal(res.status, 503);
-    // Retrying costs a full analysis per worker and hits the same wall.
-    assert.equal(stalled.hits.analyze, 1);
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), stalled.close()]);
-  }
-});
-
-test("/analyze needs a key, and a malformed sha is not one", async () => {
-  for (const uri of [
-    "http://beamline/analyze?sha256=nothex",
-    `http://beamline/analyze?sha256=${HELLO_SHA.slice(0, 63)}`,
-  ]) {
-    const res = await handle(new Request(uri, { method: "POST", body: HELLO }), {}, {});
-    assert.equal(res.status, 400, uri);
-    assert.equal((await res.json()).error, "invalid sha256");
-  }
-  for (const uri of ["http://beamline/analyze", "http://beamline/analyze?sha256="]) {
-    const res = await handle(new Request(uri, { method: "POST" }), {}, {});
-    assert.equal(res.status, 400, uri);
-    assert.equal((await res.json()).error, "provide sha256 or purl");
-  }
-});
-
-test("bytes without a digest are hashed here, and the derived sha reaches scan", async () => {
-  let sentName = "";
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: (body) => {
-      sentName = /filename="([^"]*)"/.exec(body.toString("utf8"))?.[1] || "";
-      return envelope(HELLO_SHA, { lvl: -1, eng: "2.7.2" });
-    },
-  });
-  const env = testEnv(backend.url);
-  try {
-    // No sha256 anywhere in the request: the caller holds the artifact and
-    // should not have to hash it to ask about it.
-    const res = await handle(
-      new Request("http://beamline/analyze", { method: "POST", body: HELLO }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).sha, HELLO_SHA, "the derived digest is the key we answer under");
-    // Scan requires a digest; this is where it comes from.
-    assert.equal(sentName, HELLO_SHA, "scan is handed the derived digest, not a placeholder");
-  } finally {
-    await backend.close();
-  }
-});
-
-test("bytes that do not hash to the claimed sha are refused", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "must-not-run" }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    // Claiming one artifact's digest while sending another's would file the
-    // verdict under the wrong key in beamline, in scan, and in hopper.
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
-        method: "POST",
-        body: new TextEncoder().encode("not hello"),
-      }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 400);
-    assert.equal((await res.json()).error, "body does not match sha256");
-    assert.equal(backend.hits.analyze, 0, "mismatched bytes must never reach a scanner");
-  } finally {
-    await backend.close();
-  }
-});
-
-test("/analyze with only a digest does not go fetch the artifact", async () => {
-  // A digest is a lookup key, not an artifact. Beamline used to answer this by
-  // pulling the bytes from hopper and pushing them to a worker — the whole
-  // artifact twice through this service, to reach bytes the worker can fetch
-  // for itself. It is a miss now, and the caller sends bytes or a PURL.
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    file: HELLO,
-    analyze: () => envelope(HELLO_SHA, { eng: "from-hopper" }),
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 404);
-    assert.equal(backend.hits.file, 0, "beamline must not relay artifact bytes");
-    assert.equal(backend.hits.analyze, 0, "nothing to analyze without the bytes");
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a purl hint on /analyze reaches the answer", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "hinted" }),
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}&purl=${encodeURIComponent("NPM/left-pad@1.3.0")}`, {
-        method: "POST",
-        body: HELLO,
-      }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    const body = await res.json();
-    assert.equal(body.eng, "hinted");
-    // Canonicalized on the way in, the same as /lookup does.
-    assert.equal(body.purl, "pkg:npm/left-pad@1.3.0");
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-// The sha a caller must send alongside its bytes.
-async function shaHex(bytes) {
-  const hash = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function captureLogs() {
-  const rows = [];
-  const orig = console.log;
-  console.log = (...args) => {
-    const s = args[0];
-    // logLine hands Workers an object and Node a serialized line; a helper that
-    // knew only one of them would silently capture nothing on the other.
-    if (s && typeof s === "object" && !Array.isArray(s)) {
-      rows.push(s);
-      return;
-    }
-    if (typeof s === "string" && s.startsWith("{")) {
-      try {
-        rows.push(JSON.parse(s));
-        return;
-      } catch {
-        // fall through
-      }
-    }
-    orig.apply(console, args);
-  };
-  return {
-    rows,
-    restore() {
-      console.log = orig;
-    },
-  };
-}
-
-function envelope(sha, ml = {}) {
-  return {
-    ml: {
-      v: "7",
-      prob: 0,
-      lvl: -1,
-      conf: 0,
-      version: "mock",
-      eng: "mock",
-      analyzed_at: "2026-01-01T00:00:00Z",
-      files: [],
-      ...ml,
-    },
-    raw: { v: "8", files: [{ sha, type: "js" }] },
-  };
-}
-
 function testEnv(url, extra = {}) {
   return {
     HOPPER_URL: extra.HOPPER_URL ?? url,
     SCAN_URL: extra.SCAN_URL ?? url,
+    // Carried through because it decides two things at once: whether a request
+    // is authenticated at all, and what cache scope the answer goes out with.
+    BEAMLINE_TOKEN: extra.BEAMLINE_TOKEN,
     HOPPER_POLL_MS: extra.HOPPER_POLL_MS ?? "10",
     SCAN_TIMEOUT_MS: extra.SCAN_TIMEOUT_MS ?? "2000",
     HOPPER_HEDGE_MS: extra.HOPPER_HEDGE_MS,
@@ -2682,26 +715,6 @@ function testEnv(url, extra = {}) {
 
 function noopCtx() {
   return { waitUntil() {} };
-}
-
-// The real ExecutionContext is a class instance: waitUntil lives on the
-// prototype and there are no own enumerable properties at all. waitCtx's object
-// literal keeps it as an own property, which a spread copies — so only this
-// shape catches code that spreads the context and drops the method.
-function hostCtx() {
-  const jobs = [];
-  class ExecutionContextLike {
-    waitUntil(p) {
-      jobs.push(Promise.resolve(p));
-    }
-  }
-  return {
-    ctx: new ExecutionContextLike(),
-    registered: () => jobs.length,
-    async flush() {
-      while (jobs.length) await Promise.all(jobs.splice(0));
-    },
-  };
 }
 
 // Headers a cached answer is allowed to differ on: each describes this
@@ -2757,6 +770,7 @@ function mockBackend(opts) {
     rescan: 0,
     stats: 0,
     status: 0,
+    v1: 0,
   };
   const results = [];
   const auths = [];
@@ -2773,6 +787,23 @@ function mockBackend(opts) {
         hits.stats += 1;
         if (!opts.stats) return send(res, 404, { error: "not found" });
         return send(res, 200, typeof opts.stats === "function" ? opts.stats() : opts.stats);
+      }
+      if (url.pathname === "/v1/analyze") {
+        hits.analyze += 1;
+        const forced = typeof opts.analyzeStatus === "function" ? opts.analyzeStatus() : opts.analyzeStatus;
+        if (forced && forced !== 200) {
+          return send(res, forced, { error: { code: "at_capacity" } });
+        }
+        res.writeHead(200, { "content-type": "application/x-ndjson" });
+        for (const line of opts.analyzeStream || []) res.write(`${line}\n`);
+        return res.end();
+      }
+      if (url.pathname === "/v1/lookup") {
+        hits.v1 += 1;
+        const out = typeof opts.v1 === "function" ? opts.v1(url) : opts.v1;
+        if (!out) return send(res, 404, { error: { code: "unknown_artifact" } });
+        if (out.status && out.status !== 200) return send(res, out.status, { error: { code: "boom" } });
+        return send(res, 200, out);
       }
       if (url.pathname === "/status") {
         hits.status += 1;
@@ -2910,149 +941,10 @@ function statsFor({ slots = 8, free = 8, inFlight = 0, ms = 1000, bySize = {}, .
   };
 }
 
-test("routing asks the worker its own history says is faster for this size", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  // Equal overall, but one is far better at small inputs — which is what a
-  // single scalar average would have hidden.
-  const small = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 8000, bySize: { le_1mb: { jobs: 50, avg_ms: 200 } } }),
-    analyze: () => envelope(HELLO_SHA, { eng: "small-specialist" }),
-  });
-  const big = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 8000, bySize: { le_1mb: { jobs: 50, avg_ms: 9000 } } }),
-    analyze: () => envelope(HELLO_SHA, { eng: "big-specialist" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${big.url},${small.url}` });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "small-specialist", "size-bucket history was ignored");
-    // Hedged, not raced: the favourite answered well inside its own estimate,
-    // so the other worker was never asked and spent no slot.
-    assert.equal(big.hits.analyze, 0, "the hedge fired even though the favourite was prompt");
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), small.close(), big.close()]);
-  }
-});
 
-test("a saturated worker loses to an idle one with the same service time", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const busy = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ slots: 4, free: 0, inFlight: 8, ms: 1000 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "busy" }),
-  });
-  const idle = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ slots: 4, free: 4, inFlight: 0, ms: 1000 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "idle" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${busy.url},${idle.url}` });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "idle", "queue depth was ignored");
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), busy.close(), idle.close()]);
-  }
-});
 
-test("a worker that cannot take the upload is not asked at all", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  // Would be picked on latency alone; it simply cannot accept the body.
-  const tiny = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 1, max_upload_mb: 0 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "too-small" }),
-  });
-  const roomy = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 9000 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "roomy" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${tiny.url},${roomy.url}` });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "roomy");
-    assert.equal(tiny.hits.analyze, 0, "an incapable worker was still asked");
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), tiny.close(), roomy.close()]);
-  }
-});
 
-test("an unready worker is skipped even when it looks fastest", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const loading = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 1, ready: false }),
-    analyze: () => envelope(HELLO_SHA, { eng: "loading" }),
-  });
-  const serving = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 9000 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "serving" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${loading.url},${serving.url}` });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "serving");
-    assert.equal(loading.hits.analyze, 0);
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), loading.close(), serving.close()]);
-  }
-});
 
-test("with no stats to go on it falls back to racing everyone", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  // Neither serves /_/stats. Holding an arm back would be a coin toss with a
-  // long delay attached, so the old flat race is the right answer.
-  const slow = await mockBackend({
-    bloom: "unknown",
-    analyze: async () => {
-      await delay(300);
-      return envelope(HELLO_SHA, { eng: "slow" });
-    },
-  });
-  const fast = await mockBackend({ bloom: "unknown", analyze: () => envelope(HELLO_SHA, { eng: "fast" }) });
-  const env = testEnv(hopper.url, { SCAN_URL: `${slow.url},${fast.url}` });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "fast", "uninformed routing must still race");
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), slow.close(), fast.close()]);
-  }
-});
 
 test("/_/routes dry-runs the real ranking, per size bucket", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
@@ -3128,34 +1020,6 @@ test("/_/routes is behind the token gate", async () => {
   assert.equal(res.status, 401, "the route names every worker and its load");
 });
 
-test("a full worker is excluded as closed, not ranked as slow", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  // Fast on paper, but its next try_acquire_owned() returns 429.
-  const full = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ slots: 4, free: 0, inFlight: 4, ms: 100 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "full" }),
-  });
-  const open = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ slots: 4, free: 2, ms: 8000 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "open" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${full.url},${open.url}` });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST", body: HELLO }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "open");
-    assert.equal(full.hits.analyze, 0, "dispatching to a full worker buys a 429");
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), full.close(), open.close()]);
-  }
-});
 
 test("occupancy scales the estimate; queue depth is still not added to it", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
@@ -3209,75 +1073,7 @@ test("a nearly-full worker loses to a roomier one that is slower on paper", asyn
   }
 });
 
-test("X-Beamline-Pin forces the route the router would not have chosen", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const quick = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 100 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "quick" }),
-  });
-  const slow = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 9000 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "slow" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${quick.url},${slow.url}` });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
-        method: "POST",
-        body: HELLO,
-        headers: { "x-beamline-pin": hostOf(slow.url) },
-      }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "slow", "the pin was ignored");
-    assert.equal(quick.hits.analyze, 0, "a pinned run must not also race the favourite");
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), quick.close(), slow.close()]);
-  }
-});
 
-test("a pinned run is never answered from cache", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  const a = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 100 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "a" }),
-  });
-  const b = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 100 }),
-    analyze: () => envelope(HELLO_SHA, { eng: "b" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: `${a.url},${b.url}` });
-  const ask = async (pin) => {
-    const ctx = waitCtx();
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
-        method: "POST",
-        body: HELLO,
-        headers: pin ? { "x-beamline-pin": pin } : {},
-      }),
-      env,
-      ctx.ctx,
-    );
-    const body = await res.json();
-    await ctx.flush();
-    return body;
-  };
-  try {
-    await ask(null); // warms the cache under this key
-    const pinned = await ask(hostOf(b.url));
-    assert.equal(pinned.eng, "b", "the cached verdict answered instead of the pinned worker");
-    assert.ok(b.hits.analyze >= 1, "the pinned worker must actually be timed");
-  } finally {
-    await Promise.all([hopper.close(), a.close(), b.close()]);
-  }
-});
 
 test("/_/routes ages stats against a clock read after they are refreshed", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
@@ -3357,142 +1153,10 @@ test("a class a worker has never handled falls back to its own average", async (
   }
 });
 
-test("429 does not trip the breaker, so a busy worker is asked again", async () => {
-  // Enough 429s to open the breaker if they were counted as failures, then a
-  // verdict. The worker is healthy throughout — it was only ever full.
-  let calls = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => {
-      calls += 1;
-      return calls <= 6
-        ? { status: 429, body: { error: "At capacity (4/4 active analyses)" } }
-        : envelope(HELLO_SHA, { eng: "recovered" });
-    },
-  });
-  const env = testEnv(backend.url, { SCAN_RETRY_BASE_MS: "1", SCAN_RETRIES: "8" });
-  try {
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 200, "backpressure was mistaken for a broken worker");
-    assert.equal((await res.json()).eng, "recovered");
-    assert.ok(calls > 6, `gave up after ${calls} attempts`);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("a 5xx still trips the breaker", async () => {
-  // The regression guard for the change above: real failures must still open it.
-  let calls = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => {
-      calls += 1;
-      return { status: 500, body: { error: "boom" } };
-    },
-  });
-  const env = testEnv(backend.url, { SCAN_RETRY_BASE_MS: "1", SCAN_RETRIES: "8" });
-  try {
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fbroken%401.0.0", { method: "POST" }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 503);
-    // BREAKER_FAILS is 5; the ladder must stop there rather than run all 8.
-    assert.ok(calls <= 6, `kept hammering a broken worker: ${calls} attempts`);
-  } finally {
-    await backend.close();
-  }
-});
 
-test("Server-Timing reports each raced arm, not just the winner", async () => {
-  // hopper answers late; the scan index answers first and wins. Both figures
-  // must survive, or the race is unmeasurable from outside.
-  const backend = await mockBackend({
-    bloom: "skip",
-    bloomDelayMs: 20,
-    sample: async () => {
-      await delay(120);
-      return { status: 404 };
-    },
-  });
-  const env = testEnv(backend.url);
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    const t = res.headers.get("server-timing") || "";
-    assert.match(t, /scan_index;dur=\d+/, `no scan-index timing: ${t}`);
-    assert.match(t, /total;dur=\d+/, `no total: ${t}`);
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
 
-test("a cached reply does not replay the timings of the request that made it", async () => {
-  const backend = await mockBackend({ bloom: "skip" });
-  const env = testEnv(backend.url);
-  const ask = async () => {
-    const ctx = waitCtx();
-    const res = await handle(new Request(`http://beamline/lookup?sha256=${HELLO_SHA}`), env, ctx.ctx);
-    await ctx.flush();
-    return res;
-  };
-  try {
-    const first = await ask();
-    assert.ok(first.headers.get("server-timing"), "the live reply should be timed");
-    const second = await ask();
-    if (second.headers.get("x-beamline-source") === "cache") {
-      assert.equal(second.headers.get("server-timing"), null, "stale timings served as if fresh");
-    }
-  } finally {
-    await backend.close();
-  }
-});
 
-test("a pinned analysis is not answered by the cheap sources", async () => {
-  // hopper holds a verdict and the index would serve it. Pinning says "measure
-  // this worker", so neither may answer.
-  const hopper = await mockBackend({
-    bloom: "unknown",
-    sample: () => ({ status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { eng: "from-hopper" }) }),
-  });
-  const worker = await mockBackend({
-    bloom: "skip",
-    verdict: () => envelope(HELLO_SHA, { eng: "from-index" }),
-    analyze: () => envelope(HELLO_SHA, { eng: "from-worker" }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: worker.url });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, {
-        method: "POST",
-        body: HELLO,
-        headers: { "x-beamline-pin": hostOf(worker.url) },
-      }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "from-worker", "a pin that an index can answer measures nothing");
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), worker.close()]);
-  }
-});
 
 test("one unlucky sample does not brand a worker slow", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
@@ -3568,81 +1232,7 @@ test("a worker that cannot be polled never outranks one that can", async () => {
   }
 });
 
-test("a refusal promotes the next worker instead of waiting out its hedge", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  // The live shape: the favourite is small and instantly full, the next worker
-  // has capacity. Its hedge is long, so waiting it out is the whole bug.
-  const full = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ slots: 6, free: 6, ms: 1000 }),
-    analyzePurl: () => ({ status: 429, body: { error: "At capacity (6/6 active analyses)" } }),
-  });
-  const roomy = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ slots: 64, free: 64, ms: 9000 }),
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "roomy" }),
-  });
-  const env = testEnv(hopper.url, {
-    SCAN_URL: `${full.url},${roomy.url}`,
-    // A hedge far longer than this test may take: if the promotion does not
-    // work, the arm waits this out and the assertion below fails on time.
-    SCAN_RACE_DELAY_MS: "10000",
-    SCAN_RETRY_BASE_MS: "1",
-  });
-  const ctx = waitCtx();
-  const started = Date.now();
-  try {
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "roomy");
-    const took = Date.now() - started;
-    assert.ok(took < 5000, `waited ${took}ms behind an instant refusal — the hedge was not cut short`);
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), full.close(), roomy.close()]);
-  }
-});
 
-test("a worker that is merely slow still gets its full hedge", async () => {
-  const hopper = await mockBackend({ bloom: "unknown", sample: () => ({ status: 404 }) });
-  // The counter-case: promotion must trigger on a refusal, not on slowness.
-  // This worker answers correctly, just not instantly, and the second arm must
-  // stay parked rather than duplicate the work.
-  const slow = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 1000 }),
-    analyzePurl: async () => {
-      await delay(150);
-      return envelope(HELLO_SHA, { eng: "slow-but-fine" });
-    },
-  });
-  const backup = await mockBackend({
-    bloom: "unknown",
-    stats: statsFor({ ms: 9000 }),
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "backup" }),
-  });
-  const env = testEnv(hopper.url, {
-    SCAN_URL: `${slow.url},${backup.url}`,
-    SCAN_RACE_DELAY_MS: "3000",
-  });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "slow-but-fine");
-    assert.equal(backup.hits.analyzePurl, 0, "a slow worker is not a failed one");
-    await ctx.flush();
-  } finally {
-    await Promise.all([hopper.close(), slow.close(), backup.close()]);
-  }
-});
 
 test("the estimate prefers a worker's windowed p80 over its lifetime mean", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
@@ -3772,262 +1362,90 @@ test("beamline reads the exact shape scan publishes", async () => {
   }
 });
 
-test("beamline blocks on hopper's 202 and answers when the verdict lands", async () => {
-  let polls = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: (sha) => {
-      polls += 1;
-      // Held but unanalyzed twice, then done. Beamline presents a blocking
-      // API, so it waits rather than handing the caller a 202 to chase.
-      if (polls <= 2) return { status: 202, sha: sha || HELLO_SHA };
-      return { status: 200, sha: sha || HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-worker" }) };
-    },
+
+
+
+
+
+
+
+
+
+
+// The breaker is shared machinery: it survived the legacy routes but every test
+// that exercised it went through them. A worker answering 5xx must be taken out
+// of the pool, or the router keeps offering work to something that cannot take
+// it and every caller pays the round trip to find out.
+test("v1: a worker that keeps failing is taken out of the pool", async () => {
+  const sick = await mockBackend({ v1: () => ({ status: 500 }) });
+  const well = await mockBackend({
+    v1: () => ({
+      decision: "allow", purl: "pkg:npm/fine@1.0.0", sha256: null, severity: "benign",
+      fires_at: -1, reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+    }),
   });
-  const env = testEnv(backend.url, { SCAN_URL: DEAD, HOPPER_POLL_MS: "5" });
+  const env = testEnv(DEAD, { SCAN_URL: `${sick.url},${well.url}` });
+  const url = "http://beamline/v1/lookup?purl=pkg%3Anpm%2Ffine%401.0.0";
+  try {
+    for (let i = 0; i < _test.BREAKER_FAILS + 1; i++) {
+      const res = await handle(new Request(url), { ...env, cache: _test.memoryCache() }, waitCtx().ctx);
+      assert.equal(res.status, 200, "a failing worker ended the lookup instead of falling through");
+    }
+    const before = sick.hits.v1;
+    await handle(new Request(url), { ...env, cache: _test.memoryCache() }, waitCtx().ctx);
+    assert.equal(sick.hits.v1, before, "a tripped worker was asked again");
+  } finally {
+    await Promise.all([sick.close(), well.close()]);
+  }
+});
+
+// Both cache bugs found in production were divergences between the copy
+// beamline stored and the copy a caller gets back — a `public` scope meant for
+// our cache alone, and before that no stored copy at all. Neither is visible to
+// a test that only inspects the first response.
+test("v1: the cached answer is the same answer", async () => {
+  const scan = await mockBackend({
+    v1: () => ({
+      decision: "block", purl: "pkg:npm/evil@1.0.0", sha256: HELLO_SHA, severity: "hostile",
+      fires_at: 3, reason: "Reverse shell in postinstall.",
+      findings: [{ id: "objectives/c2/backdoor", crit: 5 }],
+      engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+    }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    await assertSameThroughCache(
+      env,
+      () => new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
+      "v1 lookup",
+    );
+  } finally {
+    await scan.close();
+  }
+});
+
+// An authenticated deployment must not hand a caller an answer marked cacheable
+// by every shared proxy between here and them: the verdict is knowledge about
+// their artifact, not public data.
+test("v1: an authenticated answer is private to the caller", async () => {
+  const scan = await mockBackend({
+    v1: () => ({
+      decision: "allow", purl: "pkg:npm/fine@1.0.0", sha256: null, severity: "benign",
+      fires_at: -1, reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+    }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_TOKEN: "s3cret" });
   try {
     const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }),
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Ffine%401.0.0", {
+        headers: { authorization: "Bearer s3cret" },
+      }),
       env,
-      noopCtx(),
+      waitCtx().ctx,
     );
     assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "hopper-worker");
-    assert.ok(polls >= 3, `gave up after ${polls} polls`);
-    assert.equal(backend.hits.upload, 0, "waiting is a read, not a write");
-    assert.equal(backend.hits.rescan, 0);
+    assert.match(res.headers.get("cache-control"), /^private/, "an authenticated verdict went out public");
   } finally {
-    await backend.close();
-  }
-});
-
-test("a 204 from an older hopper still means queued", async () => {
-  let polls = 0;
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: (sha) => {
-      polls += 1;
-      // Pre-202 hopper. Reading this as "nothing here" would abandon a sample
-      // somebody is actively analyzing.
-      if (polls === 1) return { status: 204, sha: sha || HELLO_SHA };
-      return { status: 200, sha: sha || HELLO_SHA, body: envelope(HELLO_SHA, { eng: "hopper-worker" }) };
-    },
-  });
-  const env = testEnv(backend.url, { SCAN_URL: DEAD, HOPPER_POLL_MS: "5" });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "hopper-worker");
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a queue that never finishes hands back 202, not a hung request", async () => {
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: (sha) => ({ status: 202, sha: sha || HELLO_SHA }),
-  });
-  // A short budget stands in for the real one: the point is that the wait ends.
-  const env = testEnv(backend.url, { SCAN_URL: DEAD, HOPPER_POLL_MS: "5", SCAN_TIMEOUT_MS: "80" });
-  try {
-    const res = await handle(
-      new Request(`http://beamline/analyze?sha256=${HELLO_SHA}`, { method: "POST" }),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 202);
-    assert.deepEqual(await res.json(), { state: "pending" });
-    assert.ok(res.headers.get("retry-after"), "202 must say when to come back");
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a bad-set bloom hit waits for hopper's reason instead of re-deriving it", async () => {
-  // The filter says this key is bad and can say nothing else — it is a bloom
-  // filter. Hopper holds the reason, because a known-bad sample is one the
-  // corpus already has. Spending a scan slot to re-derive it would be waste.
-  const backend = await mockBackend({
-    bloom: "known-bad",
-    sample: async () => {
-      // Slower than the hedge: without the suppression, an analysis starts.
-      await delay(120);
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { lvl: 3, eng: "hopper-reason" }) };
-    },
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "wasted-scan" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "hopper");
-    assert.equal((await res.json()).eng, "hopper-reason");
-    await ctx.flush();
-    assert.equal(backend.hits.analyzePurl, 0, "spent a scan slot on a sample hopper could explain");
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a bad-set hit still analyzes when hopper genuinely has no reason", async () => {
-  // Suppressing the hedge delays the decision; it must not remove it. When
-  // hopper misses outright there is nothing to wait for.
-  const backend = await mockBackend({
-    bloom: "known-bad",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => envelope(HELLO_SHA, { lvl: 3, eng: "scan-had-to" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal(res.status, 200);
-    assert.equal((await res.json()).eng, "scan-had-to");
-    assert.equal(backend.hits.analyzePurl, 1);
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("an unknown bloom still hedges into an analysis", async () => {
-  // The counter-case: suppression applies only to the bad set. An unknown key
-  // is exactly what the hedge exists for.
-  const backend = await mockBackend({
-    bloom: "unknown",
-    sample: async () => {
-      await delay(200);
-      return { status: 404 };
-    },
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "hedged" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "hedged");
-    assert.equal(backend.hits.analyzePurl, 1, "the hedge should have fired");
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("the index probe carries both keys when the caller gave both", async () => {
-  // One request per worker, not two: scan checks each key against its own
-  // filters and merges, which is where the filters already are.
-  let asked = null;
-  const backend = await mockBackend({
-    bloom: (url) => {
-      asked = { sha: url.searchParams.get("sha256"), purl: url.searchParams.get("purl") };
-      return "unknown";
-    },
-    sample: () => ({ status: 404 }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    await handle(
-      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
-      env,
-      noopCtx(),
-    );
-    assert.equal(asked.sha, HELLO_SHA, "digest missing from the index probe");
-    assert.equal(asked.purl, "pkg:npm/left-pad@1.3.0", "purl missing from the index probe");
-    assert.equal(backend.hits.bloom, 1, "one probe per worker, not one per key");
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a conflicted bloom also waits for hopper rather than re-deriving", async () => {
-  // `conflicted` means the filters disagree about this artifact — scan's word
-  // for "trust neither". It shares the bad-set branch, and sharing a branch is
-  // exactly the thing that stops being true when someone edits one of them.
-  const backend = await mockBackend({
-    bloom: "conflicted",
-    sample: async () => {
-      await delay(120);
-      return { status: 200, sha: HELLO_SHA, body: envelope(HELLO_SHA, { lvl: 3, eng: "hopper-settled-it" }) };
-    },
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "wasted-scan" }),
-  });
-  const env = testEnv(backend.url, { HOPPER_HEDGE_MS: "20" });
-  const ctx = waitCtx();
-  try {
-    const res = await handle(
-      new Request("http://beamline/analyze?purl=pkg%3Anpm%2Fleft-pad%401.3.0", { method: "POST" }),
-      env,
-      ctx.ctx,
-    );
-    assert.equal((await res.json()).eng, "hopper-settled-it");
-    assert.equal(backend.hits.analyzePurl, 0, "a contradiction is not a reason to scan immediately");
-    await ctx.flush();
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a skip from the merged index decision still short-circuits", async () => {
-  // scan merges both keys and may answer `skip` on the strength of either.
-  // Beamline serves that as a benign stub without touching hopper or a worker.
-  const backend = await mockBackend({
-    bloom: "skip",
-    sample: () => ({ status: 404 }),
-    analyzePurl: () => envelope(HELLO_SHA, { eng: "should-not-run" }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "bloom");
-    assert.equal(backend.hits.analyzePurl, 0);
-  } finally {
-    await backend.close();
-  }
-});
-
-test("a stored verdict from the index beats the hopper round trip", async () => {
-  // The index answering with a verdict is the cheapest hit there is: no hopper
-  // query, no analysis. Worth pinning now that both keys can produce one.
-  const backend = await mockBackend({
-    bloom: "known-bad",
-    verdict: () => ({ sha: HELLO_SHA, lvl: 3, eng: "index-verdict" }),
-    sample: () => ({ status: 404 }),
-  });
-  const env = testEnv(backend.url);
-  try {
-    const res = await handle(
-      new Request(`http://beamline/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0&sha256=${HELLO_SHA}`),
-      env,
-      noopCtx(),
-    );
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get("x-beamline-source"), "scan-cache");
-    assert.equal((await res.json()).eng, "index-verdict");
-  } finally {
-    await backend.close();
+    await scan.close();
   }
 });

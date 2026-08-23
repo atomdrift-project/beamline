@@ -1,168 +1,231 @@
 # Beamline API
 
+Two routes. `/v1/lookup` reports what is already known; `/v1/analyze` finds out.
+
 ```
-GET  /healthz            (also /_/health)
-GET  /lookup?sha256={64hex}
-GET  /lookup?purl={purl}
-GET  /lookup?purl={purl}&sha256={64hex}  both: the fast path, see below
-POST /analyze                            the artifact as the raw body
-POST /analyze?purl={purl}                no body: resolved by scan
-POST /analyze?purl={purl}&sha256={64hex} no body, and the digest is checked
+GET  /v1/lookup?purl={purl}                   free, cacheable, never analyzes
+GET  /v1/lookup?sha256={64hex}
+GET  /v1/lookup?purl=a&purl=b                 up to 50 per URL
+POST /v1/analyze?purl={purl}                  spends an analysis slot; streams
+
+GET  /healthz    (also /_/health)             liveness; no token required
+GET  /_/routes                                the router's own reasoning
 ```
 
-`/lookup` reports what is already known and never spends an analysis slot; a
-key nothing holds is a 404. Name at least one key; neither is a 400.
-
-### Sending both keys
-
-If you already know the digest **and** the PURL, send both. It is the fastest
-path we offer, and it costs you nothing to use.
-
-The two keys are not interchangeable, which is why both are worth having. A
-`sha256` names exact bytes. A versioned `purl` names whatever sample the corpus
-holds for that release — usually the same artifact, but not necessarily the one
-you are holding. So:
-
-- The digest is asked first, because it is exact. If it answers, that is the
-  answer, and the PURL costs nothing — no second query is made.
-- If the digest is unknown, the PURL gets a second chance. The corpus can know
-  release `1.0` without having seen your particular bytes, and that is a hit you
-  would not have got from either key alone.
-- If the PURL resolves to a *different* digest than the one you named, that
-  answer is refused rather than served. It describes different bytes, and a
-  release whose digest has moved under it is worth knowing about rather than
-  papering over.
-
-The practical effect is that a caller who knows both never pays for a fetch to
-find out whether they agree: we compare the digests from the lookup itself.
-
-`/analyze` is the route that may analyze. Send the artifact as the raw body
-and neither key is needed: the digest is computed from the bytes. Send
-`sha256` as well and it is checked — a mismatch is a 400, which is how a
-truncated upload is caught. The digest is never taken on trust; a verdict
-filed under a key the caller chose rather than one the bytes produce would
-poison this cache, scan's, and hopper's at once.
-
-The body is optional, but a `purl` is then required: scan resolves it against
-the registry itself. A digest alone is not enough to analyze — it is a lookup
-key, not an artifact — so `/analyze?sha256=` with no body and no `purl` is a
-404, not an analysis. Send the bytes, or send a PURL, or use `/lookup`.
-
-A `multipart/` or `application/x-www-form-urlencoded` body is a 415, checked
-before the keys, so send `Content-Type: application/octet-stream`.
-
-`purl` on `/analyze` is both the thing scan resolves when there is no body and
-a hint when there is: it lets scan graft registry provenance onto the report,
-and it is echoed in each hit's `pkg`.
-
-The `pkg:` prefix is optional and the scheme and type are case-folded, so
-`npm/left-pad@1.3.0` and `PKG:NPM/left-pad@1.3.0` are the same key. The rest of
-the PURL is left as sent: npm grandfathered in mixed-case names.
-
-Both keys travel as query parameters. A PURL's own grammar carries `?` and
-`#`, and in a path segment everything from a raw `?` is parsed as the URL's
-query string while a `#subpath` never leaves the client — a qualified PURL
-would silently become a different one. `GET /sha256/{64hex}` and
-`GET /purl/{purl}` were the earlier spelling of this route, and `POST /` of
-the upload; none of the three answer any more.
+Only `/v1/analyze` costs anything.
 
 If `BEAMLINE_TOKEN` is set, every route except the health checks requires
-`Authorization: Bearer …`.
+`Authorization: Bearer …`. Your token authenticates you to us and travels no
+further; beamline holds separate credentials for its backends.
 
-## 200
+## Keys
 
-```json
+Both keys travel as query parameters. A PURL's grammar carries `?` and `#`, and
+in a path segment everything after a raw `?` is parsed as the URL's query
+string — a qualified PURL would silently become a different one.
+
+The `pkg:` prefix is optional and the scheme and type are case-folded, so
+`npm/left-pad@1.3.0` and `PKG:NPM/left-pad@1.3.0` are one key. The rest is left
+as sent: npm grandfathered in mixed-case names.
+
+Send both keys when you know both. The digest is asked first, because it names
+exact bytes; the PURL is a second chance, because the corpus can know release
+`1.0` without having seen your particular bytes. If the PURL resolves to a
+different digest than the one you named, that answer is refused rather than
+served — it describes different bytes.
+
+## GET /v1/lookup
+
+```
+$ curl 'https://api.atomdrift.com/v1/lookup?purl=npm/left-pad@1.3.0'
 {
-  "sha": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+  "decision": "allow",
   "purl": "pkg:npm/left-pad@1.3.0",
-  "lvl": -1,
-  "eng": "2.7.2"
+  "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+  "severity": "benign",
+  "fires_at": -1,
+  "reason": null,
+  "findings": [],
+  "engine_version": "2.8.0",
+  "analyzed_at": "2026-08-01T00:00:00Z"
 }
 ```
 
-`purl` is omitted when unknown. `eng` is the scanner build.
+Repeat `purl` to ask about several. One package answers with one object; a
+repeated parameter answers with a list, in the order asked. The shape follows
+the question, not the data, so a caller that always asks about one always gets
+one.
 
-Hostile:
+Over 50 packages is a `413`. There is no batch limit on `/v1/analyze` because it
+takes one package.
 
-```json
-{
-  "sha": "…",
-  "purl": "pkg:npm/evil@1.0.0",
-  "lvl": 3,
-  "eng": "2.7.2",
-  "why": "Postinstall launches a reverse shell.",
-  "hits": [
-    {
-      "id": "objectives/execution/shell/bash",
-      "crit": 5,
-      "file": "lib/install.js",
-      "pkg": "pkg:npm/evil@1.0.0",
-      "desc": "Spawns bash from a npm postinstall hook",
-      "off": 109,
-      "line": 12
-    }
-  ]
-}
-```
+## POST /v1/analyze
 
-Empty strings are omitted.
-
-`lvl` is the tightest false-positive budget per 100 million at which the
-sample is hostile. Lower is worse. `-1` never fires. Gate on `lvl`.
-
-`hits` is present only when `lvl != -1`. At most three, worst first. `crit` is
-3 notable, 4 suspicious, 5 hostile. `id` is stable. `file` is the path inside
-the artifact. `pkg` is the component. `desc` is one line.
-
-`off` is the byte offset of the match within `file`, and `line` its 1-based
-source line. Either may be absent: a binary carries no line structure, and a
-match whose evidence was trimmed from the report has neither.
-
-Only matches native to the file they are reported on appear. An archive
-repeats its members' findings on itself; those copies are dropped in favour of
-the member's own, which names the real path and offset.
-
-`why` is one sentence from the interpreter, when we have it.
-
-## Headers
+The reply is newline-delimited JSON: progress while the run is going, then the
+decision. **Read lines until one carries `decision`. That is the answer.**
 
 ```
-X-SHA256: …                              same as body.sha
-X-Beamline-Source: cache|scan-cache|bloom|hopper|scan
-Cache-Control: public, max-age=…         private if authenticated
-Content-Encoding: gzip                   applied by the edge, if requested
-Retry-After: 3-8                         on 202, jittered
+$ curl -sN -X POST \
+    'https://api.atomdrift.com/v1/analyze?purl=pypi/tensorflow@2.15.0'
+{"state":"analyzing","elapsed_ms":1002,"phase":"fetch","purl":"pkg:pypi/…"}
+{"state":"analyzing","elapsed_ms":6004,"phase":"unpack","purl":"pkg:pypi/…"}
+{"state":"analyzing","elapsed_ms":11006,"phase":"features+model","purl":"…"}
+{"decision":"allow","purl":"pkg:pypi/tensorflow@2.15.0","fires_at":-1,…}
 ```
 
-`X-Beamline-Source` is for operators. Do not branch on it.
+Progress frames carry `state`, `purl`, `elapsed_ms` and `phase`. They exist
+because a silent connection is one an intermediary will eventually cut, and
+because a six-minute analysis and a hung one are otherwise indistinguishable.
+Ignore them if you like; they are never the answer.
 
-Every request carries an `X-Request-Id`, taken from `CF-Ray` when present, into
-hopper and scan and onto every log line. Send your own to correlate with ours.
+An analysis that finishes before the first frame is due emits only the decision,
+so a fast call is a single JSON object.
+
+**A stream that ends without a decision was cut short, not answered.** Retry it.
+Nothing is lost: the worker finishes regardless and files the verdict, so the
+retry usually answers from the index in milliseconds. Reconnecting rejoins the
+run already in progress rather than starting a second one.
+
+Analyses run to 30 minutes on the heaviest packages. The connection is simply
+held.
+
+## The decision
+
+| `decision` | means | typical action |
+| --- | --- | --- |
+| `allow` | Analyzed. Not hostile at your budget. | proceed |
+| `block` | Analyzed. Hostile at your budget. | stop |
+| `unknown` | Nobody has analyzed this. Nothing is wrong. | your policy |
+| `unavailable` | **We could not answer.** Nothing about it. | your policy |
+
+`unknown` and `unavailable` are deliberately distinct. You may reasonably
+install unanalyzed packages while refusing to install anything during an
+outage — or the reverse. A partial answer is never an HTTP error: if we can
+decide four of five packages, that is a `200` carrying four decisions and one
+`unavailable`.
+
+An `unavailable` decision carries `null` for `severity`, `fires_at`,
+`engine_version` and `analyzed_at`, and an empty `findings`. It is a statement
+about us, not about the artifact; there is nothing in it to read.
+
+## The response object
+
+Every field is always present. Unknown is `null`, empty is `[]`.
+
+| field | type | |
+| --- | --- | --- |
+| `decision` | string | `allow`, `block`, `unknown`, `unavailable`. |
+| `purl` | string\|null | The package, canonicalized. |
+| `sha256` | string\|null | The exact bytes analyzed. |
+| `severity` | string\|null | `benign`, `suspicious`, `hostile`. |
+| `fires_at` | int\|null | Tightest budget at which this grades hostile. |
+| `reason` | string\|null | One sentence, when we have one. |
+| `findings` | array | At most three, worst first. Empty unless one fired. |
+| `engine_version` | string\|null | Scanner build that produced it. |
+| `analyzed_at` | string\|null | RFC 3339. |
+
+### fires_at and false_positive_budget
+
+Same scale, different things. `fires_at` is **measured**: the tightest
+budget, in false positives per 100 million benign files, at which this
+artifact grades hostile. Lower is worse. `-1` fires at no budget at all;
+`null` means no level applies to the record.
+
+`false_positive_budget` is **chosen**: how many false positives per 100 million
+you will tolerate. Pass it as a query parameter on either route.
+
+```
+?false_positive_budget=25     the default: strict
+?false_positive_budget=1000   looser; catches more, and more false alarms
+```
+
+`decision` is `block` when `fires_at` is at or below your budget. Tune against
+`fires_at` values you have actually seen. The default follows the deploy's own
+operating point, so a retuned fleet moves with it.
+
+A budget that is not a whole number from 0 to 65535 is a `400`, never a silent
+fall back to the default.
+
+### findings
+
+| field | type | |
+| --- | --- | --- |
+| `id` | string | Stable trait id, e.g. `objectives/execution/shell/bash`. |
+| `crit` | int | 3 notable, 4 suspicious, 5 hostile. |
+| `file` | string\|null | Path inside the artifact. |
+| `pkg` | string\|null | The component it is about. |
+| `desc` | string\|null | One line. |
+| `off` | int\|null | Byte offset within `file`. |
+| `line` | int\|null | 1-based source line. Text matches only. |
+
+`file`, `desc`, `off` and `line` are `null` when the verdict came from the
+corpus rather than from a local index; the trait and its criticality always
+arrive.
+
+Only matches native to the file they are reported on appear. An archive repeats
+its members' findings on itself; those copies are dropped in favour of the
+member's own.
 
 ## Errors
 
 ```json
-{ "error": "unknown sample" }
+{
+  "error": {
+    "code": "too_many_packages",
+    "message": "51 packages exceeds the limit of 50 for a URL."
+  }
+}
 ```
 
-`detail` is included only when it adds something the status does not.
+`code` is stable and safe to branch on. `message` is for people and may be
+reworded.
 
-A call blocks until the sample has an answer. Analyses run to 30 minutes on the
-heaviest packages, and the connection is simply held: there is no duration limit
-on a Worker request while the caller stays connected. A caller that disconnects
-loses nothing — the analysis keeps running, and reconnecting on the same key
-joins the work already in progress rather than starting it again.
+| code | status | |
+| --- | --- | --- |
+| `missing_package` | 400 | Neither `purl` nor `sha256`. |
+| `invalid_false_positive_budget` | 400 | Not a whole number from 0 to 65535. |
+| `invalid_purl` | 400 | Not a package URL. |
+| `invalid_sha256` | 400 | Not 64 hexadecimal characters. |
+| `too_many_packages` | 413 | Over 50 in one URL. Use several requests. |
 
-| code | |
+Beamline's own refusals, such as an unauthenticated request or an unknown
+route, answer `{"error":"unauthorized"}` and the like, without a code.
+
+| status | |
 | --- | --- |
-| 202 | `{"state":"pending"}`. Honor `Retry-After`; it is jittered, so do not pin it. Rare: the call blocks while an analysis somebody else already started completes, and only gives up on a 202 when that outruns the request budget. |
-| 400 | Bad sha256 or PURL. |
-| 401 | Bad bearer token. |
-| 413 | Too large. |
-| 415 | Body we will not accept. |
-| 422 | Bytes we cannot analyze. |
-| 404 | No such route or sample. |
-| 405 | Right route, wrong method. `Allow` names the one that works: `/lookup` is GET, `/analyze` is POST. |
-| 429 | At capacity. |
-| 503 | Unavailable. No worker could be reached, and nothing is running on the sample. It does not mean the analysis was slow: a sample that outruns the 125s edge ceiling is waited out rather than failed, because the worker finishes it and files the verdict regardless. |
-| 504 | Timed out. |
+| 200 | A decision, or a list of them. Includes `unknown` and `unavailable`. |
+| 400 | Your request. See `code`. |
+| 401 | Bad or missing bearer token. |
+| 404 | No such route. |
+| 405 | Right route, wrong method. `Allow` names the one that works. |
+| 413 | Too many packages. |
+| 429 | At capacity. Retry; it is jittered on our side. |
+
+There is no `503` for a package we could not reach a worker for. That is a
+`200` carrying `unavailable`.
+
+## Headers
+
+| header | |
+| --- | --- |
+| `X-Request-Id` | Send your own to correlate with our logs. |
+| `X-Beamline-Source` | `cache`, `scan`, `none`. Operators only. |
+| `X-Beamline-Worker` | Which worker answered. For operators. |
+| `Cache-Control` | See below. |
+| `Content-Type` | `application/json`; `x-ndjson` from `/v1/analyze`. |
+
+## Caching
+
+A verdict is immutable for the engine that produced it and is cached for an
+hour. Not knowing is cached for a minute — it stops being true the moment
+anything analyzes the artifact. `unavailable` is never cached; it describes this
+moment's reachability.
+
+`false_positive_budget` is part of the cache key: two callers on different
+budgets are asking different questions.
+
+The scope is `private` on an authenticated deployment — a verdict is knowledge
+about your artifact, not public data.
+
+`/v1/analyze` is never cached, but a decision it produces populates the lookup
+cache for that package.

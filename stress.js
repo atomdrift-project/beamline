@@ -29,6 +29,11 @@ const hopperToken = (process.env.HOPPER_TOKEN || "").trim() || readToken("hopper
 const scanUrl = trimSlash((process.env.SCAN_URL || "").split(",")[0]);
 const hopperUrl = trimSlash(process.env.HOPPER_URL);
 const outPath = process.env.STRESS_OUT || "";
+// Which surface to exercise. v1 is the default because it is the one under
+// development and the one a customer will hold; API=legacy still reaches the
+// older routes while they exist, so a run can be pointed at either without
+// keeping two harnesses in step.
+const api = (process.env.API || "v1").trim().toLowerCase() === "legacy" ? "legacy" : "v1";
 const popular = process.env.POPULAR === "1";
 const analyzeMisses = process.env.ANALYZE_MISSES === "1";
 const timeoutMs = Number(process.env.SCAN_TIMEOUT_MS) || 1_800_000;
@@ -323,11 +328,27 @@ async function fetchGo(limit) {
 // the PURL and no bytes, so scan resolves the artifact from the registry itself
 // and the provenance it grafts into the report comes from the same fetch.
 async function submit(item) {
+  return api === "v1" ? submitV1(item) : submitLegacy(item);
+}
+
+async function submitLegacy(item) {
   const looked = await ask(item, `${beamlineUrl}/lookup?purl=${encodeURIComponent(item.purl)}`, "GET");
   const answered = !analyzeMisses || looked.status !== 404 ? looked : null;
   if (answered) return { ...answered, both: await bothProbe(item, answered) };
   const analyzed = await ask(item, `${beamlineUrl}/analyze?purl=${encodeURIComponent(item.purl)}`, "POST");
   return { ...analyzed, analyzed: true, lookupMs: looked.ms, both: await bothProbe(item, analyzed) };
+}
+
+// The v1 shape of the same pass. A lookup that nobody has analyzed answers 200
+// with `decision: unknown` rather than a 404, so what counts as a miss is a
+// field rather than a status — which is the whole point of the contract and
+// therefore worth exercising exactly as a client would read it.
+async function submitV1(item) {
+  const looked = await ask(item, `${beamlineUrl}/v1/lookup?purl=${encodeURIComponent(item.purl)}`, "GET");
+  const known = looked.decision && looked.decision !== "unknown";
+  if (!analyzeMisses || known) return { ...looked, both: await bothProbeV1(item, looked) };
+  const analyzed = await askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}`);
+  return { ...analyzed, analyzed: true, lookupMs: looked.ms, both: await bothProbeV1(item, analyzed) };
 }
 
 // Re-ask with both keys, which is the shape a real client is in after its first
@@ -336,6 +357,13 @@ async function submit(item) {
 // moment apart — the only comparison that controls for what the corpus holds.
 //
 // Skipped when the first answer produced no digest; there is nothing to pair.
+async function bothProbeV1(item, prior) {
+  if (!prior?.sha || !/^[0-9a-f]{64}$/.test(prior.sha)) return null;
+  const url = `${beamlineUrl}/v1/lookup?purl=${encodeURIComponent(item.purl)}&sha256=${prior.sha}`;
+  const probed = await ask(item, url, "GET");
+  return { ms: probed.ms, status: probed.status, source: probed.source };
+}
+
 async function bothProbe(item, prior) {
   if (!prior?.sha || !/^[0-9a-f]{64}$/.test(prior.sha)) return null;
   const url = `${beamlineUrl}/lookup?purl=${encodeURIComponent(item.purl)}&sha256=${prior.sha}`;
@@ -354,25 +382,108 @@ async function ask(item, url, method) {
     // Whether we authenticated decides the scope the answer must carry, and
     // only the caller knows that — so it is passed in rather than read from
     // module state, which would make the check untestable either way.
-    const issues = checkApi(resp.status, resp.headers, body, item.purl, token ? "private" : "public");
+    const issues =
+      api === "v1"
+        ? checkV1(resp.status, body, item.purl)
+        : checkApi(resp.status, resp.headers, body, item.purl, token ? "private" : "public");
     return row(item, {
       ms,
       status: resp.status,
+      decision: body && body.decision,
       source: resp.headers.get("x-beamline-source") || "",
       worker: resp.headers.get("x-beamline-worker") || "",
-      sha: (body && body.sha) || resp.headers.get("x-sha256") || "",
+      sha: (body && (body.sha || body.sha256)) || resp.headers.get("x-sha256") || "",
       encoding: resp.headers.get("content-encoding") || "",
       error: body && body.error,
       detail: body && body.detail,
       state: body && body.state,
-      lvl: body && body.lvl,
-      eng: body && body.eng,
-      hits: body && body.hits ? body.hits.length : 0,
+      lvl: body && (body.lvl ?? body.fires_at),
+      eng: body && (body.eng || body.engine_version),
+      hits: body && (body.hits || body.findings) ? (body.hits || body.findings).length : 0,
       issues,
     });
   } catch (err) {
     return row(item, { ms: Date.now() - t0, status: 0, error: err.message || String(err), issues: [err.message || String(err)] });
   }
+}
+
+// Read a v1 analysis, which answers as a stream: progress while the run is
+// going, then the decision. Timed to the decision rather than the first byte —
+// the first byte arrives in about a second by design, and reporting that as the
+// latency would flatter every measurement this harness exists to take.
+//
+// `frames` is what proves the connection was talking. A long analysis that
+// reports zero progress frames has gone silent, which is the failure this route
+// was built to end, so it is counted rather than assumed.
+async function askStream(item, url) {
+  const headers = { accept: "application/x-ndjson" };
+  if (token) headers.authorization = `Bearer ${token}`;
+  const t0 = Date.now();
+  try {
+    const resp = await get(url, timeoutMs + 10_000, headers, "POST");
+    if (resp.status !== 200) {
+      const body = await readJson(resp).catch(() => null);
+      return row(item, {
+        ms: Date.now() - t0,
+        status: resp.status,
+        source: resp.headers.get("x-beamline-source") || "",
+        worker: resp.headers.get("x-beamline-worker") || "",
+        error: body?.error?.code || body?.error,
+        issues: [`analyze status ${resp.status}`],
+      });
+    }
+    let frames = 0;
+    let decision = null;
+    let firstMs = 0;
+    for await (const line of ndjson(resp)) {
+      if (!firstMs) firstMs = Date.now() - t0;
+      if (line.decision) {
+        decision = line;
+        break;
+      }
+      frames += 1;
+    }
+    const ms = Date.now() - t0;
+    if (!decision) {
+      // No decision line means the stream was cut short, not that the answer
+      // was negative. Recorded as a defect: a client that took the last frame
+      // for an answer would file a verdict nobody produced.
+      return row(item, { ms, status: 200, frames, issues: ["stream ended with no decision"] });
+    }
+    return row(item, {
+      ms,
+      firstMs,
+      frames,
+      status: 200,
+      source: resp.headers.get("x-beamline-source") || "",
+      worker: resp.headers.get("x-beamline-worker") || "",
+      decision: decision.decision,
+      sha: decision.sha256 || "",
+      lvl: decision.fires_at,
+      eng: decision.engine_version,
+      hits: decision.findings ? decision.findings.length : 0,
+      issues: checkV1(200, decision, item.purl),
+    });
+  } catch (err) {
+    return row(item, { ms: Date.now() - t0, status: 0, error: err.message || String(err), issues: [err.message || String(err)] });
+  }
+}
+
+// Yield each JSON line of a streamed body as it arrives.
+async function* ndjson(resp) {
+  const decoder = new TextDecoder();
+  let buffered = "";
+  for await (const chunk of resp.body) {
+    buffered += decoder.decode(chunk, { stream: true });
+    const lines = buffered.split("\n");
+    buffered = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed) yield JSON.parse(trimmed);
+    }
+  }
+  const tail = buffered.trim();
+  if (tail) yield JSON.parse(tail);
 }
 
 async function readJson(resp) {
@@ -392,9 +503,54 @@ const ALLOWED_200 = new Set(["sha", "purl", "lvl", "eng", "why", "hits"]);
 // missing here, so every response carrying a located hit — which is the useful
 // kind — was reported as an API violation. The harness was stale, not the API.
 const ALLOWED_HIT = new Set(["id", "crit", "file", "pkg", "desc", "off", "line"]);
-const SOURCES = new Set(["cache", "scan-cache", "bloom", "hopper", "scan"]);
+const SOURCES = new Set(["cache", "scan-cache", "bloom", "hopper", "scan", "none"]);
+// Every key a v1 decision carries, and every key it may carry — the contract is
+// that the shape never moves, so a field appearing or vanishing is a defect
+// rather than a variation.
+const V1_REQUIRED = ["decision", "purl", "sha256", "severity", "fires_at", "reason", "findings", "engine_version", "analyzed_at"];
+const V1_DECISIONS = new Set(["allow", "block", "unknown", "unavailable"]);
+const V1_SEVERITIES = new Set(["benign", "suspicious", "hostile"]);
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DOC_STATUS = new Set([200, 202, 400, 401, 413, 415, 422, 404, 429, 503, 504, 500]);
+
+// A v1 decision, checked as a client would have to read it.
+//
+// The shape never moving is the contract, so absence is a defect and not a
+// variation: a caller writing one code path against nine keys is exactly what
+// "null rather than missing" buys, and it is only true if nothing drops one.
+function checkV1(status, body, askedPurl) {
+  const issues = [];
+  if (status !== 200) return issues;
+  if (!body || typeof body !== "object") return ["v1 body is not an object"];
+  for (const key of V1_REQUIRED) {
+    if (!(key in body)) issues.push(`v1 missing ${key}`);
+  }
+  if (!V1_DECISIONS.has(body.decision)) issues.push(`v1 decision ${JSON.stringify(body.decision)}`);
+  if (body.severity !== null && !V1_SEVERITIES.has(body.severity)) {
+    issues.push(`v1 severity ${JSON.stringify(body.severity)}`);
+  }
+  if (!Array.isArray(body.findings)) issues.push("v1 findings is not a list");
+  // A decision that says nothing was found must not carry a level, and one that
+  // could not be reached must carry nothing about the artifact at all: reading
+  // anything into either is how a caller ends up treating our outage as
+  // evidence about a package.
+  if (body.decision === "unavailable" || body.decision === "unknown") {
+    if (body.fires_at !== null) issues.push(`${body.decision} carried fires_at=${body.fires_at}`);
+    if (body.severity !== null) issues.push(`${body.decision} carried a severity`);
+    if (Array.isArray(body.findings) && body.findings.length) {
+      issues.push(`${body.decision} carried findings`);
+    }
+  }
+  // A block must be able to say why, or the developer whose build it stops has
+  // nothing to act on.
+  if (body.decision === "block" && !body.reason && !(body.findings || []).length) {
+    issues.push("block carried neither a reason nor a finding");
+  }
+  if (askedPurl && body.purl && body.purl !== askedPurl) {
+    issues.push(`answered about ${body.purl}, asked about ${askedPurl}`);
+  }
+  return issues;
+}
 
 function checkApi(status, headers, body, askedPurl, scope) {
   const issues = [];
@@ -504,7 +660,15 @@ function row(item, extra) {
 function classify(r) {
   if (r.issues && r.issues.length) return "bug";
   if (!r.status) return "bug";
-  if (r.status === 200) return "ok";
+  if (r.status === 200) {
+    // v1 answers about the corpus in the body: nothing analyzed is a miss and
+    // an outage is not an answer at all, both at 200. Reading only the status
+    // here would report an outage as a success, which is the exact confusion
+    // the four decisions exist to prevent.
+    if (r.decision === "unknown") return "miss";
+    if (r.decision === "unavailable") return "note";
+    return "ok";
+  }
   // /lookup is read-only, so a 404 is the correct answer for something nothing
   // has analyzed yet — a fact about the corpus, not a defect. It gets its own
   // bucket because the hit rate is the number this run exists to report.
@@ -521,6 +685,8 @@ function logRow(r) {
   const eco = r.eco.padEnd(6);
   const ms = String(r.ms).padStart(6);
   let extra = r.status === 200 ? `lvl=${r.lvl}` : `${r.status} ${r.error || r.state || ""}`;
+  if (r.decision) extra = `${r.decision} ${extra}`;
+  if (r.frames !== undefined) extra += ` frames=${r.frames}${r.firstMs ? ` first=${r.firstMs}ms` : ""}`;
   if (r.sha) extra += ` sha=${String(r.sha).slice(0, 12)}`;
   if (r.issues && r.issues.length) extra += ` [${r.issues.join("; ")}]`;
   process.stderr.write(`${tag} ${ms}ms ${src} ${eco} ${r.purl}  ${extra}${how}\n`);
@@ -849,6 +1015,7 @@ function trimSlash(s) {
 }
 
 export const _test = {
+  checkV1,
   npmPurl,
   pypiPurl,
   cargoPurl,
