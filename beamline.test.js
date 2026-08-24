@@ -764,6 +764,128 @@ test("v1: a cached answer carries the TTL its own content earns", async () => {
   }
 });
 
+// A lookup that reached a worker has just learned the artifact's identity. The
+// next caller who knows only that identity should not have to reach a worker to
+// learn the same thing.
+test("v1 lookup: an answer from scan is filed under its digest too", async () => {
+  const sha = "c3d4e5f6".repeat(8);
+  const scan = await mockBackend({
+    v1: () => ({
+      decision: "block", purl: "pkg:npm/evil@1.0.0", sha256: sha, severity: "malicious",
+      fires_at: 3, reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+    }),
+  });
+  const cache = _test.memoryCache();
+  const env = testEnv(DEAD, { SCAN_URL: scan.url, cache });
+  const ctx = waitCtx();
+  try {
+    await (await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
+      env,
+      ctx.ctx,
+    )).text();
+    await ctx.flush();
+
+    const byDigest = await handle(
+      new Request(`http://beamline/v1/lookup?sha256=${sha}`),
+      env,
+      noopCtx(),
+    );
+    assert.equal(byDigest.headers.get("x-beamline-source"), "cache", "the digest door was left shut");
+    assert.equal((await byDigest.json()).decision, "block");
+    assert.equal(scan.hits.v1, 1, "the digest lookup cost a second trip to a worker");
+  } finally {
+    await scan.close();
+  }
+});
+
+// Answering /v1/analyze from cache returns before the warm-write ever runs, so
+// a warm PURL key used to leave the digest key cold indefinitely — and
+// answering those callers never fixed it either.
+test("v1 analyze: answering from cache still opens the digest door", async () => {
+  const sha = "d4e5f6a7".repeat(8);
+  const decision = JSON.stringify({
+    decision: "block", purl: "pkg:npm/evil@1.0.0", sha256: sha, severity: "malicious",
+    fires_at: 3, reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+  });
+  const cache = _test.memoryCache();
+  // The state this exists for: the PURL key warm, the digest key cold.
+  await cache.put(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
+    new Response(decision, {
+      status: 200,
+      headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" },
+    }),
+  );
+  const scan = await mockBackend({ analyzeStream: [decision] });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url, cache });
+  const ctx = waitCtx();
+  try {
+    const analyzed = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    assert.equal(analyzed.headers.get("x-beamline-source"), "cache", "precondition: it was answered from cache");
+    await analyzed.text();
+    await ctx.flush();
+    assert.equal(scan.hits.analyze, 0, "precondition: no analysis was dispatched");
+
+    const filed = await cache.match(new Request(`http://beamline/v1/lookup?sha256=${sha}`));
+    assert.ok(filed, "the digest key was left cold by an answer that named the digest");
+    assert.equal(JSON.parse(await filed.text()).decision, "block");
+  } finally {
+    await scan.close();
+  }
+});
+
+// The check before the write is the point. Rewriting a key every time it is read
+// would refresh its TTL forever, and an entry that never ages is pinned rather
+// than cached — a verdict is allowed to go stale on schedule.
+test("v1 analyze: the digest back-fill never refreshes an entry already there", async () => {
+  const sha = "e5f6a7b8".repeat(8);
+  const decision = JSON.stringify({
+    decision: "block", purl: "pkg:npm/evil@1.0.0", sha256: sha, severity: "malicious",
+    fires_at: 3, reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+  });
+  const inner = _test.memoryCache();
+  let puts = 0;
+  const cache = {
+    match: (req) => inner.match(req),
+    put: (req, res) => {
+      puts += 1;
+      return inner.put(req, res);
+    },
+  };
+  const key = (q) => new Request(`http://beamline/v1/lookup?${q}`);
+  const stored = (body) =>
+    new Response(body, {
+      status: 200,
+      headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" },
+    });
+  await inner.put(key("purl=pkg%3Anpm%2Fevil%401.0.0"), stored(decision));
+  await inner.put(key(`sha256=${sha}`), stored(decision));
+
+  const scan = await mockBackend({ analyzeStream: [decision] });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url, cache });
+  try {
+    for (let i = 0; i < 3; i++) {
+      const ctx = waitCtx();
+      const res = await handle(
+        new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", { method: "POST" }),
+        env,
+        ctx.ctx,
+      );
+      assert.equal(res.headers.get("x-beamline-source"), "cache");
+      await res.text();
+      await ctx.flush();
+    }
+    assert.equal(puts, 0, `a cache hit rewrote its own keys ${puts} times, which pins them alive`);
+  } finally {
+    await scan.close();
+  }
+});
+
 // A worker mid-analysis attaches a second request for the same key to the run
 // already going, so a caller who reconnected belongs back on it. Anywhere else
 // pays for the whole analysis a second time — which on the samples this matters

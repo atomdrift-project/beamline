@@ -226,7 +226,7 @@ async function handleV1Lookup(env, ctx, url) {
     return res;
   }
 
-  return v1Ask(env, ctx, cache, cacheKey, path, sha, purls);
+  return v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budgetRaw);
 }
 
 // Ask the workers in turn until one answers.
@@ -235,8 +235,9 @@ async function handleV1Lookup(env, ctx, url) {
 // lookup spends no analysis slot, and since every worker defers to the same
 // corpus when it does not know, they now give the same answer. Broadcasting
 // would multiply the load behind them to learn nothing.
-async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls) {
+async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budgetRaw) {
   const ids = { rid: ctx.rid, sha256: sha || undefined, purl: purls[0] };
+  const origin = new URL(cacheKey.url).origin;
   const workers = await lookupOrder(env, ctx, scanWorkers(env), ids);
   const t0 = Date.now();
 
@@ -279,7 +280,17 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls) {
       breakerFor(base).ok();
       logLine("v1_lookup", { src: "scan", status: 200, worker, ms: Date.now() - t0, ...ids });
       const res = v1Body(env, answered.body, 200, worker, v1MaxAge(answered.body));
-      return v1MaxAge(answered.body) ? serveHit(ctx, cache, cacheKey, res) : res;
+      if (!v1MaxAge(answered.body)) return res;
+      // The asked-for key is stored by serveHit; the digest the answer names is
+      // stored here. A lookup by PURL that reached a worker has just learned
+      // the artifact's identity, and the next caller who knows only that
+      // identity should not have to reach a worker to learn the same thing.
+      // Skipped when they are the same key — a sha lookup has nothing to add.
+      const digestKey = `${origin}${v1CachePath(v1DecisionSha(answered.body) || "", [], budgetRaw)}`;
+      if (v1DecisionSha(answered.body) && digestKey !== cacheKey.url) {
+        waitUntil(ctx, backfillDigestKey(env, cache, origin, answered.body, budgetRaw));
+      }
+      return serveHit(ctx, cache, cacheKey, res);
     } catch {
       breakerFor(base).fail();
     }
@@ -326,6 +337,43 @@ function v1CachePath(sha, purls, budgetRaw) {
   for (const purl of purls) query.push(`purl=${encodeURIComponent(purl)}`);
   if (budgetRaw !== null) query.push(`false_positive_budget=${encodeURIComponent(budgetRaw.trim())}`);
   return `/v1/lookup?${query.join("&")}`;
+}
+
+// File an answer under its digest as well, when nothing has yet.
+//
+// A decision names the artifact it resolved to, so an answer one caller's PURL
+// paid for can serve the next caller who holds only a hash — a lockfile pin, a
+// scanner report. One question answered, both doors open.
+//
+// Only ever the digest, never the reverse. A digest is the artifact's identity
+// and cannot name a different thing; a PURL is a spelling somebody chose, and
+// filing an answer under a PURL the caller never typed would hand the next one
+// a body written for a different question.
+//
+// Checked before it is written, and that check is the point: rewriting a key
+// every time it is read would refresh its TTL forever, and an entry that never
+// ages is pinned rather than cached. A verdict is allowed to go stale on
+// schedule.
+async function backfillDigestKey(env, cache, origin, body, budgetRaw) {
+  const sha = v1DecisionSha(body);
+  if (!sha) return;
+  const maxAge = v1MaxAge(body);
+  if (!maxAge) return;
+  const key = new Request(`${origin}${v1CachePath(sha, [], budgetRaw)}`);
+  if (await cache.match(key).catch(() => null)) return;
+  await cache.put(
+    key,
+    storedCopy(
+      new Response(body, {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
+        },
+      }),
+    ),
+  );
+  logLine("v1_cache_backfill", { key: "sha256", sha, max_age: maxAge });
 }
 
 // The digest a decision names, when it names a well-formed one.
@@ -466,6 +514,12 @@ async function handleV1Analyze(request, env, ctx, url) {
     const body = hit ? await hit.text().catch(() => null) : null;
     const decided = body ? v1CachedVerdict(body) : null;
     if (decided) {
+      // Serving from cache used to warm nothing, because this path returns
+      // before the write below ever runs. So a warm PURL key left the digest
+      // key cold indefinitely: every caller holding only a hash paid a round
+      // trip to learn something we were already holding, and answering them
+      // never fixed it either.
+      waitUntil(ctx, backfillDigestKey(env, cache, url.origin, body, budgetRaw));
       logLine("v1_analyze", { src: "cache", status: 200, decision: decided.decision, ms: Date.now() - t0, ...ids });
       // Answered in the shape this route always answers in: one NDJSON line,
       // no progress frames because there was no run to report progress about.
