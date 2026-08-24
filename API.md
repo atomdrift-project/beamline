@@ -140,7 +140,9 @@ about us, not about the artifact; there is nothing in it to read.
 
 ## The response object
 
-Every field is always present. Unknown is `null`, empty is `[]`.
+Every field is always present. Unknown is `null`, empty is `[]`. This applies to
+the decision object itself; the objects inside `findings` omit what they do not
+know — see [findings](#findings).
 
 | field | type | |
 | --- | --- | --- |
@@ -188,9 +190,17 @@ fall back to the default.
 | `off` | int\|null | Byte offset within `file`. |
 | `line` | int\|null | 1-based source line. Text matches only. |
 
-`file`, `desc`, `off` and `line` are `null` when the verdict came from the
-corpus rather than from a local index; the trait and its criticality always
-arrive.
+`id` and `crit` are the only fields always present. The rest are **omitted**
+when there is nothing to say — `file`, `desc`, `off` and `line` are all absent
+when the verdict came from the corpus rather than from a local index, because
+the corpus keeps the trait and its criticality and not the detail.
+
+That is the opposite of the rule the enclosing decision object follows, and the
+two differ because the questions differ. A decision answers a fixed set of
+things, so its nine keys never move and `"engine_version": null` is itself the
+answer to "which engine". A finding has no fixed set: how much is known about
+one depends on where it came from, and four nulls would be most of the object.
+Read a finding's extras with a presence check, not a null check.
 
 Only matches native to the file they are reported on appear. An archive repeats
 its members' findings on itself; those copies are dropped in favour of the
