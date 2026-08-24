@@ -6,14 +6,16 @@ Two routes. `/v1/lookup` reports what is already known; `/v1/analyze` finds out.
 GET  /v1/lookup?purl={purl}                   free, cacheable, never analyzes
 GET  /v1/lookup?sha256={64hex}
 GET  /v1/lookup?purl=a&purl=b                 up to 50 per URL
-POST /v1/analyze?purl={purl}                  spends an analysis slot; streams
-POST /v1/analyze                              the artifact as the raw body
+POST /v1/analyze?purl={purl}                  answers from cache or spends an
+POST /v1/analyze                              analysis slot; streams. The
+                                              artifact may be the raw body
 
 GET  /healthz    (also /_/health)             liveness; no token required
 GET  /_/routes                                the router's own reasoning
 ```
 
-Only `/v1/analyze` costs anything.
+Only `/v1/analyze` costs anything, and only when the answer is not already
+known.
 
 If `BEAMLINE_TOKEN` is set, every route except the health checks requires
 `Authorization: Bearer …`. Your token authenticates you to us and travels no
@@ -258,5 +260,19 @@ budgets are asking different questions.
 The scope is `private` on an authenticated deployment — a verdict is knowledge
 about your artifact, not public data.
 
-`/v1/analyze` is never cached, but a decision it produces populates the lookup
-cache for that package.
+A decision produced by `/v1/analyze` populates the lookup cache for that
+package, and `/v1/analyze` reads that same cache before it dispatches. Asking
+the expensive way twice therefore costs one analysis, not two: the second call
+returns the stored verdict as a single NDJSON line carrying
+`X-Beamline-Source: cache`, with no progress frames, because there was no run to
+report progress about.
+
+Three things never answer from the cache:
+
+- an **upload**, which is a request to analyze *those bytes*. A PURL sent
+  alongside one names provenance, not the artifact in hand.
+- a cached `unknown` or `unavailable`. Neither is an analysis: the first says
+  nobody has analyzed the package, which is what you are asking us to change,
+  and the second says we could not find out.
+- a request carrying `X-Beamline-Pin`, which exists to time a specific
+  backend.

@@ -29,6 +29,10 @@ const MEMORY_CACHE_MAX = 1024;
 const HIT_LIMIT = 3;
 const HIT_MIN_CRIT = 3;
 const SCAN_RETRIES = 5;
+// The share of an analysis's own budget that may be spent waiting for a slot.
+// Half: a caller who allows thirty minutes for an answer would rather spend
+// fifteen of them queueing than be told we could not find out.
+const BUSY_BUDGET_SHARE = 0.5;
 const SCAN_RETRY_BASE_MS = 1_000;
 const SCAN_RETRY_MAX_MS = 30_000;
 
@@ -197,19 +201,27 @@ async function handleV1Lookup(env, ctx, url) {
   // The budget is part of the question, so it is part of the cache key. Two
   // callers on different budgets are asking different things about the same
   // artifact and must not be served each other's answer.
-  const query = [];
-  if (sha) query.push(`sha256=${encodeURIComponent(sha)}`);
-  for (const purl of purls) query.push(`purl=${encodeURIComponent(purl)}`);
-  if (budgetRaw !== null) query.push(`false_positive_budget=${encodeURIComponent(budgetRaw.trim())}`);
-  const path = `/v1/lookup?${query.join("&")}`;
+  const path = v1CachePath(sha, purls, budgetRaw);
 
   const cache = await getCache(env);
   const cacheKey = new Request(`${url.origin}${path}`);
   const hit = ctx.pin ? null : await cache.match(cacheKey);
   if (hit) {
-    const res = new Response(hit.body, hit);
+    // Buffered rather than streamed through, because the answer decides how
+    // long the caller may hold it. Decisions are one small object.
+    const body = await hit.text();
+    const res = new Response(body, hit);
     res.headers.set("X-Beamline-Source", "cache");
-    res.headers.set("cache-control", clientScope(env, hit.headers.get("cache-control")));
+    // Derived from the answer, never read back from the cache.
+    //
+    // What comes back is whatever the platform decided to store the directive
+    // as, which is not what we asked for: measured on api.isotope13.ai, an
+    // entry written `max-age=60` reads back `max-age=14400`, because the zone's
+    // edge TTL overrides the worker's. Our own eviction still honours the 60s —
+    // an `unknown` really is gone a minute later — but the caller was being
+    // told to hold it for four hours, which is exactly the staleness the short
+    // TTL exists to prevent.
+    res.headers.set("cache-control", clientScope(env, v1MaxAge(body)));
     res.headers.delete("X-Beamline-Worker");
     return res;
   }
@@ -301,6 +313,52 @@ function v1Unavailable(sha, purl) {
   };
 }
 
+// The cache key a v1 decision is stored under.
+//
+// One builder for every path that touches it: /v1/lookup reads and writes it,
+// and /v1/analyze reads it before dispatching and writes it afterwards. These
+// were three separate string literals saying the same thing, and a key that
+// differs by one character between the writer and the reader is a cache that
+// never hits and never says why.
+function v1CachePath(sha, purls, budgetRaw) {
+  const query = [];
+  if (sha) query.push(`sha256=${encodeURIComponent(sha)}`);
+  for (const purl of purls) query.push(`purl=${encodeURIComponent(purl)}`);
+  if (budgetRaw !== null) query.push(`false_positive_budget=${encodeURIComponent(budgetRaw.trim())}`);
+  return `/v1/lookup?${query.join("&")}`;
+}
+
+// The digest a decision names, when it names a well-formed one.
+function v1DecisionSha(body) {
+  let row;
+  try {
+    row = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  const sha = row && typeof row === "object" ? row.sha256 : null;
+  return typeof sha === "string" && SHA_RE.test(sha) ? sha : null;
+}
+
+// A cached body /v1/analyze may answer with, or null.
+//
+// `unknown` and `unavailable` are both cacheable — briefly, and for the
+// lookup's benefit — and neither one is an analysis. Answering /v1/analyze
+// with either would tell a caller who just asked us to analyze an artifact
+// that nobody has analyzed it. Only a real verdict may stand in for the run.
+function v1CachedVerdict(body) {
+  let row;
+  try {
+    row = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+  const decision = row.decision;
+  if (typeof decision !== "string" || decision === "unknown" || decision === "unavailable") return null;
+  return row;
+}
+
 // How long this answer may be cached. A body carrying any `unavailable` is not
 // cacheable at all, and one carrying any `unknown` is cacheable only briefly:
 // both become wrong on their own schedule, and neither is a verdict.
@@ -388,6 +446,44 @@ async function handleV1Analyze(request, env, ctx, url) {
   const ids = { rid: ctx.rid, purl: purl || undefined, bytes: bytes ? bytes.byteLength : undefined };
   const t0 = Date.now();
 
+  // Already answered?
+  //
+  // This is the expensive door into the question /v1/lookup asks cheaply, and
+  // the two share a cache key precisely so that asking the expensive way twice
+  // costs one analysis rather than two. Nothing on this path used to look:
+  // measured before this existed, three consecutive analyses of
+  // pkg:cargo/tokio@1.40.0 ran 291s, 161s and 116s, each re-deriving a verdict
+  // the cache could have returned in one hop.
+  //
+  // Only for a named package. An upload is a request to analyze *those bytes*,
+  // and the PURL riding along with one names provenance rather than the thing
+  // being asked about, so it cannot stand in for the artifact. `pin` bypasses,
+  // exactly as it does on the lookup: it exists to time a specific backend.
+  if (purl && !bytes && !ctx.pin) {
+    const cache = await getCache(env);
+    const key = new Request(`${url.origin}${v1CachePath(null, [purl], budgetRaw)}`);
+    const hit = await cache.match(key).catch(() => null);
+    const body = hit ? await hit.text().catch(() => null) : null;
+    const decided = body ? v1CachedVerdict(body) : null;
+    if (decided) {
+      logLine("v1_analyze", { src: "cache", status: 200, decision: decided.decision, ms: Date.now() - t0, ...ids });
+      // Answered in the shape this route always answers in: one NDJSON line,
+      // no progress frames because there was no run to report progress about.
+      return new Response(`${body.trimEnd()}\n`, {
+        status: 200,
+        headers: {
+          "content-type": "application/x-ndjson",
+          "cache-control": "no-store",
+          "X-Beamline-Source": "cache",
+        },
+      });
+    }
+    // Why we are about to spend an analysis slot. Without this a cache that
+    // never hits and a cache that is never consulted look identical in the
+    // logs, which is how the warm-write below went unnoticed.
+    logLine("v1_analyze_uncached", { reason: hit ? "not_a_verdict" : "cold", ...ids });
+  }
+
   // Who is already running it, asked once rather than per attempt. A worker
   // mid-analysis attaches a second request for the same key to the run in
   // progress rather than starting another beside it, so a caller who
@@ -397,14 +493,28 @@ async function handleV1Analyze(request, env, ctx, url) {
   const tries = numEnv(env, "SCAN_RETRIES", SCAN_RETRIES);
   const backoffBase = numEnv(env, "SCAN_RETRY_BASE_MS", SCAN_RETRY_BASE_MS);
 
+  // How long to keep offering work to a fleet that is merely full.
+  //
+  // Busy and broken wear the same answer and are not the same claim. A worker
+  // that refuses has told us it has the capacity and is using it: a slot will
+  // free, and the only question is whether we are still here when it does. A
+  // worker we could not reach has told us nothing of the sort, and retrying it
+  // buys nothing.
+  //
+  // The old budget did not make that distinction, and the numbers say it must:
+  // an analysis runs 8s at p50 and 53s at p90, while five attempts expire after
+  // ~30s. Beamline gave up on a saturated fleet while every worker was
+  // legitimately busy and about to free — reporting "we could not find out"
+  // about work nobody had refused on its merits. So a busy fleet is waited on
+  // against the same clock the analysis itself is promised, and a broken one
+  // keeps the short budget.
+  const busyDeadline = t0 + numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS) * BUSY_BUDGET_SHARE;
   for (let attempt = 0; ; attempt++) {
-    const answered = await v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, bytes);
+    const pass = { busy: 0, broken: 0 };
+    const answered = await v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, bytes, pass);
     if (answered) return answered;
-    // Every worker refused. They are busy rather than broken — scan refuses the
-    // instant a slot is asked for — so the work is worth offering again once
-    // one of them has finished something, rather than telling the caller we
-    // could not find out when in fact we never asked past a full moment.
-    if (attempt >= tries || !scanWorkers(env).length) break;
+    const stillWorthOffering = pass.busy > 0 && Date.now() < busyDeadline;
+    if ((attempt >= tries && !stillWorthOffering) || !scanWorkers(env).length) break;
     const wait = backoff(backoffBase, attempt, SCAN_RETRY_MAX_MS);
     logLine("v1_analyze_retry", { attempt: attempt + 1, of: tries, wait_ms: Math.round(wait), ...ids });
     await sleep(wait, ctx);
@@ -423,7 +533,7 @@ async function handleV1Analyze(request, env, ctx, url) {
 
 // One pass over the fleet. Returns the response, or null when every worker
 // refused and the pass is worth making again.
-async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, bytes) {
+async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, bytes, pass) {
   const workers = scanWorkers(env);
   let ranked = workers.length ? (await rankWorkers(env, ctx, workers, ids, { purl })).workers : [];
   if (busy) {
@@ -447,12 +557,24 @@ async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, b
         signal: ctx.signal,
       });
     } catch {
+      if (pass) pass.broken += 1;
       breakerFor(base).fail();
       continue;
     }
-    // Busy, or unwell. Either way somebody else may be able to take it, and
-    // scan refuses before it streams so nothing has been sent to the caller yet.
-    if (upstream.status === 429 || upstream.status >= 500) {
+    // Full. Somebody else may have room, and scan refuses before it streams so
+    // nothing has been sent to the caller yet.
+    //
+    // Not counted against the breaker: a worker saying "I am at capacity" is
+    // answering correctly and promptly, which is the opposite of the fault a
+    // breaker exists to detect. Counting it took healthy workers out of the
+    // pool exactly when the fleet could least afford to lose them.
+    if (upstream.status === 429) {
+      if (pass) pass.busy += 1;
+      logLine("v1_analyze", { src: "scan", status: 429, worker, busy: true, ...ids });
+      continue;
+    }
+    if (upstream.status >= 500) {
+      if (pass) pass.broken += 1;
       breakerFor(base).fail();
       logLine("v1_analyze", { src: "scan", status: upstream.status, worker, retry: true, ...ids });
       continue;
@@ -461,6 +583,7 @@ async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, b
     // request was wrong. Counted against it so a partial rollout converges on
     // the workers that can serve.
     if (upstream.status === 404) {
+      if (pass) pass.broken += 1;
       breakerFor(base).fail();
       logLine("v1_analyze", { src: "scan", status: 404, worker, no_route: true, ...ids });
       continue;
@@ -503,24 +626,57 @@ async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, b
 // truncated answer would turn one dropped connection into a wrong answer served
 // from the edge — so nothing is stored unless a decision actually arrived.
 async function cacheV1Decision(env, ctx, origin, purl, budgetRaw, stream) {
+  const ids = { rid: ctx.rid, purl };
   const decided = await lastDecision(stream);
-  if (!decided) return;
-  const query = [`purl=${encodeURIComponent(purl)}`];
-  if (budgetRaw !== null) query.push(`false_positive_budget=${encodeURIComponent(budgetRaw.trim())}`);
-  const path = `/v1/lookup?${query.join("&")}`;
-  const cache = await getCache(env);
+  if (!decided) {
+    logLine("v1_cache_write", { stored: false, reason: "no_decision", ...ids });
+    return;
+  }
   const maxAge = v1MaxAge(decided);
-  if (!maxAge) return;
-  await cache.put(
-    new Request(`${origin}${path}`),
-    new Response(decided, {
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-        "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
-      },
-    }),
-  );
+  if (!maxAge) {
+    logLine("v1_cache_write", { stored: false, reason: "uncacheable", ...ids });
+    return;
+  }
+  const cache = await getCache(env);
+  // Both ways the artifact can be named, from the one analysis that learned it.
+  //
+  // The decision carries the digest it resolved to, and a caller may well ask
+  // by that next — a lockfile pins a hash, a scanner reports one. Storing only
+  // the PURL key left `/v1/lookup?sha256=…` cold for an answer we were holding.
+  //
+  // One caveat, deliberately accepted: the body is spelled the way *this*
+  // caller named the package, so a later sha lookup reads back that spelling
+  // rather than the canonical one scan would have answered with. Both name the
+  // same artifact and the digest is the identity, but it is a spelling a
+  // different caller chose.
+  const sha = v1DecisionSha(decided);
+  const paths = [v1CachePath(null, [purl], budgetRaw)];
+  if (sha) paths.push(v1CachePath(sha, [], budgetRaw));
+  for (const path of paths) {
+    try {
+      await cache.put(
+        new Request(`${origin}${path}`),
+        // Through storedCopy, not straight to put: this used to build its own
+        // `private` response and store it directly, which Cloudflare discards.
+        // The whole warm-write did nothing in production, passed every test,
+        // and reported nothing either way.
+        storedCopy(
+          new Response(decided, {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+              "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
+            },
+          }),
+        ),
+      );
+    } catch (err) {
+      // One key failing is not a reason to abandon the other: a half-warmed
+      // cache still saves the analysis the other key would have cost.
+      logLine("v1_cache_write", { stored: false, reason: "put_failed", key: path, err: errText(err), ...ids });
+    }
+  }
+  logLine("v1_cache_write", { stored: true, max_age: maxAge, keys: paths.length, sha: sha || undefined, ...ids });
 }
 
 // The last line of an NDJSON stream that carries a decision, or null.
@@ -685,15 +841,19 @@ const MIN_CLASS_SAMPLES = 5;
 // only asking one.
 const CAPACITY_WEIGHT = 1.0;
 
-// occupancy is a worker's load in units of its own capacity: everything it is
-// running plus everything waiting for a slot, over the slots it has.
+// How busy a worker is, in units of its own capacity.
 //
-// Deliberately not clamped. Clamping was right when scan refused past full,
-// because there was nothing worse than full — every rejection cost the same hop
-// elsewhere. Now that it queues, past full is exactly where the differences
-// live: a worker at 64/64 with 200 waiting is not the same proposition as one
-// at 64/64 with nobody, and a ceiling of 1.0 scores them identically. That is
-// how a saturated worker keeps winning dispatches it should be losing.
+// Two measures of the same thing, and the larger wins. `in_flight / slots` is
+// what this server is doing; `load1 / physical_cpus` is what the machine is
+// doing. They are not added, because the server's own analyses appear in both
+// and adding would count them twice.
+//
+// The host term is not defensive programming. A scan host commonly runs the
+// pull worker beside the server, and may run an ad-hoc analysis too. Measured
+// on a 64-core node: `slots=64 slots_free=64 in_flight=0` while `load1` sat at
+// 50, because a 16-worker puller and a batch scan were between them using
+// nearly half the box. Every field the server reported was true, and a router
+// reading only those fields would have called it idle.
 //
 // Unknown slots mean an unknown answer, and 0 keeps such a worker ranked on
 // latency alone rather than inventing a penalty for it.
@@ -701,12 +861,22 @@ function occupancy(stats) {
   const slots = Number(stats?.slots);
   if (!Number.isFinite(slots) || slots <= 0) return 0;
   const running = Number(stats.in_flight ?? slots - (stats.slots_free ?? slots));
-  const waiting = Number(stats.queued);
-  const load =
-    (Number.isFinite(running) ? Math.max(0, running) : 0) +
-    (Number.isFinite(waiting) ? Math.max(0, waiting) : 0);
-  if (load <= 0) return 0;
-  return load / slots;
+  const mine = Number.isFinite(running) ? Math.max(0, running) / slots : 0;
+  return Math.max(mine, hostPressure(stats));
+}
+
+// What the whole machine is doing, over the cores it really has.
+//
+// `physical_cpus` rather than the logical count `/_/info` reports: slots are
+// sized on physical cores, and using logical would halve the apparent pressure
+// on any host with SMT — which is every host where this matters most. A worker
+// too old to report it contributes nothing rather than a guess.
+function hostPressure(stats) {
+  const cpus = Number(stats?.physical_cpus);
+  const load = Number(stats?.load1);
+  if (!Number.isFinite(cpus) || cpus <= 0) return 0;
+  if (!Number.isFinite(load) || load <= 0) return 0;
+  return load / cpus;
 }
 // The hedge is a stall detector, not a latency optimizer.
 //
@@ -827,7 +997,17 @@ function predictMs(stats, hint, mix) {
   // blended average is the honest fallback — it at least contains every size it
   // has really seen. The mix is for requests with no class at all.
   const classed = classMs(stats, hint);
-  const base = classed ?? (hint == null ? mixedMs(stats, mix) : null) ?? blendedMs(stats) ?? UNKNOWN_JOB_MS;
+  // A lookup never falls back to an analysis average. classMs() says why —
+  // "predicting it from an analysis average would be wrong by a factor of a
+  // thousand" — and this chain used to walk straight past that guard one line
+  // later, into blendedMs(). Measured in production: a worker reporting a real
+  // 71ms lookup average was predicted at 1326ms from its analysis history, and
+  // a worker with no history at all at UNKNOWN_JOB_MS, against a 116ms
+  // incumbent. Neither could ever win, so neither was ever asked, so neither
+  // ever gathered the samples that would have corrected it.
+  const base = hint?.lookup
+    ? (classed ?? UNKNOWN_JOB_MS)
+    : (classed ?? (hint == null ? mixedMs(stats, mix) : null) ?? blendedMs(stats) ?? UNKNOWN_JOB_MS);
   // How long the work takes, then how likely this worker is to take it.
   return base * (1 + CAPACITY_WEIGHT * occupancy(stats));
 }
@@ -849,9 +1029,28 @@ function lookupMsOf(stats) {
   if (!stats) return null;
   const windowed = recentMs(stats.recent_lookup);
   if (windowed != null) return windowed;
-  if (stats.lookup_samples != null && stats.lookup_samples < MIN_CLASS_SAMPLES) return null;
+  // Below the sample floor the number is thin, and it is still used.
+  //
+  // The floor is there because one job is a story rather than a statistic, and
+  // that reasoning holds for an analysis, where the alternative estimate is
+  // another analysis measurement. It does not hold here, where the alternative
+  // is this worker's *analysis* average or a flat 5000ms — not a cautious
+  // estimate but a wrong one, wrong by twenty times, and wrong in the direction
+  // that stops the worker ever being asked again. A thin measurement of the
+  // right thing beats a confident measurement of the wrong one.
+  //
+  // hasHistory() still applies the floor, so a thin number ranks but does not
+  // earn the jitter that damps herding between workers we actually trust.
   if (stats.avg_lookup_us != null) return stats.avg_lookup_us / 1000;
   return stats.avg_lookup_ms ?? null;
+}
+
+// Whether this worker's lookup estimate rests on enough samples to be trusted
+// for tie-breaking, as opposed to merely being the best number available.
+function lookupIsSettled(stats) {
+  if (!stats) return false;
+  if (recentMs(stats.recent_lookup) != null) return true;
+  return stats.lookup_samples != null && stats.lookup_samples >= MIN_CLASS_SAMPLES;
 }
 
 function classMs(stats, hint) {
@@ -948,7 +1147,7 @@ function jobMix(all) {
 // something to say.
 function hasHistory(stats, hint, mix) {
   if (!stats) return false;
-  if (hint?.lookup) return lookupMsOf(stats) != null;
+  if (hint?.lookup) return lookupIsSettled(stats);
   if (classMs(stats, hint) != null) return true;
   if (hint == null && mixedMs(stats, mix) != null) return true;
   return blendedMs(stats) != null;
@@ -1396,9 +1595,8 @@ function envelopeResponse(env, envelope, sha, source, maxAge, totalMs, purl) {
 // Our own cache is a different matter — see serveHit.
 // The scope a client's copy carries, restoring what serveHit dropped for the
 // benefit of our own cache.
-function clientScope(env, stored) {
-  const age = /max-age=(\d+)/.exec(stored || "");
-  return age ? `${cacheScope(env)}, max-age=${age[1]}` : cacheScope(env);
+function clientScope(env, maxAge) {
+  return maxAge ? `${cacheScope(env)}, max-age=${maxAge}` : cacheScope(env);
 }
 
 function cacheScope(env) {
@@ -1562,6 +1760,10 @@ function memoryCache() {
     },
     async put(req, res) {
       const cc = res.headers.get("cache-control") || "";
+      // Refused here because Cloudflare refuses them there. A stand-in that is
+      // more permissive than the real cache proves nothing: the analyze path
+      // stored `private` for as long as it existed and every test passed.
+      if (/(^|,\s*)(private|no-store|no-cache)\b/.test(cc)) return;
       const m = /max-age=(\d+)/.exec(cc);
       const maxAge = m ? Number(m[1]) : 3600;
       while (map.size >= MEMORY_CACHE_MAX) map.delete(map.keys().next().value);
@@ -1579,14 +1781,26 @@ function cacheId(req) {
   return typeof req === "string" ? req : req.url;
 }
 
-function serveHit(ctx, cache, cacheKey, res) {
+// The copy that goes into our cache.
+//
+// Cloudflare will not store a `private` response, which would silently leave
+// every token-protected deployment with no cache at all. Our cache sits behind
+// the 401 and every valid token gets the same answer, so the stored copy drops
+// the directive that the client's copy keeps.
+//
+// Every writer goes through here. When only one of them did, the other wrote
+// `private` for as long as it existed and Cloudflare dropped all of it.
+function storedCopy(res) {
   const copy = res.clone();
-  // Cloudflare will not store a `private` response, which would silently leave
-  // every token-protected deployment with no cache at all. Our cache sits
-  // behind the 401 and every valid token gets the same answer, so the stored
-  // copy drops the directive that the client's copy keeps.
   const cc = copy.headers.get("cache-control") || "";
   if (cc.startsWith("private")) copy.headers.set("cache-control", cc.replace("private", "public"));
+  return copy;
+}
+
+function serveHit(ctx, cache, cacheKey, res) {
+  // Cloned now, stored later: by the time the deferred put runs, the caller
+  // may already have consumed the body it is holding.
+  const copy = storedCopy(res);
   // A cache that throws, synchronously or not, must not fail the lookup.
   waitUntil(ctx, Promise.resolve().then(() => cache.put(cacheKey, copy)));
   return res;
@@ -1748,6 +1962,11 @@ function trimSlash(s) {
 }
 
 export const _test = {
+  occupancy,
+  predictMs,
+  hasHistory,
+  jobMix,
+  UNKNOWN_JOB_MS,
   tiedEst,
   rotate,
   scanWorkers,

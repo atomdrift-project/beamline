@@ -118,6 +118,131 @@ test("a breaker gives a recovered worker its record back", async () => {
 
 
 
+// A server's own counters describe the server, not the machine it is on.
+//
+// Measured on a 64-core node: slots=64, slots_free=64, in_flight=0 — and load1
+// at 50, because a 16-worker puller and a batch scan were sharing the box.
+// Every field the server reported was true and a router reading only those
+// fields would have called it idle.
+test("occupancy sees the machine, not just the server", () => {
+  const cores = 64;
+  const idleLooking = { slots: cores, slots_free: cores, in_flight: 0, load1: 50, physical_cpus: cores };
+  assert.ok(
+    _test.occupancy(idleLooking) > 0.7,
+    `scored ${_test.occupancy(idleLooking)} for a node with 50 of 64 cores busy`,
+  );
+
+  // Its own work still counts when that is the larger of the two.
+  const serving = { slots: 8, slots_free: 0, in_flight: 8, load1: 1, physical_cpus: 64 };
+  assert.equal(_test.occupancy(serving), 1, "a full server is full");
+
+  // Not added: the server's own analyses show up in load1 too, so summing
+  // would charge for them twice.
+  const both = { slots: 64, slots_free: 32, in_flight: 32, load1: 32, physical_cpus: 64 };
+  assert.equal(_test.occupancy(both), 0.5, "the same work was counted twice");
+
+  // A worker too old to report a core count contributes no host term rather
+  // than a guess, and is still ranked on what it does report.
+  const old = { slots: 16, slots_free: 8, in_flight: 8, load1: 40 };
+  assert.equal(_test.occupancy(old), 0.5);
+  // And an idle one is idle.
+  assert.equal(_test.occupancy({ slots: 16, slots_free: 16, in_flight: 0, load1: 0, physical_cpus: 16 }), 0);
+});
+
+
+
+// Busy and broken wear the same answer and are not the same claim.
+//
+// A worker that refuses has told us it has capacity and is using it; a slot
+// will free. The old budget gave up after five attempts — about 30 seconds —
+// while an analysis runs 8s at p50 and 53s at p90, so a saturated fleet was
+// reported as "we could not find out" about work nobody had refused on its
+// merits.
+test("a fleet that is merely full is waited on, not given up on", async () => {
+  let refusals = 0;
+  const worker = await mockBackend({
+    status: { state: "unknown" },
+    analyzeStatus: () => (++refusals <= 8 ? 429 : 200),
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/busy@1.0.0"}'],
+  });
+  // SCAN_RETRIES is 5, so eight refusals outlast the old budget entirely.
+  const env = testEnv(DEAD, { SCAN_URL: worker.url, SCAN_RETRY_BASE_MS: "1", SCAN_TIMEOUT_MS: "600000" });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fbusy%401.0.0", { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    const decided = JSON.parse((await res.text()).trim().split("\n").pop());
+    assert.equal(decided.decision, "allow", "gave up on a fleet that was only busy");
+    assert.ok(refusals > _test.BREAKER_FAILS, `only ${refusals} refusals; the budget did not stretch`);
+  } finally {
+    await worker.close();
+  }
+});
+
+
+
+// And a refusal is not a fault: a worker answering "at capacity" promptly and
+// correctly is the opposite of what a breaker exists to detect. Counting it
+// took healthy workers out of the pool exactly when the fleet could least
+// afford to lose them.
+test("being at capacity does not trip a worker's breaker", async () => {
+  const full = await mockBackend({ status: { state: "unknown" }, analyzeStatus: 429 });
+  const env = testEnv(DEAD, { SCAN_URL: full.url, SCAN_RETRY_BASE_MS: "1", SCAN_TIMEOUT_MS: "1" });
+  try {
+    await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fbusy%401.0.0", { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(
+      _test.breakerFor(full.url).open(),
+      false,
+      "a busy worker was recorded as a broken one",
+    );
+  } finally {
+    await full.close();
+  }
+});
+
+
+
+// A worker with two lookups behind it must still be reachable.
+//
+// Measured in production after a fleet restart: a worker reporting a real 71ms
+// lookup average was estimated at 1326ms — its *analysis* average, reached by a
+// fallback chain that walked past the guard saying never to do that — and a
+// worker with no history at all at a flat 5000ms. Against a 116ms incumbent
+// neither could ever win, so neither was ever asked, so neither ever gathered
+// the samples that would have corrected it. 400 of 400 lookups went to the
+// slower worker.
+test("a thin lookup average still beats an analysis average", () => {
+  const thin = { lookup_samples: 2, avg_lookup_ms: 71, recent: { samples: 40, p80_ms: 1326 }, avg_job_ms: 1326 };
+  const settled = { lookup_samples: 200, avg_lookup_ms: 86, recent_lookup: { samples: 779, p80_ms: 116 } };
+  const mix = _test.jobMix([thin, settled]);
+  const hint = { lookup: true };
+
+  const thinEst = _test.predictMs(thin, hint, mix);
+  assert.ok(thinEst < 200, `predicted ${thinEst}ms for a worker measuring 71ms`);
+  assert.ok(
+    thinEst < _test.predictMs(settled, hint, mix),
+    "the faster worker has to be able to win, or it never gets a sixth sample",
+  );
+
+  // Thin, though, is not trusted: it ranks, but it does not earn the jitter
+  // that damps herding between workers we actually have evidence for.
+  assert.equal(_test.hasHistory(thin, hint, mix), false);
+  assert.equal(_test.hasHistory(settled, hint, mix), true);
+
+  // And with nothing measured at all, a lookup still must not be priced from
+  // an analysis average.
+  const none = { recent: { samples: 40, p80_ms: 9000 }, avg_job_ms: 9000, avg_job_samples: 40 };
+  assert.equal(_test.predictMs(none, hint, mix), _test.UNKNOWN_JOB_MS);
+});
+
+
+
 // The tie band decides when two workers are close enough that picking the
 // nominally-faster one is noise-chasing, and jitter should break the tie
 // instead. A flat 250ms was a fair description of that for analyses and wider
@@ -375,6 +500,265 @@ test("v1 analyze: a truncated stream is not cached", async () => {
       waitCtx().ctx,
     );
     assert.notEqual(looked.headers.get("x-beamline-source"), "cache", "half an answer was cached as a whole one");
+  } finally {
+    await scan.close();
+  }
+});
+
+// The warm-write shipped carrying `cache-control: private`, which Cloudflare
+// will not store, so the whole cache-warming path did nothing in production
+// for as long as it existed. Every test passed: none of them set a token, and
+// without one the scope is `public` and the write lands. The token is the
+// entire point of this test — measured against the live service, three
+// consecutive analyses of pkg:cargo/tokio@1.40.0 each re-derived a verdict
+// that was supposed to already be cached.
+test("v1 analyze: the decision is cached on a token-protected deployment too", async () => {
+  const scan = await mockBackend({
+    analyzeStream: ['{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}'],
+    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_TOKEN: "s3cret" });
+  const auth = { authorization: "Bearer s3cret" };
+  const ctx = waitCtx();
+  try {
+    const analyzed = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", { method: "POST", headers: auth }),
+      env,
+      ctx.ctx,
+    );
+    await analyzed.text();
+    await ctx.flush();
+
+    const looked = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0", { headers: auth }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(looked.headers.get("x-beamline-source"), "cache", "a private answer was never stored");
+    assert.match(looked.headers.get("cache-control"), /^private/, "the client copy lost its scope");
+    assert.equal((await looked.json()).decision, "block");
+  } finally {
+    await scan.close();
+  }
+});
+
+// /v1/analyze is the expensive door into the question /v1/lookup asks cheaply.
+// Asking it twice for the same package used to cost two full analyses, because
+// nothing on the path ever looked at the cache the first one had warmed.
+test("v1 analyze: a verdict already cached is answered without a second analysis", async () => {
+  const scan = await mockBackend({
+    analyzeStream: ['{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}'],
+    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ask = () =>
+    new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", { method: "POST" });
+  const ctx = waitCtx();
+  try {
+    await (await handle(ask(), env, ctx.ctx)).text();
+    await ctx.flush();
+    assert.equal(scan.hits.analyze, 1, "precondition: the first ask analysed");
+
+    const again = await handle(ask(), env, waitCtx().ctx);
+    const body = await again.text();
+    assert.equal(scan.hits.analyze, 1, "the cached verdict was re-analysed anyway");
+    assert.equal(again.headers.get("x-beamline-source"), "cache");
+    assert.equal(again.headers.get("content-type"), "application/x-ndjson");
+    assert.equal(JSON.parse(body.trim()).decision, "block", "the cached answer was not the verdict");
+    assert.equal(body.endsWith("\n"), true, "an NDJSON answer must end its line");
+  } finally {
+    await scan.close();
+  }
+});
+
+// `unknown` is cacheable — briefly, and for the lookup's benefit — and it is
+// not an analysis. Serving it here would answer "nobody has analyzed this" to
+// a caller who just asked us to analyze it.
+test("v1 analyze: a cached `unknown` is not an answer to `analyze`", async () => {
+  const scan = await mockBackend({
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/fresh@1.0.0"}'],
+    v1: () => ({ decision: "unknown", purl: "pkg:npm/fresh@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
+  try {
+    await (await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Ffresh%401.0.0"),
+      env,
+      ctx.ctx,
+    )).text();
+    await ctx.flush();
+    const warm = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Ffresh%401.0.0"),
+      env,
+      noopCtx(),
+    );
+    assert.equal(warm.headers.get("x-beamline-source"), "cache", "precondition: the unknown was cached");
+
+    const analyzed = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Ffresh%401.0.0", { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    const body = await analyzed.text();
+    assert.equal(scan.hits.analyze, 1, "a cached `unknown` was served instead of analysing");
+    assert.equal(JSON.parse(body.trim()).decision, "allow");
+  } finally {
+    await scan.close();
+  }
+});
+
+// An upload is a request to analyze *those bytes*. The PURL riding along with
+// one names provenance, not the thing being asked about, so a verdict cached
+// under it cannot stand in for the artifact in hand.
+test("v1 analyze: an upload is analysed even when its PURL has a cached verdict", async () => {
+  const scan = await mockBackend({
+    analyzeStream: ['{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}'],
+    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
+  try {
+    await (await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    )).text();
+    await ctx.flush();
+    assert.equal(scan.hits.analyze, 1, "precondition: the PURL was analysed once");
+
+    const uploaded = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", {
+        method: "POST",
+        body: "these bytes are not that package",
+      }),
+      env,
+      waitCtx().ctx,
+    );
+    await uploaded.text();
+    assert.equal(scan.hits.analyze, 2, "an upload was answered from a cache keyed by its PURL");
+  } finally {
+    await scan.close();
+  }
+});
+
+// A decision names the artifact it resolved to, and a caller may well ask by
+// that digest next — a lockfile pins a hash, a scanner reports one. Storing
+// only the PURL key left `/v1/lookup?sha256=…` cold for an answer already in
+// hand, and paid for a second analysis to learn it again.
+test("v1 analyze: the decision is cached under its digest as well as its PURL", async () => {
+  const sha = "a1b2c3d4".repeat(8);
+  const scan = await mockBackend({
+    analyzeStream: [`{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0","sha256":"${sha}"}`],
+    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
+  try {
+    await (await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    )).text();
+    await ctx.flush();
+    const analyses = scan.hits.analyze;
+
+    const bySha = await handle(
+      new Request(`http://beamline/v1/lookup?sha256=${sha}`),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(bySha.headers.get("x-beamline-source"), "cache", "the digest key was never warmed");
+    assert.equal((await bySha.json()).decision, "block");
+
+    // The digest key is an addition, not a replacement.
+    const byPurl = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(byPurl.headers.get("x-beamline-source"), "cache", "warming the digest key cost the PURL key");
+    assert.equal(scan.hits.analyze, analyses, "a lookup spent an analysis");
+  } finally {
+    await scan.close();
+  }
+});
+
+// A decision with no digest still warms the key it does have. Nothing about a
+// missing `sha256` makes the PURL answer less true.
+test("v1 analyze: a decision naming no digest still caches under its PURL", async () => {
+  const scan = await mockBackend({
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/evil@1.0.0","sha256":null}'],
+    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
+  try {
+    await (await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fevil%401.0.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    )).text();
+    await ctx.flush();
+    const looked = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(looked.headers.get("x-beamline-source"), "cache", "a digestless decision was not cached at all");
+    assert.equal((await looked.json()).decision, "allow");
+  } finally {
+    await scan.close();
+  }
+});
+
+// The TTL a caller is told is derived from the answer, never read back from
+// the cache. Measured on api.isotope13.ai: an entry written `max-age=60` reads
+// back `max-age=14400`, because the zone's edge TTL overrides the worker's. Our
+// own eviction still honours the 60s, so the effect was purely to tell callers
+// to hold a one-minute answer for four hours.
+test("v1: a cached answer carries the TTL its own content earns", async () => {
+  const scan = await mockBackend({
+    v1: () => ({
+      decision: "unknown", purl: "pkg:npm/nobody@1.0.0", sha256: null, severity: null,
+      fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null,
+    }),
+  });
+  // A cache that rewrites cache-control on the way in, the way the zone does.
+  const inner = _test.memoryCache();
+  const env = testEnv(DEAD, {
+    SCAN_URL: scan.url,
+    cache: {
+      match: (req) => inner.match(req),
+      put: (req, res) => {
+        const copy = new Response(res.body, res);
+        copy.headers.set("cache-control", "public, max-age=14400");
+        return inner.put(req, copy);
+      },
+    },
+  });
+  const ctx = waitCtx();
+  try {
+    const fresh = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fnobody%401.0.0"),
+      env,
+      ctx.ctx,
+    );
+    assert.match(fresh.headers.get("cache-control"), /max-age=60/, "an unknown must go out short-lived");
+    await fresh.text();
+    await ctx.flush();
+
+    const cached = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fnobody%401.0.0"),
+      env,
+      noopCtx(),
+    );
+    assert.equal(cached.headers.get("x-beamline-source"), "cache", "precondition: the answer was cached");
+    assert.match(
+      cached.headers.get("cache-control"),
+      /max-age=60/,
+      "the caller was handed the cache's TTL instead of the answer's",
+    );
   } finally {
     await scan.close();
   }
