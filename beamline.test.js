@@ -547,7 +547,7 @@ test("v1 analyze: the decision is cached on a token-protected deployment too", a
 // nothing on the path ever looked at the cache the first one had warmed.
 test("v1 analyze: a verdict already cached is answered without a second analysis", async () => {
   const scan = await mockBackend({
-    analyzeStream: ['{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}'],
+    analyzeStream: ['{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0","engine_version":"2.8.0"}'],
     v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
@@ -1031,17 +1031,23 @@ test("v1: a worker's answer is passed through intact", async () => {
 // the artifact, which on this route is often seconds later.
 test("v1: a verdict caches for longer than an absence", async () => {
   const scan = await mockBackend({
-    v1: (u) => ({
-      decision: u.searchParams.get("purl").includes("evil") ? "block" : "unknown",
-      purl: u.searchParams.get("purl"),
-      sha256: null,
-      severity: null,
-      fires_at: null,
-      reason: null,
-      findings: [],
-      engine_version: null,
-      analyzed_at: null,
-    }),
+    v1: (u) => {
+      const analyzed = u.searchParams.get("purl").includes("evil");
+      return {
+        decision: analyzed ? "block" : "unknown",
+        purl: u.searchParams.get("purl"),
+        sha256: null,
+        severity: null,
+        fires_at: null,
+        reason: null,
+        findings: [],
+        // An engine is what makes it a verdict. Absent, this is a record no
+        // engine produced — an absence, or a level derived from threat-feed
+        // citations — and both age out on the short schedule.
+        engine_version: analyzed ? "2.8.0" : null,
+        analyzed_at: null,
+      };
+    },
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   try {
@@ -2250,4 +2256,51 @@ test("v1 analyze: an oversized artifact is refused by name", async () => {
   );
   assert.equal(res.status, 413);
   assert.equal((await res.json()).error.code, "artifact_too_large");
+});
+
+// A threat-feed-derived level carries a real `decision` but no engine. It is a
+// citation, not a measurement, and the two questions that separates it on are
+// deliberately asked of the same field.
+test("v1 analyze: a feed-derived level is not an answer to `analyze`", async () => {
+  const derived = {
+    decision: "block",
+    purl: "pkg:npm/cited@1.0.0",
+    sha256: null,
+    severity: "hostile",
+    fires_at: 10,
+    reason: "Cited as malicious by 2 independent threat intelligence feeds.",
+    findings: [{ id: "intel/feed/malicious", crit: 5, file: null, pkg: null, desc: null, off: null, line: null }],
+    engine_version: null,
+    analyzed_at: null,
+  };
+  const scan = await mockBackend({
+    analyzeStream: ['{"decision":"block","fires_at":2,"purl":"pkg:npm/cited@1.0.0","engine_version":"2.8.0"}'],
+    v1: () => derived,
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    // Populate the lookup cache with the derived answer, as a lookup would.
+    const look = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fcited%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(JSON.parse(await look.text()).decision, "block");
+    // Derived answers are not verdicts, so they age out on the short schedule.
+    assert.match(look.headers.get("cache-control"), /max-age=60/);
+
+    // The gap this level papers over must still close: analyze has to run.
+    const ctx = waitCtx();
+    const ran = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fcited%401.0.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    const body = await ran.text();
+    await ctx.flush();
+    assert.equal(scan.hits.analyze, 1, "a feed citation stood in for the analysis");
+    assert.equal(JSON.parse(body.trim()).fires_at, 2, "the answer was the citation, not the analysis");
+  } finally {
+    await scan.close();
+  }
 });

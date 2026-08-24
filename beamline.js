@@ -394,6 +394,13 @@ function v1DecisionSha(body) {
 // lookup's benefit — and neither one is an analysis. Answering /v1/analyze
 // with either would tell a caller who just asked us to analyze an artifact
 // that nobody has analyzed it. Only a real verdict may stand in for the run.
+//
+// A threat-feed-derived answer is the third of those, and the one that would be
+// easiest to miss: it carries a real `decision`, so it reads as a verdict, but
+// no engine produced it. Standing in for the run would mean an artifact nobody
+// has analyzed is never analyzed — the caller is told `block` and the gap the
+// derived level exists to paper over stays open forever. An engine is what
+// separates a measurement from a citation, so that is what is checked.
 function v1CachedVerdict(body) {
   let row;
   try {
@@ -404,15 +411,25 @@ function v1CachedVerdict(body) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return null;
   const decision = row.decision;
   if (typeof decision !== "string" || decision === "unknown" || decision === "unavailable") return null;
+  if (!row.engine_version) return null;
   return row;
 }
 
 // How long this answer may be cached. A body carrying any `unavailable` is not
-// cacheable at all, and one carrying any `unknown` is cacheable only briefly:
-// both become wrong on their own schedule, and neither is a verdict.
+// cacheable at all; anything no engine produced is cacheable only briefly.
+//
+// One marker, because it is one question. A verdict is immutable for the engine
+// that produced it, and everything else here is not: `unknown` stops being true
+// the moment something analyzes the artifact, and a feed-derived level stops
+// being true when the ledger behind it moves. All of them carry a null
+// `engine_version`, so testing for the engine subsumes the `unknown` check
+// rather than adding to it.
+//
+// A pre-engine_version verdict lands in the short bucket too. That costs a
+// little more traffic and is never wrong, which is the right side to err on.
 function v1MaxAge(body) {
   if (body.includes('"unavailable"')) return 0;
-  if (body.includes('"unknown"')) return V1_UNKNOWN_MAX_AGE;
+  if (body.includes('"engine_version":null')) return V1_UNKNOWN_MAX_AGE;
   return V1_VERDICT_MAX_AGE;
 }
 

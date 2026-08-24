@@ -196,6 +196,48 @@ Only matches native to the file they are reported on appear. An archive repeats
 its members' findings on itself; those copies are dropped in favour of the
 member's own.
 
+### Answers nobody measured
+
+Some artifacts have never been analyzed, and outside threat intelligence knows
+about them anyway. Rather than answer `unknown` about a package several
+independent feeds call malware, we answer with what those feeds say — marked as
+what it is.
+
+Such an answer carries `engine_version: null` and `analyzed_at: null` alongside
+a real `decision`. **`engine_version` is the field to branch on:** it is present
+whenever an engine of ours produced the verdict and absent whenever nothing
+did. A finding names the evidence:
+
+```json
+{
+  "decision": "block",
+  "purl": "npm/left-pad@1.3.0",
+  "severity": "hostile",
+  "fires_at": 10,
+  "reason": "Cited as malicious by 2 independent threat intelligence feeds.",
+  "findings": [{"id": "intel/feed/malicious", "crit": 5, "desc": "…", "file": null, "pkg": null, "off": null, "line": null}],
+  "engine_version": null,
+  "analyzed_at": null
+}
+```
+
+Ids under `intel/` describe where a claim came from rather than what an
+artifact does, which is why they are namespaced apart from the analyzer's own
+taxonomy. `fires_at` follows how much independent agreement there is: several
+unrelated operators reach a tighter level than one, and a feed that publishes
+adjudicated reports reaches a tighter one than a detector's prediction. Feeds
+that share a corpus count once — two mirrors of one advisory database are one
+opinion, not two.
+
+The same evidence annotates artifacts we *have* analyzed. There, `fires_at` is
+the tighter of the two: outside citations can only make an answer stricter,
+never more permissive, and `engine_version` is present because an engine did
+produce the verdict.
+
+`POST /v1/analyze` never answers from a citation alone. An artifact nobody has
+analyzed is exactly what that route exists to change, so it runs the analysis
+and returns the measured answer.
+
 ## Errors
 
 ```json
