@@ -4,8 +4,8 @@ function docsHtml(authRequired) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Beamline API documentation: cached malware lookup and real-time analysis.">
-  <title>Beamline API · isotope¹³</title>
+  <meta name="description" content="Beamline is an API for finding 0-day malware in the software supply chain, with a false-positive policy you control.">
+  <title>Beamline API · software supply-chain malware detection · isotope¹³</title>
   <style>
     @font-face { font-family: Oxanium; src: url("https://atomdrift.org/assets/fonts/Oxanium-Bold.ttf") format("truetype"); font-display: swap; font-weight: 700; }
     :root { --ink:#0d0008; --mid:#4a2040; --light:#6e6e73; --paper:#fff; --mist:#fdf5fc; --pink:#ff00cc; --pink-dark:#9f005f; --line:rgba(255,0,204,.22); --code:#f2f2f7; --code-ink:#1d1d1f; --code-muted:#6e6e73; --max:1180px; }
@@ -36,11 +36,15 @@ function docsHtml(authRequired) {
     .heading-link:hover::after,.heading-link:focus-visible::after { opacity:1; }
     .new-label { background:var(--mist); border:1px solid var(--pink); border-radius:999px; color:var(--pink-dark); display:inline-block; font:700 10px/1 Inter,ui-sans-serif,system-ui,sans-serif; letter-spacing:.8px; margin-left:8px; padding:4px 7px 3px; text-transform:uppercase; vertical-align:.25em; }
     p { color:var(--mid); margin:0 0 18px; max-width:none; }
-    .lead { font-size:19px; line-height:1.6; max-width:620px; }
+    .lead { font-size:19px; line-height:1.6; max-width:820px; }
     .eyebrow { margin-bottom:8px; }
     .facts { display:flex; flex-wrap:wrap; gap:9px; margin:28px 0 42px; }
     .fact { background:var(--mist); border:1px solid var(--line); color:var(--mid); font-size:12px; overflow-wrap:anywhere; padding:7px 10px; }
     .fact strong { color:var(--ink); font-weight:600; }
+    .hero-points { display:grid; gap:24px; grid-template-columns:repeat(3,minmax(0,1fr)); margin:34px 0 42px; }
+    .hero-point { border-top:2px solid var(--pink); padding-top:11px; }
+    .hero-point-title { color:var(--ink); display:block; font-size:14px; font-weight:700; }
+    .hero-point p { font-size:14px; line-height:1.5; margin:6px 0 0; }
     .endpoint-table { border-collapse:collapse; margin:22px 0 0; width:100%; }
     .endpoint-table th,.endpoint-table td { border-bottom:1px solid var(--line); padding:12px 8px 12px 0; text-align:left; vertical-align:top; }
     .endpoint-table th { color:var(--light); font-size:11px; letter-spacing:1px; text-transform:uppercase; }
@@ -88,6 +92,7 @@ function docsHtml(authRequired) {
       h1 { font-size:clamp(36px,11vw,52px); }
       h2 { font-size:26px; margin-top:58px; }
       .lead { font-size:18px; }
+      .hero-points { grid-template-columns:1fr; gap:22px; }
       .endpoint-table { display:block; overflow-x:auto; }
       .endpoint-table th,.endpoint-table td { min-width:120px; }
       .route-example { margin-bottom:9px; }
@@ -110,9 +115,14 @@ function docsHtml(authRequired) {
     </aside>
     <main class="content">
       <section id="start">
-        <div class="eyebrow">Beamline API · isotope¹³</div>
-        <h1><a class="heading-link" href="#start">Lookup what we know.<br>Analyze what we don’t.</a></h1>
-        <p class="lead">Beamline is an API for malware analysis. Calls wait for a decision and may be retried.</p>
+        <div class="eyebrow">Supply-chain malware detection API</div>
+        <h1><a class="heading-link" href="#start">Find 0-day malware in the software supply chain.</a></h1>
+        <p class="lead">Beamline is an API for finding 0-day malware in the software supply chain. Calls wait for a decision and may be retried.</p>
+        <div class="hero-points" aria-label="Why Beamline">
+          <article class="hero-point"><strong class="hero-point-title">Your false-positive policy</strong><p>Set <code>false_positive_budget</code> to match the risk tolerance of your use case, from strict blocking to broader detection.</p></article>
+          <article class="hero-point"><strong class="hero-point-title">Built for what is not known yet</strong><p>Analyze packages, exact downloads, and uploaded artifacts—not just files that already appear on a threat list.</p></article>
+          <article class="hero-point"><strong class="hero-point-title">Open-source foundation</strong><p>Beamline is based on the open-source <a href="https://atomdrift.org/">Atomdrift project</a>.</p></article>
+        </div>
         <div class="facts"><span class="fact"><strong>Endpoint</strong> https://api.isotope13.ai</span><span class="fact"><strong>Auth</strong> Anonymous / Bearer Token</span><span class="fact"><strong>Formats</strong> JSON + NDJSON</span></div>
         <table class="endpoint-table" aria-label="Endpoint summary"><thead><tr><th>Method</th><th>Route</th><th>Use it for</th></tr></thead><tbody>
           <tr><td>GET</td><td>/v1/lookup</td><td>Ask whether an artifact is already known.</td></tr>

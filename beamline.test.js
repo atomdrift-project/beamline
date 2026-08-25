@@ -35,6 +35,10 @@ test("GET / serves the public API documentation", async () => {
   assert.match(res.headers.get("content-type"), /^text\/html/);
   const body = await res.text();
   assert.match(body, /Beamline API/);
+  assert.match(body, /Find 0-day malware in the software supply chain/);
+  assert.match(body, /class="hero-points"/);
+  assert.match(body, /false_positive_budget/);
+  assert.match(body, /open-source <a href="https:\/\/atomdrift\.org\/">Atomdrift project/);
   assert.match(body, /Use cases/);
   assert.match(body, /href="#false-positive-budget"/);
   assert.match(body, /false_positive_budget=25/);
@@ -143,7 +147,7 @@ test("a dropped version prefix says so", async () => {
 test("the documentation page ignores query parameters", async () => {
   const res = await handle(new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"), {}, {});
   assert.equal(res.status, 200);
-  assert.match(await res.text(), /Lookup what we know/);
+  assert.match(await res.text(), /Find 0-day malware in the software supply chain/);
 });
 
 
