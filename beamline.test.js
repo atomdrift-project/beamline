@@ -1121,6 +1121,59 @@ test("v1: a cached answer carries the TTL its own content earns", async () => {
   }
 });
 
+// `unknown` was the old scan spelling of `unanalyzed`. Existing L0 and KV
+// entries should survive that rename, but a live worker still using it must
+// remain visible so the contract probe catches a partial or bad deployment.
+test("v1: legacy unknown is normalized only when read from cache", async () => {
+  const purl = "pkg:npm/legacy-unknown@1.0.0";
+  const stored = new Map();
+  const kv = {
+    async get(key) { return stored.get(key) || null; },
+    async put(key, value) { stored.set(key, value); },
+  };
+  const scan = await mockBackend({
+    v1: () => ({
+      decision: "unknown", purl, sha256: null, severity: null, fires_at: null,
+      reason: null, findings: [], engine_version: null, analyzed_at: null,
+    }),
+  });
+  const cache = _test.memoryCache();
+  const env = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_KV: kv, cache });
+  const ctx = waitCtx();
+  try {
+    const live = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      ctx.ctx,
+    );
+    assert.equal((await live.json()).decision, "unknown", "a live contract violation was hidden");
+    await ctx.flush();
+
+    const l0 = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      noopCtx(),
+    );
+    assert.equal(l0.headers.get("x-beamline-source"), "cache");
+    assert.equal((await l0.json()).decision, "unanalyzed");
+
+    assert.ok(
+      [...stored.values()].some((value) => JSON.parse(value).decision === "unknown"),
+      "the migration rewrote stored data instead of normalizing the read",
+    );
+    const kvEnv = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_KV: kv, cache: _test.memoryCache() });
+    const l1 = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      kvEnv,
+      noopCtx(),
+    );
+    assert.equal(l1.headers.get("x-beamline-source"), "kv");
+    assert.equal((await l1.json()).decision, "unanalyzed");
+  } finally {
+    await scan.close();
+  }
+});
+
 // A lookup that reached a worker has just learned the artifact's identity. The
 // next caller who knows only that identity should not have to reach a worker to
 // learn the same thing.

@@ -243,7 +243,7 @@ async function handleV1Lookup(env, ctx, url) {
     // Buffered rather than streamed through, because the answer decides how
     // long the caller may hold it. Decisions are one small object.
     const document = await hit.text();
-    const body = v1BudgetedBody(document, budget, locator);
+    const body = v1BudgetedBody(document, budget, locator, true);
     const res = new Response(body, hit);
     res.headers.set("X-Beamline-Source", "cache");
     // Derived from the answer, never read back from the cache.
@@ -263,7 +263,7 @@ async function handleV1Lookup(env, ctx, url) {
   if (!ctx.pin) {
     const document = await kvGet(env, path);
     if (document) {
-      const body = v1BudgetedBody(document, budget, locator);
+      const body = v1BudgetedBody(document, budget, locator, true);
       if (body) {
         const res = v1Body(env, body, 200, null, v1MaxAge(document));
         res.headers.set("X-Beamline-Source", "kv");
@@ -620,7 +620,7 @@ function canonicalV1Row(row) {
   return applyBudgetToRow(row, DEFAULT_FALSE_POSITIVE_BUDGET);
 }
 
-function v1BudgetedBody(body, budget, locator) {
+function v1BudgetedBody(body, budget, locator, legacyCachedUnknown = false) {
   let row;
   try {
     row = JSON.parse(body);
@@ -628,7 +628,17 @@ function v1BudgetedBody(body, budget, locator) {
     return null;
   }
   if (!row || typeof row !== "object") return null;
-  const rows = Array.isArray(row) ? row.map((item) => applyBudgetToRow(item, budget)) : applyBudgetToRow(row, budget);
+  // `unknown` was scan's old wire name for `unanalyzed`. Translate it only on
+  // cache reads so entries written before the rename remain useful. A live
+  // worker returning the old name stays visible and fails the v1 contract
+  // probe instead of hiding a partial or regressed deployment.
+  const budgetRow = (item) => {
+    const normalized = legacyCachedUnknown && item && typeof item === "object" && !Array.isArray(item) && item.decision === "unknown"
+      ? { ...item, decision: "unanalyzed" }
+      : item;
+    return applyBudgetToRow(normalized, budget);
+  };
+  const rows = Array.isArray(row) ? row.map(budgetRow) : budgetRow(row);
   if (!locator || locator.type !== "url") return JSON.stringify(rows);
   const addUrl = (item) => (item && typeof item === "object" && !Array.isArray(item) ? { ...item, url: locator.value } : item);
   return JSON.stringify(Array.isArray(rows) ? rows.map(addUrl) : addUrl(rows));
