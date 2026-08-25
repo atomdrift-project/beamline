@@ -385,12 +385,12 @@ async function submitLegacy(item) {
 }
 
 // The v1 shape of the same pass. A lookup that nobody has analyzed answers 200
-// with `decision: unknown` rather than a 404, so what counts as a miss is a
+// with `decision: unanalyzed` rather than a 404, so what counts as a miss is a
 // field rather than a status — which is the whole point of the contract and
 // therefore worth exercising exactly as a client would read it.
 async function submitV1(item) {
   const looked = await ask(item, `${beamlineUrl}/v1/lookup?purl=${encodeURIComponent(item.purl)}`, "GET");
-  // Only a real verdict counts as known. `unknown` is the miss this pass exists
+  // Only a real verdict counts as known. `unanalyzed` is the miss this pass exists
   // to fill, and `unavailable` is our own failure — treating either as an
   // answer would skip the analysis and report an outage as a cache hit.
   const known = looked.decision === "allow" || looked.decision === "block";
@@ -564,7 +564,7 @@ const SOURCES = new Set([
 // that the shape never moves, so a field appearing or vanishing is a defect
 // rather than a variation.
 const V1_REQUIRED = ["decision", "purl", "sha256", "severity", "fires_at", "reason", "findings", "engine_version", "analyzed_at"];
-const V1_DECISIONS = new Set(["allow", "block", "unknown", "unavailable"]);
+const V1_DECISIONS = new Set(["allow", "block", "unanalyzed", "unavailable"]);
 const V1_SEVERITIES = new Set(["benign", "suspicious", "hostile"]);
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DOC_STATUS = new Set([200, 202, 400, 401, 413, 415, 422, 404, 429, 503, 504, 500]);
@@ -590,7 +590,7 @@ function checkV1(status, body, askedPurl) {
   // could not be reached must carry nothing about the artifact at all: reading
   // anything into either is how a caller ends up treating our outage as
   // evidence about a package.
-  if (body.decision === "unavailable" || body.decision === "unknown") {
+  if (body.decision === "unavailable" || body.decision === "unanalyzed") {
     if (body.fires_at !== null) issues.push(`${body.decision} carried fires_at=${body.fires_at}`);
     if (body.severity !== null) issues.push(`${body.decision} carried a severity`);
     if (Array.isArray(body.findings) && body.findings.length) {
@@ -727,7 +727,7 @@ function classify(r) {
     // an outage is not an answer at all, both at 200. Reading only the status
     // here would report an outage as a success, which is the exact confusion
     // the four decisions exist to prevent.
-    if (r.decision === "unknown") return "miss";
+    if (r.decision === "unanalyzed") return "miss";
     if (r.decision === "unavailable") return "note";
     return "ok";
   }

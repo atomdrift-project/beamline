@@ -99,7 +99,7 @@ async function dispatch(request, env, ctx) {
   // authenticate before having a token.
   if (url.pathname === "/") {
     if (request.method !== "GET") return methodNotAllowed("GET");
-    return docsResponse();
+    return docsResponse(Boolean((env.BEAMLINE_TOKEN || "").trim()));
   }
 
   const allowed = tokenList(env.BEAMLINE_TOKEN);
@@ -166,7 +166,23 @@ const V1_VERDICT_MAX_AGE = 3600;
 // so this is a memory bound as much as a policy one. Anything bigger belongs in
 // a registry, which is what `?purl=` is for.
 const V1_MAX_UPLOAD_BYTES = 16 * 1024 * 1024;
-const V1_UNKNOWN_MAX_AGE = 60;
+const V1_NO_ENGINE_MAX_AGE = 60;
+// How long a verdict survives in KV.
+//
+// L0 holds one for an hour; L1 is what makes the next month cheap, so its
+// horizon is measured in months rather than minutes. Bounded all the same.
+// Written without a TTL a verdict is stored forever, and a key whose spelling
+// stops being read — an engine that moved on, a policy nobody asks for — is
+// then never reclaimed and nothing ever notices, because a key nobody reads is
+// a key nobody misses.
+//
+// KV measures expiration from the write and a read does not extend it, so this
+// is a ceiling on staleness rather than a sliding window: a verdict is at most
+// this old before the next caller pays for a fresh one.
+const V1_KV_MAX_AGE = 90 * 24 * 60 * 60;
+// KV refuses anything shorter, so a misconfigured horizon must not turn every
+// write into a throw.
+const KV_MIN_TTL = 60;
 const DEFAULT_FALSE_POSITIVE_BUDGET = 25;
 
 // GET /v1/lookup — what we know, at the caller's budget. Never analyzes.
@@ -211,10 +227,13 @@ async function handleV1Lookup(env, ctx, url) {
     );
   }
 
-  // The document is keyed by the artifact question, not by the caller's
-  // policy. Beamline applies false_positive_budget to `fires_at` below, so one
-  // stored document can answer every budget consistently.
-  const path = v1CachePath(sha, locators);
+  // Which question is being asked about the artifact. `follow` is part of it,
+  // so it is part of the key; false_positive_budget is not, because beamline
+  // applies it to `fires_at` below and one stored document therefore answers
+  // every budget consistently.
+  const follow = parseFollow(url.searchParams, urls.length ? "url" : purls.length ? "purl" : "sha256");
+  if (follow.error) return v1Error(400, "invalid_follow_policy", follow.error);
+  const path = v1CachePath(sha, locators, follow.value);
   const locator = locators.length === 1 ? locators[0] : null;
 
   const cache = await getCache(env);
@@ -233,7 +252,7 @@ async function handleV1Lookup(env, ctx, url) {
     // as, which is not what we asked for: measured on api.isotope13.ai, an
     // entry written `max-age=60` reads back `max-age=14400`, because the zone's
     // edge TTL overrides the worker's. Our own eviction still honours the 60s —
-    // an `unknown` really is gone a minute later — but the caller was being
+    // an `unanalyzed` really is gone a minute later — but the caller was being
     // told to hold it for four hours, which is exactly the staleness the short
     // TTL exists to prevent.
     res.headers.set("cache-control", clientScope(env, v1MaxAge(document)));
@@ -254,7 +273,7 @@ async function handleV1Lookup(env, ctx, url) {
     }
   }
 
-  return v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget);
+  return v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, follow.value);
 }
 
 // Ask the workers in turn until one answers.
@@ -263,10 +282,15 @@ async function handleV1Lookup(env, ctx, url) {
 // lookup spends no analysis slot, and since every worker defers to the same
 // corpus when it does not know, they now give the same answer. Broadcasting
 // would multiply the load behind them to learn nothing.
-async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget) {
+async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, follow) {
   const ids = v1LocatorIds(ctx.rid, sha, locators);
   const locator = locators.length === 1 ? locators[0] : null;
   const origin = new URL(cacheKey.url).origin;
+  // Scan is asked by locator alone. Its corpus holds one verdict per artifact
+  // rather than one per policy, so sending a policy it does not take would only
+  // invite it to reject the question. What comes back is filed under the policy
+  // this request resolved to, which is the question the caller actually asked.
+  const askPath = v1CachePath(sha, locators, null);
   const workers = await lookupOrder(env, ctx, scanWorkers(env), ids);
   const t0 = Date.now();
 
@@ -274,7 +298,7 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget) {
     const worker = hostOf(base);
     try {
       const answered = await fetchTimeout(
-        `${base}${path}`,
+        `${base}${askPath}`,
         { method: "GET", headers: scanHeaders(env, ctx) },
         LOOKUP_TIMEOUT_MS,
         ctx,
@@ -285,7 +309,7 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget) {
       );
       // A 404 is not this request being wrong. This route never answers one
       // for a well-formed query — an artifact nobody has analyzed is a 200
-      // carrying `unknown` — so a 404 means the worker has no such route, which
+      // carrying `unanalyzed` — so a 404 means the worker has no such route, which
       // is a fact about the worker. Counted against it and tried elsewhere:
       // during a partial rollout that is what drains traffic off the workers
       // that cannot serve yet and onto the ones that can. Relaying it instead
@@ -321,7 +345,7 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget) {
       // the artifact's identity, and the next caller who knows only that
       // identity should not have to reach a worker to learn the same thing.
       // Skipped when they are the same key — a sha lookup has nothing to add.
-      waitUntil(ctx, cacheV1Aliases(env, cache, origin, path, locator, stored));
+      waitUntil(ctx, cacheV1Aliases(env, cache, origin, path, locator, stored, follow));
       return res;
     } catch {
       breakerFor(base).fail();
@@ -365,12 +389,20 @@ function v1Unavailable(sha, locator) {
 // were three separate string literals saying the same thing, and a key that
 // differs by one character between the writer and the reader is a cache that
 // never hits and never says why.
-function v1CachePath(sha, locators) {
+//
+// The follow policy is part of the key because it is part of the question. Two
+// policies can reach opposite verdicts about one artifact and both be right —
+// a package whose own bytes are clean and whose install script is not — so a
+// document filed without saying which question it answers is a document that
+// will eventually answer the wrong one. Passing no policy builds the path scan
+// is asked on, which takes locators only.
+function v1CachePath(sha, locators, follow) {
   const query = [];
   if (sha) query.push(`sha256=${encodeURIComponent(sha)}`);
   for (const locator of locators || []) {
     query.push(`${locator.type}=${encodeURIComponent(locator.value)}`);
   }
+  if (follow) query.push(`follow=${encodeURIComponent(follow)}`);
   return `/v1/lookup?${query.join("&")}`;
 }
 
@@ -385,23 +417,30 @@ function v1CachePath(sha, locators) {
 // filing an answer under a PURL the caller never typed would hand the next one
 // a body written for a different question.
 //
+// Under the policy that produced it, never the bare digest. A digest names the
+// artifact but says nothing about how it was reached, and the default differs
+// by how it was reached — so an answer a URL scan paid for is filed at the
+// digest under `follow=none`, where only a caller asking that same question
+// finds it.
+//
 // Checked before it is written, and that check is the point: rewriting a key
 // every time it is read would refresh its TTL forever, and an entry that never
 // ages is pinned rather than cached. A verdict is allowed to go stale on
 // schedule.
-async function backfillDigestKey(env, cache, origin, body) {
+async function backfillDigestKey(env, cache, origin, body, follow) {
   const sha = v1DecisionSha(body);
   if (!sha) return;
   const maxAge = v1MaxAge(body);
   if (!maxAge) return;
-  const key = new Request(`${origin}${v1CachePath(sha, [])}`);
+  const path = v1CachePath(sha, [], follow);
+  const key = new Request(`${origin}${path}`);
   if (await cache.match(key).catch(() => null)) return;
   await cache.put(
     key,
     storedDocument(body, env),
   );
-  await kvPut(env, v1CachePath(sha, []), body);
-  logLine("v1_cache_backfill", { key: "sha256", sha, max_age: maxAge });
+  await kvPut(env, path, body);
+  logLine("v1_cache_backfill", { key: "sha256", sha, follow, max_age: maxAge });
 }
 
 // A locator is an alias, not a second document. Once scan resolves a URL or
@@ -409,11 +448,18 @@ async function backfillDigestKey(env, cache, origin, body) {
 // the request's locator, the resolved PURL (when present), and the SHA-256.
 // Full copies are deliberate: a KV read then costs one lookup and does not
 // require a redirect lookup or a second consistency window.
-function v1CacheAliasPaths(origin, requestedPath, locator, body) {
+//
+// Names alias; policies do not. Every path here carries the one policy that
+// produced this document, so a URL scan that followed nothing warms the PURL's
+// `follow=none` entry and leaves the PURL's own default untouched. Aliasing
+// across policies would file a shallow answer where a caller asking the deeper
+// question reads, which is the same mistake as filing under a PURL nobody
+// typed — one name, two questions.
+function v1CacheAliasPaths(origin, requestedPath, locator, body, follow) {
   const paths = new Set([requestedPath]);
-  if (locator) paths.add(v1CachePath(null, [locator]));
+  if (locator) paths.add(v1CachePath(null, [locator], follow));
   const sha = v1DecisionSha(body);
-  if (sha) paths.add(v1CachePath(sha, []));
+  if (sha) paths.add(v1CachePath(sha, [], follow));
   let row;
   try {
     row = JSON.parse(body);
@@ -422,17 +468,17 @@ function v1CacheAliasPaths(origin, requestedPath, locator, body) {
   }
   if (row && !Array.isArray(row) && typeof row === "object") {
     if (typeof row.purl === "string" && row.purl.trim()) {
-      paths.add(v1CachePath(null, [{ type: "purl", value: row.purl.trim() }]));
+      paths.add(v1CachePath(null, [{ type: "purl", value: row.purl.trim() }], follow));
     }
     if (typeof row.url === "string" && validArtifactUrl(row.url.trim())) {
-      paths.add(v1CachePath(null, [{ type: "url", value: row.url.trim() }]));
+      paths.add(v1CachePath(null, [{ type: "url", value: row.url.trim() }], follow));
     }
   }
   return [...paths].map((path) => new Request(`${origin}${path}`));
 }
 
-async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body) {
-  const keys = v1CacheAliasPaths(origin, requestedPath, locator, body);
+async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, follow) {
+  const keys = v1CacheAliasPaths(origin, requestedPath, locator, body, follow);
   await Promise.all(
     keys.map(async (key) => {
       try {
@@ -485,12 +531,42 @@ function v1LocatorIds(rid, sha, locators) {
   };
 }
 
+// What a caller who names no policy gets, decided by how they named the
+// artifact — which is also a statement about what they already know.
+//
+// A PURL or a digest is a name for something the caller has already resolved.
+// They walked a dependency graph to produce it, and they are working through
+// that graph package by package, so walking it again underneath each request
+// re-analyzes the same subgraph once per package. What their resolution cannot
+// show them is an install or download command fetching something no manifest
+// declares, so that is the category followed on their behalf.
+//
+// A URL is an exact artifact, and a caller holding one usually holds the whole
+// set: a proxy hands them the resolved download for every dependency it serves.
+// Traversal from a caller-supplied URL also reaches addresses we did not
+// choose, which is the one case where following is a request to fetch from
+// somewhere nobody vetted.
+//
+// Bytes name nothing. There is no registry resolution behind them and no
+// lockfile beside them, so whatever is discoverable inside them is discoverable
+// nowhere else, and this is the only place it can be found.
+const DEFAULT_FOLLOW = {
+  purl: "references",
+  sha256: "references",
+  url: "none",
+  bytes: "all",
+};
+
 // Parse which references discovered inside the root artifact should be
 // followed. The root itself is always retrieved; this controls only traversal
 // after that. Repeated query keys and comma-separated values are equivalent.
-function parseFollow(searchParams) {
+//
+// Every request resolves to a policy, named or not, because the answer is
+// stored under a key that carries it: a request whose policy we could not name
+// would be one whose answer we could not file.
+function parseFollow(searchParams, kind) {
   const values = searchParams.getAll("follow");
-  if (!values.length) return { explicit: false, value: null };
+  if (!values.length) return { value: DEFAULT_FOLLOW[kind] };
 
   const selected = new Set();
   let none = false;
@@ -515,14 +591,14 @@ function parseFollow(searchParams) {
   if (none && (all || selected.size)) {
     return { error: "follow=none cannot be combined with another follow target." };
   }
-  if (none) return { explicit: true, value: "none" };
-  if (all) return { explicit: true, value: "all" };
+  if (none) return { value: "none" };
+  if (all) return { value: "all" };
   // CI actions are dependency references with additional CI context. Include
   // dependencies in the canonical spelling so logs and upstream requests make
   // that implication visible.
   if (selected.has("ci-actions")) selected.add("dependencies");
   const order = ["dependencies", "references", "ci-actions"];
-  return { explicit: true, value: order.filter((target) => selected.has(target)).join(",") };
+  return { value: order.filter((target) => selected.has(target)).join(",") };
 }
 
 function v1DocumentBody(body) {
@@ -585,19 +661,20 @@ async function kvGet(env, path) {
   }
 }
 
+// Nothing is written without an expiry. `unanalyzed` keeps the short clock it has
+// at the edge, because it stops being true the moment anything analyzes the
+// artifact; a verdict keeps the long one.
 async function kvPut(env, path, body) {
   const kv = env && env.BEAMLINE_KV;
   if (!kv || typeof kv.put !== "function") return;
   const maxAge = v1MaxAge(body);
-  const options = maxAge === V1_UNKNOWN_MAX_AGE ? { expirationTtl: maxAge } : undefined;
-  const key = await kvKey(path);
-  if (options) await kv.put(key, body, options);
-  else await kv.put(key, body);
+  const ttl = maxAge === V1_NO_ENGINE_MAX_AGE ? maxAge : numEnv(env, "KV_MAX_AGE", V1_KV_MAX_AGE);
+  await kv.put(await kvKey(path), body, { expirationTtl: Math.max(KV_MIN_TTL, Math.round(ttl)) });
 }
 
 // A cached body /v1/analyze may answer with, or null.
 //
-// `unknown` and `unavailable` are both cacheable — briefly, and for the
+// `unanalyzed` and `unavailable` are both cacheable — briefly, and for the
 // lookup's benefit — and neither one is an analysis. Answering /v1/analyze
 // with either would tell a caller who just asked us to analyze an artifact
 // that nobody has analyzed it. Only a real verdict may stand in for the run.
@@ -617,7 +694,7 @@ function v1CachedVerdict(body) {
   }
   if (!row || typeof row !== "object" || Array.isArray(row)) return null;
   const decision = row.decision;
-  if (typeof decision !== "string" || decision === "unknown" || decision === "unavailable") return null;
+  if (typeof decision !== "string" || decision === "unanalyzed" || decision === "unavailable") return null;
   if (!row.engine_version) return null;
   return row;
 }
@@ -626,17 +703,17 @@ function v1CachedVerdict(body) {
 // cacheable at all; anything no engine produced is cacheable only briefly.
 //
 // One marker, because it is one question. A verdict is immutable for the engine
-// that produced it, and everything else here is not: `unknown` stops being true
+// that produced it, and everything else here is not: `unanalyzed` stops being true
 // the moment something analyzes the artifact, and a feed-derived level stops
 // being true when the ledger behind it moves. All of them carry a null
-// `engine_version`, so testing for the engine subsumes the `unknown` check
+// `engine_version`, so testing for the engine subsumes the `unanalyzed` check
 // rather than adding to it.
 //
 // A pre-engine_version verdict lands in the short bucket too. That costs a
 // little more traffic and is never wrong, which is the right side to err on.
 function v1MaxAge(body) {
   if (body.includes('"unavailable"')) return 0;
-  if (body.includes('"engine_version":null')) return V1_UNKNOWN_MAX_AGE;
+  if (body.includes('"engine_version":null')) return V1_NO_ENGINE_MAX_AGE;
   return V1_VERDICT_MAX_AGE;
 }
 
@@ -701,8 +778,6 @@ async function handleV1Analyze(request, env, ctx, url) {
   const artifactUrl = (url.searchParams.get("url") || "").trim();
   const budgetRaw = url.searchParams.get("false_positive_budget");
   const budget = parseFalsePositiveBudget(budgetRaw);
-  const follow = parseFollow(url.searchParams);
-  if (follow.error) return v1Error(400, "invalid_follow_policy", follow.error);
   if (purl && artifactUrl) return v1Error(400, "multiple_locators", "Use ?purl= or ?url=, not both.");
   if (artifactUrl && !validArtifactUrl(artifactUrl)) {
     return v1Error(400, "invalid_url", "url must be an absolute http or https URL.");
@@ -742,18 +817,25 @@ async function handleV1Analyze(request, env, ctx, url) {
       `false_positive_budget must be a whole number from 0 to 65535, not ${JSON.stringify(budgetRaw)}.`,
     );
   }
+  // Resolved after the body, because how the artifact was named decides the
+  // default and an upload is only known to be one once bytes have arrived.
+  const follow = parseFollow(url.searchParams, bytes ? "bytes" : locator.type);
+  if (follow.error) return v1Error(400, "invalid_follow_policy", follow.error);
 
   const query = [];
   // The PURL rides along with an upload too: scan grafts the registry
   // provenance onto the report and echoes it in each finding's `pkg`.
   if (locator) query.push(`${locator.type}=${encodeURIComponent(locator.value)}`);
-  if (follow.explicit) query.push(`follow=${encodeURIComponent(follow.value)}`);
+  // Always sent, named or not. The answer is filed under the policy resolved
+  // here, so leaving scan to apply a default of its own would file it under a
+  // policy that is not the one it was produced with.
+  query.push(`follow=${encodeURIComponent(follow.value)}`);
   const path = `/v1/analyze${query.length ? `?${query.join("&")}` : ""}`;
   const ids = {
     rid: ctx.rid,
     ...v1LocatorIds(ctx.rid, null, locator ? [locator] : []),
     bytes: bytes ? bytes.byteLength : undefined,
-    follow: follow.explicit ? follow.value : undefined,
+    follow: follow.value,
   };
   const t0 = Date.now();
 
@@ -770,9 +852,14 @@ async function handleV1Analyze(request, env, ctx, url) {
   // and the PURL riding along with one names provenance rather than the thing
   // being asked about, so it cannot stand in for the artifact. `pin` bypasses,
   // exactly as it does on the lookup: it exists to time a specific backend.
-  if (locator && !bytes && !ctx.pin && !follow.explicit) {
+  //
+  // A narrower or wider follow policy is a different entry here, not a bypass.
+  // It used to be a bypass, which meant the policy this service documents most
+  // loudly — `follow=none`, the one the proxy recipe tells every caller to
+  // send — was the one policy that could never hit a cache in either direction.
+  if (locator && !bytes && !ctx.pin) {
     const cache = await getCache(env);
-    const cachePath = v1CachePath(null, [locator]);
+    const cachePath = v1CachePath(null, [locator], follow.value);
     const key = new Request(`${url.origin}${cachePath}`);
     const hit = await cache.match(key).catch(() => null);
     let document = hit ? await hit.text().catch(() => null) : null;
@@ -785,7 +872,7 @@ async function handleV1Analyze(request, env, ctx, url) {
       // trip to learn something we were already holding, and answering them
       // never fixed it either.
       const body = v1BudgetedBody(document, budget, locator);
-      waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document));
+      waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document, follow.value));
       logLine("v1_analyze", { src: "cache", status: 200, decision: decided.decision, ms: Date.now() - t0, ...ids });
       // Answered in the shape this route always answers in: one NDJSON line,
       // no progress frames because there was no run to report progress about.
@@ -831,7 +918,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   const busyDeadline = t0 + numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS) * BUSY_BUDGET_SHARE;
   for (let attempt = 0; ; attempt++) {
     const pass = { busy: 0, broken: 0 };
-    const cacheResult = Boolean(locator && !bytes && !follow.explicit);
+    const cacheFollow = locator && !bytes ? follow.value : null;
     const answered = await v1Dispatch(
       env,
       ctx,
@@ -844,7 +931,7 @@ async function handleV1Analyze(request, env, ctx, url) {
       t0,
       bytes,
       pass,
-      cacheResult,
+      cacheFollow,
     );
     if (answered) return answered;
     const stillWorthOffering = pass.busy > 0 && Date.now() < busyDeadline;
@@ -867,7 +954,7 @@ async function handleV1Analyze(request, env, ctx, url) {
 
 // One pass over the fleet. Returns the response, or null when every worker
 // refused and the pass is worth making again.
-async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheResult) {
+async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheFollow) {
   const workers = scanWorkers(env);
   const hint = locator?.type === "purl" ? { purl: locator.value } : {};
   let ranked = workers.length ? (await rankWorkers(env, ctx, workers, ids, hint)).workers : [];
@@ -939,10 +1026,10 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
     // cheap route reads. Teeing rather than buffering keeps the caller's copy
     // flowing while ours is still arriving.
     let out = upstream.body;
-    if (cacheResult) {
+    if (cacheFollow) {
       const streams = upstream.body.tee();
       out = streams[0];
-      waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, streams[1]));
+      waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, streams[1], cacheFollow));
     }
     return new Response(
       annotatedV1Stream(out, budget, {
@@ -972,7 +1059,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
 // run was doing. A stream that ends without one was cut short, and caching a
 // truncated answer would turn one dropped connection into a wrong answer served
 // from the edge — so nothing is stored unless a decision actually arrived.
-async function cacheV1Decision(env, ctx, origin, locator, stream) {
+async function cacheV1Decision(env, ctx, origin, locator, stream, follow) {
   const ids = v1LocatorIds(ctx.rid, null, locator ? [locator] : []);
   const decided = await lastDecision(stream);
   if (!decided) {
@@ -990,9 +1077,9 @@ async function cacheV1Decision(env, ctx, origin, locator, stream) {
     return;
   }
   const cache = await getCache(env);
-  const requestedPath = v1CachePath(null, locator ? [locator] : []);
-  await cacheV1Aliases(env, cache, origin, requestedPath, locator, document);
-  logLine("v1_cache_write", { stored: true, max_age: maxAge, keys: v1CacheAliasPaths(origin, requestedPath, locator, document).length, ...ids });
+  const requestedPath = v1CachePath(null, locator ? [locator] : [], follow);
+  await cacheV1Aliases(env, cache, origin, requestedPath, locator, document, follow);
+  logLine("v1_cache_write", { stored: true, follow, max_age: maxAge, keys: v1CacheAliasPaths(origin, requestedPath, locator, document, follow).length, ...ids });
 }
 
 // Add phase telemetry to the progress stream without changing the cached

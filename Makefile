@@ -135,8 +135,32 @@ define put_secret
 
 endef
 
+# Client authentication is environment-controlled. In particular, do not
+# leave an old Worker secret active just because this deployment omits the
+# variable: an omitted BEAMLINE_TOKEN means the client gate is off.
+define sync_client_token
+	@if [ -n "$$BEAMLINE_TOKEN" ]; then \
+	  echo "BEAMLINE_TOKEN: from the environment"; \
+	  printf '%s\n' "$$BEAMLINE_TOKEN" | npx --yes $(WRANGLER) secret put BEAMLINE_TOKEN; \
+	else \
+	  echo "BEAMLINE_TOKEN: removing the client gate"; \
+	  delete_output=$$(printf 'y\n' | npx --yes $(WRANGLER) secret delete BEAMLINE_TOKEN --name beamline 2>&1); \
+	  delete_status=$$?; \
+	  if [ $$delete_status -eq 0 ]; then \
+	    printf '%s\n' "$$delete_output"; \
+	  else \
+	    case "$$delete_output" in \
+	      *"Binding 'BEAMLINE_TOKEN' not found."*) echo "BEAMLINE_TOKEN: already absent" ;; \
+	      *) printf '%s\n' "$$delete_output"; exit $$delete_status ;; \
+	    esac; \
+	  fi; \
+	fi
+
+endef
+
 deploy-cf:
 	@test -n "$(SCAN_URL)" || { echo "SCAN_URL is required"; exit 1; }
 	@test -n "$(KV)" || { echo "KV is required (Cloudflare KV namespace ID)"; exit 1; }
 	KV="$(KV)" SCAN_URL="$(SCAN_URL)" WRANGLER="$(WRANGLER)" node scripts/deploy-cf.mjs
+	$(call sync_client_token)
 	$(call put_secret,SCAN_TOKEN,scan)

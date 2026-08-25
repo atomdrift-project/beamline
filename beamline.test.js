@@ -35,9 +35,52 @@ test("GET / serves the public API documentation", async () => {
   assert.match(res.headers.get("content-type"), /^text\/html/);
   const body = await res.text();
   assert.match(body, /Beamline API/);
+  assert.match(body, /Use cases/);
+  assert.match(body, /href="#false-positive-budget"/);
+  assert.match(body, /false_positive_budget=25/);
+  assert.match(body, /<code>\?false_positive_budget=<\/code>/);
+  assert.match(body, /Following references/);
+  assert.match(body, /<code>\?follow=<\/code> controls/);
+  assert.match(body, /CI systems/);
   assert.match(body, /Transparent proxy integration/);
+  assert.match(body, /<code>\?follow=references<\/code>/);
+  assert.match(body, /downloads malware later/);
+  assert.match(body, /mailto:support@isotope13\.ai/);
+  assert.equal((body.match(/class="new-label"/g) || []).length, 3);
+  assert.equal((body.match(/class="heading-link"/g) || []).length, (body.match(/<h[123](?:\s|>)/g) || []).length);
+  assert.match(body, /href="#lookup-url"/);
+  assert.match(body, /href="#content-upload"/);
+  assert.match(body, /data-upload data-path="\/v1\/analyze\?follow=none"/);
+  assert.match(body, /api\.isotope13\.ai\/v1\/analyze\?follow=none/);
   assert.match(body, /follow=none/);
-  assert.match(body, /BEAMLINE_TOKEN/);
+  assert.match(body, /Authentication is required/);
+  assert.match(body, /Authorization: Bearer/);
+  assert.match(body, /class="run-button"/);
+  assert.match(body, /class="request"/);
+  assert.match(body, /overflow-wrap:anywhere/);
+  assert.match(body, /class="route-example"/);
+  assert.doesNotMatch(body, /Runnable curl|class="runbar"/);
+  assert.match(body, /class="response"/);
+  assert.match(body, /class="meanings"/);
+  assert.match(body, /<code>decision<\/code> is the result to act on/);
+  assert.match(body, /decision: "allow"/);
+  assert.match(body, /only a line containing <code>decision<\/code> is a verdict/);
+  assert.match(body, /runner\.has-response/);
+  assert.match(body, /runner\.hasAttribute\("data-stream"\) \? output\.scrollHeight : 0/);
+  assert.match(body, /data-path="\/v1\/lookup\?url=/);
+  assert.match(body, /data-path="\/v1\/lookup\?sha256=/);
+  assert.match(body, /application\/x-ndjson/);
+  assert.match(body, /--code:#f2f2f7/);
+  assert.match(body, /grid-template-columns:136px minmax\(0,1fr\)/);
+  assert.match(body, /p \{[^}]*max-width:none/);
+  assert.doesNotMatch(body, /healthz/);
+});
+
+test("GET / describes an open deployment as unauthenticated", async () => {
+  const res = await handle(new Request("http://beamline/"), {}, {});
+  const body = await res.text();
+  assert.match(body, /<strong>Auth<\/strong> Anonymous \/ Bearer Token/);
+  assert.doesNotMatch(body, /Authentication is required/);
 });
 
 test("BEAMLINE_TOKEN accepts a comma-separated list", () => {
@@ -425,6 +468,72 @@ test("v1 analyze: follow is normalized and forwarded", async () => {
   }
 });
 
+// The default is a statement about what the caller already knows. A PURL is a
+// name for something they resolved themselves, so their dependency graph is
+// theirs to walk and only what no manifest declares is followed for them. A URL
+// is one artifact out of a set a proxy already handed them in full. Bytes name
+// nothing at all, so nothing inside them is discoverable anywhere else.
+test("v1 analyze: the follow default is decided by how the artifact was named", async () => {
+  const cases = [
+    ["purl", "http://beamline/v1/analyze?purl=pkg%3Anpm%2Fapp%401.0.0", null, "references"],
+    ["url", `http://beamline/v1/analyze?url=${encodeURIComponent("https://cdn.example.test/app.tgz")}`, null, "none"],
+    ["upload", "http://beamline/v1/analyze", "bytes nobody published", "all"],
+    // A PURL beside an upload names provenance, not the thing being asked
+    // about. The bytes are still the question.
+    ["upload with provenance", "http://beamline/v1/analyze?purl=pkg%3Anpm%2Fapp%401.0.0", "bytes nobody published", "all"],
+  ];
+  for (const [label, target, body, expected] of cases) {
+    let forwarded;
+    const scan = await mockBackend({
+      onAnalyzeQuery: (url) => { forwarded = url.searchParams.get("follow"); },
+      analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/app@1.0.0"}'],
+    });
+    const env = testEnv(DEAD, { SCAN_URL: scan.url });
+    try {
+      const res = await handle(new Request(target, { method: "POST", body }), env, waitCtx().ctx);
+      assert.equal(res.status, 200, label);
+      await res.text();
+      assert.equal(forwarded, expected, label);
+    } finally {
+      await scan.close();
+    }
+  }
+});
+
+// A digest sits with the PURL rather than the URL. Whoever holds one holds it
+// because something resolved to it — a lockfile pin, a scanner report — which
+// puts them in the same position as the caller who named the package, and an
+// answer one of them paid for should serve the other.
+test("v1: a digest resolves the same policy as the PURL that answered it", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const scan = await mockBackend({
+    analyzeStream: [
+      `{"decision":"allow","fires_at":-1,"purl":"${purl}","sha256":"${HELLO_SHA}","engine_version":"2.8.0"}`,
+    ],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
+  try {
+    const analyzed = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    await analyzed.text();
+    await ctx.flush();
+
+    const byDigest = await handle(new Request(`http://beamline/v1/lookup?sha256=${HELLO_SHA}`), env, noopCtx());
+    assert.equal(
+      byDigest.headers.get("x-beamline-source"),
+      "cache",
+      "the digest asked a different question than the PURL that answered it",
+    );
+    assert.equal((await byDigest.json()).sha256, HELLO_SHA);
+  } finally {
+    await scan.close();
+  }
+});
+
 test("v1 analyze: exact URL reaches scan and warms locator aliases", async () => {
   const artifactUrl = "https://cdn.example.test/files/app-1.0.0.tgz";
   const purl = "pkg:npm/app@1.0.0";
@@ -448,8 +557,10 @@ test("v1 analyze: exact URL reaches scan and warms locator aliases", async () =>
     assert.equal(forwarded.searchParams.get("url"), artifactUrl);
     await ctx.flush();
 
+    // Under the policy the URL scan answered, which is `none`. The PURL's own
+    // default is a different question and must still be cold.
     const cached = await handle(
-      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=none`),
       env,
       noopCtx(),
     );
@@ -475,10 +586,16 @@ test("v1 analyze: malformed follow policy is rejected at the edge", async () => 
   }
 });
 
-test("v1 analyze: explicit follow bypasses and does not replace canonical cache", async () => {
+// Two policies can disagree about one package and both be right — bytes that
+// are clean and an install script that is not. So a policy is part of the key
+// rather than a reason to skip it: neither answer may be served for the other's
+// question, and each is cacheable in its own right. `follow=none` being the
+// policy this service documents most loudly is exactly why it must not be the
+// one policy that can never hit a cache.
+test("v1 analyze: a non-default follow policy is a separate entry, not a bypass", async () => {
   const purl = "pkg:npm/app@1.0.0";
   const scan = await mockBackend({
-    analyzeStream: (url) => url.searchParams.has("follow")
+    analyzeStream: (url) => url.searchParams.get("follow") === "none"
       ? [`{"decision":"block","fires_at":3,"purl":"${purl}","engine_version":"test"}`]
       : [`{"decision":"allow","fires_at":-1,"purl":"${purl}","engine_version":"test"}`],
   });
@@ -501,7 +618,15 @@ test("v1 analyze: explicit follow bypasses and does not replace canonical cache"
     );
     assert.equal(JSON.parse((await custom.text()).trim()).decision, "block");
     await customCtx.flush();
-    assert.equal(scan.hits.analyze, 2, "explicit policy incorrectly used the warm canonical cache");
+    assert.equal(scan.hits.analyze, 2, "explicit policy incorrectly used the default policy's entry");
+
+    const repeated = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}&follow=none`, { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(JSON.parse((await repeated.text()).trim()).decision, "block");
+    assert.equal(scan.hits.analyze, 2, "an explicit policy paid for its own analysis twice");
 
     const cached = await handle(
       new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
@@ -509,7 +634,7 @@ test("v1 analyze: explicit follow bypasses and does not replace canonical cache"
       waitCtx().ctx,
     );
     assert.equal(JSON.parse((await cached.text()).trim()).decision, "allow");
-    assert.equal(scan.hits.analyze, 2, "custom result replaced the canonical cache entry");
+    assert.equal(scan.hits.analyze, 2, "the explicit result replaced the default policy's entry");
   } finally {
     await scan.close();
   }
@@ -647,7 +772,7 @@ test("v1 analyze: the decision lands where /v1/lookup will find it", async () =>
       '{"state":"analyzing","purl":"pkg:npm/evil@1.0.0","elapsed_ms":1002,"phase":"unpack"}',
       '{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}',
     ],
-    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    v1: () => ({ decision: "unanalyzed", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   const ctx = waitCtx();
@@ -677,7 +802,7 @@ test("v1 analyze: the decision lands where /v1/lookup will find it", async () =>
 test("v1 analyze: a truncated stream is not cached", async () => {
   const scan = await mockBackend({
     analyzeStream: ['{"state":"analyzing","purl":"pkg:npm/half@1.0.0","elapsed_ms":1002,"phase":"unpack"}'],
-    v1: () => ({ decision: "unknown", purl: "pkg:npm/half@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    v1: () => ({ decision: "unanalyzed", purl: "pkg:npm/half@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   const ctx = waitCtx();
@@ -711,7 +836,7 @@ test("v1 analyze: a truncated stream is not cached", async () => {
 test("v1 analyze: the decision is cached on a token-protected deployment too", async () => {
   const scan = await mockBackend({
     analyzeStream: ['{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}'],
-    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    v1: () => ({ decision: "unanalyzed", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_TOKEN: "s3cret" });
   const auth = { authorization: "Bearer s3cret" };
@@ -744,7 +869,7 @@ test("v1 analyze: the decision is cached on a token-protected deployment too", a
 test("v1 analyze: a verdict already cached is answered without a second analysis", async () => {
   const scan = await mockBackend({
     analyzeStream: ['{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0","engine_version":"2.8.0"}'],
-    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    v1: () => ({ decision: "unanalyzed", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   const ask = () =>
@@ -767,13 +892,13 @@ test("v1 analyze: a verdict already cached is answered without a second analysis
   }
 });
 
-// `unknown` is cacheable — briefly, and for the lookup's benefit — and it is
+// `unanalyzed` is cacheable — briefly, and for the lookup's benefit — and it is
 // not an analysis. Serving it here would answer "nobody has analyzed this" to
 // a caller who just asked us to analyze it.
-test("v1 analyze: a cached `unknown` is not an answer to `analyze`", async () => {
+test("v1 analyze: a cached `unanalyzed` is not an answer to `analyze`", async () => {
   const scan = await mockBackend({
     analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/fresh@1.0.0"}'],
-    v1: () => ({ decision: "unknown", purl: "pkg:npm/fresh@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    v1: () => ({ decision: "unanalyzed", purl: "pkg:npm/fresh@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   const ctx = waitCtx();
@@ -789,7 +914,7 @@ test("v1 analyze: a cached `unknown` is not an answer to `analyze`", async () =>
       env,
       noopCtx(),
     );
-    assert.equal(warm.headers.get("x-beamline-source"), "cache", "precondition: the unknown was cached");
+    assert.equal(warm.headers.get("x-beamline-source"), "cache", "precondition: the unanalyzed row was cached");
 
     const analyzed = await handle(
       new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Ffresh%401.0.0", { method: "POST" }),
@@ -797,10 +922,46 @@ test("v1 analyze: a cached `unknown` is not an answer to `analyze`", async () =>
       waitCtx().ctx,
     );
     const body = await analyzed.text();
-    assert.equal(scan.hits.analyze, 1, "a cached `unknown` was served instead of analysing");
+    assert.equal(scan.hits.analyze, 1, "a cached `unanalyzed` was served instead of analysing");
     assert.equal(JSON.parse(body.trim()).decision, "allow");
   } finally {
     await scan.close();
+  }
+});
+
+// The guard is `engine_version`, not the spelling of the decision. Nothing an
+// engine of ours did not produce may stand in for an analysis, whatever it
+// calls itself — which is what makes the rename survivable in either deploy
+// order: a worker still saying `unknown` is rejected on the same test that
+// rejects `unanalyzed`, rather than being mistaken for a verdict and filed as
+// one for ninety days.
+test("v1 analyze: a row no engine produced is never a verdict, whatever it is called", async () => {
+  for (const decision of ["unanalyzed", "unknown"]) {
+    const purl = "pkg:npm/lagging@1.0.0";
+    const scan = await mockBackend({
+      analyzeStream: [`{"decision":"allow","fires_at":-1,"purl":"${purl}","engine_version":"2.8.0"}`],
+      v1: () => ({ decision, purl, sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    });
+    const env = testEnv(DEAD, { SCAN_URL: scan.url });
+    const ctx = waitCtx();
+    try {
+      await (await handle(new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`), env, ctx.ctx)).text();
+      await ctx.flush();
+      const warm = await handle(new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`), env, noopCtx());
+      assert.equal(warm.headers.get("x-beamline-source"), "cache", `${decision}: precondition: the row was cached`);
+      assert.match(warm.headers.get("cache-control"), /max-age=60/, `${decision}: cached on the long clock`);
+
+      const analyzed = await handle(
+        new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+        env,
+        waitCtx().ctx,
+      );
+      const body = await analyzed.text();
+      assert.equal(scan.hits.analyze, 1, `${decision}: served as a verdict instead of analysing`);
+      assert.equal(JSON.parse(body.trim()).decision, "allow", decision);
+    } finally {
+      await scan.close();
+    }
   }
 });
 
@@ -810,7 +971,7 @@ test("v1 analyze: a cached `unknown` is not an answer to `analyze`", async () =>
 test("v1 analyze: an upload is analysed even when its PURL has a cached verdict", async () => {
   const scan = await mockBackend({
     analyzeStream: ['{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0"}'],
-    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    v1: () => ({ decision: "unanalyzed", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   const ctx = waitCtx();
@@ -846,7 +1007,7 @@ test("v1 analyze: the decision is cached under its digest as well as its PURL", 
   const sha = "a1b2c3d4".repeat(8);
   const scan = await mockBackend({
     analyzeStream: [`{"decision":"block","fires_at":3,"purl":"pkg:npm/evil@1.0.0","sha256":"${sha}"}`],
-    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    v1: () => ({ decision: "unanalyzed", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   const ctx = waitCtx();
@@ -885,7 +1046,7 @@ test("v1 analyze: the decision is cached under its digest as well as its PURL", 
 test("v1 analyze: a decision naming no digest still caches under its PURL", async () => {
   const scan = await mockBackend({
     analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/evil@1.0.0","sha256":null}'],
-    v1: () => ({ decision: "unknown", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    v1: () => ({ decision: "unanalyzed", purl: "pkg:npm/evil@1.0.0", sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   const ctx = waitCtx();
@@ -916,7 +1077,7 @@ test("v1 analyze: a decision naming no digest still caches under its PURL", asyn
 test("v1: a cached answer carries the TTL its own content earns", async () => {
   const scan = await mockBackend({
     v1: () => ({
-      decision: "unknown", purl: "pkg:npm/nobody@1.0.0", sha256: null, severity: null,
+      decision: "unanalyzed", purl: "pkg:npm/nobody@1.0.0", sha256: null, severity: null,
       fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null,
     }),
   });
@@ -940,7 +1101,7 @@ test("v1: a cached answer carries the TTL its own content earns", async () => {
       env,
       ctx.ctx,
     );
-    assert.match(fresh.headers.get("cache-control"), /max-age=60/, "an unknown must go out short-lived");
+    assert.match(fresh.headers.get("cache-control"), /max-age=60/, "an unanalyzed row must go out short-lived");
     await fresh.text();
     await ctx.flush();
 
@@ -1005,9 +1166,10 @@ test("v1 analyze: answering from cache still opens the digest door", async () =>
     fires_at: 3, reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
   });
   const cache = _test.memoryCache();
-  // The state this exists for: the PURL key warm, the digest key cold.
+  // The state this exists for: the PURL key warm, the digest key cold. Both at
+  // `references`, the policy a PURL with no stated one resolves to.
   await cache.put(
-    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0&follow=references"),
     new Response(decision, {
       status: 200,
       headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" },
@@ -1027,7 +1189,7 @@ test("v1 analyze: answering from cache still opens the digest door", async () =>
     await ctx.flush();
     assert.equal(scan.hits.analyze, 0, "precondition: no analysis was dispatched");
 
-    const filed = await cache.match(new Request(`http://beamline/v1/lookup?sha256=${sha}`));
+    const filed = await cache.match(new Request(`http://beamline/v1/lookup?sha256=${sha}&follow=references`));
     assert.ok(filed, "the digest key was left cold by an answer that named the digest");
     assert.equal(JSON.parse(await filed.text()).decision, "block");
   } finally {
@@ -1059,8 +1221,8 @@ test("v1 analyze: the digest back-fill never refreshes an entry already there", 
       status: 200,
       headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" },
     });
-  await inner.put(key("purl=pkg%3Anpm%2Fevil%401.0.0"), stored(decision));
-  await inner.put(key(`sha256=${sha}`), stored(decision));
+  await inner.put(key("purl=pkg%3Anpm%2Fevil%401.0.0&follow=references"), stored(decision));
+  await inner.put(key(`sha256=${sha}&follow=references`), stored(decision));
 
   const scan = await mockBackend({ analyzeStream: [decision] });
   const env = testEnv(DEAD, { SCAN_URL: scan.url, cache });
@@ -1185,7 +1347,7 @@ test("v1: every worker down answers unavailable, not an error", async () => {
   assert.equal(res.status, 200, "an outage was reported as a request failure");
   const body = await res.json();
   assert.equal(body.decision, "unavailable");
-  assert.notEqual(body.decision, "unknown", "an outage was reported as a fact about the package");
+  assert.notEqual(body.decision, "unanalyzed", "an outage was reported as a fact about the package");
   assert.equal(body.fires_at, null);
   assert.deepEqual(body.findings, []);
   assert.equal(res.headers.get("cache-control"), "no-store", "an outage was made cacheable");
@@ -1253,7 +1415,7 @@ test("v1: scan source is exposed as the single Beamline source header", async ()
 test("v1: Bloom source is exposed as a derived Beamline source", async () => {
   const scan = await mockBackend({
     v1: {
-      decision: "unknown",
+      decision: "unanalyzed",
       purl: "pkg:npm/bloom@1.0.0",
       sha256: null,
       severity: null,
@@ -1286,7 +1448,7 @@ test("v1: a verdict caches for longer than an absence", async () => {
     v1: (u) => {
       const analyzed = u.searchParams.get("purl").includes("evil");
       return {
-        decision: analyzed ? "block" : "unknown",
+        decision: analyzed ? "block" : "unanalyzed",
         purl: u.searchParams.get("purl"),
         sha256: null,
         severity: null,
@@ -1412,7 +1574,45 @@ test("v1: KV is L1 behind Cache API and still applies the budget", async () => {
   assert.equal(writes, 0, "a KV read should not refresh the stored value");
 });
 
-test("v1: exact URL aliases the URL, PURL, and SHA cache keys", async () => {
+// Every KV write carries an expiry. Written without one a verdict is stored
+// forever, and a key whose spelling stops being read — an engine that moved on,
+// a policy nobody asks for — is never reclaimed, because a key nobody reads is
+// a key nobody misses.
+test("v1: KV writes expire, a verdict on the long clock and an unanalyzed row on the short one", async () => {
+  const purl = "pkg:npm/ttl@1.0.0";
+  const cases = [
+    ["verdict", { decision: "allow", severity: "benign", fires_at: -1, engine_version: "2.8.0" }, 90 * 24 * 60 * 60],
+    ["unanalyzed", { decision: "unanalyzed", severity: null, fires_at: null, engine_version: null }, 60],
+  ];
+  for (const [label, row, expected] of cases) {
+    const ttls = [];
+    const kv = {
+      async get() { return null; },
+      async put(_key, _body, options) { ttls.push(options && options.expirationTtl); },
+    };
+    const scan = await mockBackend({
+      v1: () => ({ purl, sha256: HELLO_SHA, reason: null, findings: [], analyzed_at: "2026-08-01T00:00:00Z", ...row }),
+    });
+    const env = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_KV: kv });
+    const ctx = waitCtx();
+    try {
+      const res = await handle(
+        new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+        env,
+        ctx.ctx,
+      );
+      assert.equal(res.status, 200, label);
+      await res.json();
+      await ctx.flush();
+      assert.ok(ttls.length > 0, `${label}: nothing reached KV`);
+      for (const ttl of ttls) assert.equal(ttl, expected, `${label}: stored without the expected expiry`);
+    } finally {
+      await scan.close();
+    }
+  }
+});
+
+test("v1: exact URL aliases the URL, PURL, and SHA cache keys within its policy", async () => {
   const artifactUrl = "https://registry.example.test/npm/app/-/app-1.0.0.tgz";
   const purl = "pkg:npm/app@1.0.0";
   let forwarded;
@@ -1445,10 +1645,13 @@ test("v1: exact URL aliases the URL, PURL, and SHA cache keys", async () => {
     assert.equal(forwarded.searchParams.get("url"), artifactUrl);
     await firstCtx.flush();
 
+    // Every name for the artifact, all asking the question the URL lookup
+    // answered. A URL resolves to `follow=none`, so that is where the answer is
+    // filed under each of them.
     for (const query of [
-      `url=${encodeURIComponent(artifactUrl)}`,
-      `purl=${encodeURIComponent(purl)}`,
-      `sha256=${HELLO_SHA}`,
+      `url=${encodeURIComponent(artifactUrl)}&follow=none`,
+      `purl=${encodeURIComponent(purl)}&follow=none`,
+      `sha256=${HELLO_SHA}&follow=none`,
     ]) {
       const res = await handle(new Request(`http://beamline/v1/lookup?${query}`), env, noopCtx());
       assert.equal(res.status, 200, query);
@@ -1459,6 +1662,20 @@ test("v1: exact URL aliases the URL, PURL, and SHA cache keys", async () => {
       else assert.equal(body.url, undefined);
     }
     assert.equal(scan.hits.v1, 1, "aliases should prevent a second scan lookup");
+
+    // Names alias, policies do not. A PURL with no stated policy asks about the
+    // dependency graph's install commands; this answer followed nothing, and
+    // serving it there would answer a question nobody got an analysis for.
+    const byDefault = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      noopCtx(),
+    );
+    assert.notEqual(
+      byDefault.headers.get("x-beamline-source"),
+      "cache",
+      "a follow=none answer was served to a caller asking the PURL's own question",
+    );
   } finally {
     await scan.close();
   }
@@ -2448,7 +2665,7 @@ test("v1: an authenticated answer is private to the caller", async () => {
 // measured at 0 successes in 12 requests.
 //
 // A 404 is never this request being wrong: the route answers 200 with
-// `unknown` for an artifact nobody has analyzed. It means the worker has no
+// `unanalyzed` for an artifact nobody has analyzed. It means the worker has no
 // such route, which is a fact about the worker.
 test("v1: a worker without the route is skipped, not relayed", async () => {
   const old = await mockBackend({ v1: () => ({ status: 404 }) });

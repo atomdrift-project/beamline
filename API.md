@@ -160,13 +160,28 @@ POST /v1/analyze?purl=…&follow=dependencies,references
 POST /v1/analyze?purl=…&follow=dependencies&follow=references
 ```
 
-Omitting `follow` uses the deployment's configured policy. A request may
-restrict that policy but cannot enable a category disabled by the operator;
-that is `follow_policy_not_allowed`.
+#### Defaults
 
-An explicit `follow` request bypasses the shared verdict cache and its result
-is not written there. Following different references can change the verdict,
-so a policy-specific answer must not replace the deployment's canonical one.
+Omitting `follow` selects a default from how you named the artifact, on the
+principle that we follow what your own resolution cannot show you:
+
+| named by | default | why |
+| --- | --- | --- |
+| `purl`, `sha256` | `references` | You walked a dependency graph to produce this name, and you are asking about it package by package. What that walk cannot show you is an install or download command fetching something no manifest declares. |
+| `url` | `none` | You hold the exact set of URLs already — a proxy resolved every one of them for you. |
+| uploaded bytes | `all` | Bytes name nothing. There is no resolution behind them and no lockfile beside them, so whatever is inside them is discoverable nowhere else. |
+
+A PURL sent alongside an upload names provenance, not the artifact in hand, so
+an upload keeps the upload default.
+
+An explicit `follow` selection replaces the configured categories after scan
+validates it. Scan's depth, size, and fan-out limits still apply.
+
+Verdicts are cached per policy. `follow=none` and `follow=all` are separate
+entries for one artifact and neither is served for the other's question, so
+asking a non-default policy twice still costs one analysis. `/v1/lookup` takes
+`follow` too, and resolves the same defaults — a lookup and an analysis that
+name a package the same way read and write the same entry.
 
 Progress frames exist
 because a silent connection is one an intermediary will eventually cut, and
@@ -190,10 +205,10 @@ held.
 | --- | --- | --- |
 | `allow` | Analyzed. Not hostile at your budget. | proceed |
 | `block` | Analyzed. Hostile at your budget. | stop |
-| `unknown` | Nobody has analyzed this. Nothing is wrong. | your policy |
+| `unanalyzed` | Nobody has analyzed this. Nothing is wrong. | your policy |
 | `unavailable` | **We could not answer.** Nothing about it. | your policy |
 
-`unknown` and `unavailable` are deliberately distinct. You may reasonably
+`unanalyzed` and `unavailable` are deliberately distinct. You may reasonably
 install unanalyzed packages while refusing to install anything during an
 outage — or the reverse. A partial answer is never an HTTP error: if we can
 decide four of five packages, that is a `200` carrying four decisions and one
@@ -211,7 +226,7 @@ know — see [findings](#findings).
 
 | field | type | |
 | --- | --- | --- |
-| `decision` | string | `allow`, `block`, `unknown`, `unavailable`. |
+| `decision` | string | `allow`, `block`, `unanalyzed`, `unavailable`. |
 | `purl` | string\|null | The package, spelled as you asked. |
 | `url` | string\|null | The exact URL, spelled as you asked; present for URL requests. |
 | `sha256` | string\|null | The exact bytes analyzed. |
@@ -275,7 +290,7 @@ member's own.
 ### Answers nobody measured
 
 Some artifacts have never been analyzed, and outside threat intelligence knows
-about them anyway. Rather than answer `unknown` about a package several
+about them anyway. Rather than answer `unanalyzed` about a package several
 independent feeds call malware, we answer with what those feeds say — marked as
 what it is.
 
@@ -336,7 +351,6 @@ reworded.
 | `url_with_body` | 400 | An exact URL cannot be combined with uploaded bytes. |
 | `invalid_false_positive_budget` | 400 | Not a whole number from 0 to 65535. |
 | `invalid_follow_policy` | 400 | Unknown, empty, or contradictory `follow` selection. |
-| `follow_policy_not_allowed` | 400 | Requests traversal disabled by the deployment. |
 | `invalid_purl` | 400 | Not a package URL. |
 | `invalid_sha256` | 400 | Not 64 hexadecimal characters. |
 | `too_many_packages` | 413 | Over 50 in one URL. Use several requests. |
@@ -349,7 +363,7 @@ without a package-level decision.
 
 | status | |
 | --- | --- |
-| 200 | A decision, or a list of them. Includes `unknown` and `unavailable`. |
+| 200 | A decision, or a list of them. Includes `unanalyzed` and `unavailable`. |
 | 400 | Your request. See `code`. |
 | 401 | Bad or missing bearer token when `BEAMLINE_TOKEN` is configured. |
 | 404 | No such route. |
@@ -388,17 +402,24 @@ the caller's budget to its `fires_at` value, so two callers on different budgets
 share one cached document while receiving the appropriate decision.
 
 The Cache API is L0. When configured, Workers KV is L1: it stores the same small
-document behind a hashed key and repopulates L0 on a hit. KV expiration, when
-configured, is measured from the write; reads do not refresh the expiration.
+document behind a hashed key and repopulates L0 on a hit. Every KV write carries
+an expiry — 90 days for a verdict, a minute for `unanalyzed` — measured from the
+write, and a read does not refresh it. A verdict is therefore at most 90 days
+old before the next caller pays for a fresh one; `KV_MAX_AGE` moves that
+horizon.
 
 The scope is `private` on an authenticated deployment — a verdict is knowledge
 about your artifact, not public data.
 
 A decision produced by `/v1/analyze` populates the lookup cache for that
-artifact. URL, PURL, and SHA-256 spellings are stored as aliases, and
-`/v1/analyze` reads those same aliases before it dispatches. Asking
-the expensive way twice therefore costs one analysis, not two: the second call
-returns the stored verdict as a single NDJSON line carrying
+artifact. URL, PURL, and SHA-256 spellings are stored as aliases of one
+question, and `/v1/analyze` reads those same aliases before it dispatches.
+Names alias; policies do not — an answer that followed nothing is filed under
+every name for the artifact at `follow=none`, and never over the answer to a
+question nobody ran an analysis for.
+
+Asking the expensive way twice therefore costs one analysis, not two: the
+second call returns the stored verdict as a single NDJSON line carrying
 `X-Beamline-Source: cache`, with no progress frames, because there was no run to
 report progress about.
 
@@ -406,10 +427,13 @@ Three things never answer from the cache:
 
 - an **upload**, which is a request to analyze *those bytes*. A PURL sent
   alongside one names provenance, not the artifact in hand.
-- a cached `unknown` or `unavailable`. Neither is an analysis: the first says
+- a cached `unanalyzed` or `unavailable`. Neither is an analysis: the first says
   nobody has analyzed the package, which is what you are asking us to change,
   and the second says we could not find out.
 - a request carrying `X-Beamline-Pin`, which exists to time a specific
   backend.
-- a request carrying an explicit `follow` policy, because its result is scoped
-  to that policy and is not a canonical verdict.
+
+A `follow` policy is not on that list: it is part of the cache key rather than
+a reason to skip it. Two policies can reach opposite verdicts about one
+artifact and both be right — bytes that are clean, an install script that is
+not — so each is stored under the question it answers and served only for it.

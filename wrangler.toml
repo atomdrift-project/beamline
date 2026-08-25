@@ -21,3 +21,7 @@ SCAN_TIMEOUT_MS = "1800000"
 # How long a verdict stays in caches.default. Short while the service is still
 # moving; raise it once the answers have settled.
 VERDICT_MAX_AGE = "3600"
+# How long a verdict stays in Workers KV, the layer behind it. Measured from the
+# write; a read does not extend it. Written without an expiry a verdict is
+# stored forever, and a key whose spelling stops being read is never reclaimed.
+KV_MAX_AGE = "7776000"

@@ -264,7 +264,7 @@ test("v1 check: an answer about a different package is a defect", () => {
 // has analyzed. Classifying on the status alone would count every miss as a
 // success and report a hit rate of 100%.
 test("v1: a miss and an outage are told apart inside a 200", () => {
-  assert.equal(_test.classify({ status: 200, decision: "unknown" }), "miss");
+  assert.equal(_test.classify({ status: 200, decision: "unanalyzed" }), "miss");
   assert.equal(_test.classify({ status: 200, decision: "unavailable" }), "note");
   assert.equal(_test.classify({ status: 200, decision: "allow" }), "ok");
   assert.equal(_test.classify({ status: 200, decision: "block" }), "ok");
