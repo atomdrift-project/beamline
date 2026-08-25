@@ -411,9 +411,50 @@ test("v1 analyze: progress reaches the caller, not just the decision", async () 
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type"), "application/x-ndjson");
     const lines = (await res.text()).trim().split("\n");
-    assert.equal(lines.length, 3, "the caller was handed only the answer, not the run");
-    assert.equal(JSON.parse(lines[0]).phase, "unpack");
-    assert.equal(JSON.parse(lines[2]).decision, "block");
+    assert.equal(lines.length, 5, "the caller was handed the annotated run and answer");
+    const unpackStarted = JSON.parse(lines[0]);
+    const unpackCompleted = JSON.parse(lines[1]);
+    const modelStarted = JSON.parse(lines[2]);
+    const modelCompleted = JSON.parse(lines[3]);
+    assert.equal(unpackStarted.phase, "unpack");
+    assert.equal(unpackStarted.phase_state, "started");
+    assert.equal(unpackStarted.phase_elapsed_ms, 0);
+    assert.equal(unpackStarted.total_elapsed_ms, 1002);
+    assert.equal(unpackStarted.request_id.length > 0, true);
+    assert.equal(unpackCompleted.phase, "unpack");
+    assert.equal(unpackCompleted.phase_state, "completed");
+    assert.equal(unpackCompleted.phase_elapsed_ms, 5002);
+    assert.equal(modelStarted.phase, "features+model");
+    assert.equal(modelStarted.phase_state, "started");
+    assert.equal(modelCompleted.phase, "features+model");
+    assert.equal(modelCompleted.phase_state, "completed");
+    assert.equal(JSON.parse(lines[4]).decision, "block");
+  } finally {
+    await scan.close();
+  }
+});
+
+test("v1 analyze: an omitted upstream phase is explicit and correlated", async () => {
+  const scan = await mockBackend({
+    analyzeStream: [
+      '{"state":"analyzing","purl":"pkg:npm/slow@1.0.0","elapsed_ms":100,"phase":null}',
+      '{"decision":"allow","fires_at":-1,"purl":"pkg:npm/slow@1.0.0"}',
+    ],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fslow%401.0.0", { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    const lines = (await res.text()).trim().split("\n").map(JSON.parse);
+    assert.equal(lines[0].phase, "unknown");
+    assert.equal(lines[0].phase_state, "started");
+    assert.equal(lines[1].phase_state, "completed");
+    assert.equal(lines[2].decision, "allow");
+    assert.equal("phase" in lines[0], true);
+    assert.notEqual(lines[0].phase, null);
   } finally {
     await scan.close();
   }
@@ -1069,17 +1110,17 @@ test("v1: a verdict caches for longer than an absence", async () => {
   }
 });
 
-// Two callers on different budgets are asking different questions about one
-// artifact. Serving the second the first's answer would enforce somebody else's
-// policy — silently, and for as long as the entry lives.
-test("v1: the budget is part of the cache key", async () => {
+// The document is stored once. Beamline applies each caller's budget to its
+// measured fires_at value, and scan never has to produce budget-shaped copies.
+test("v1: beamline applies the budget and stores one document", async () => {
   let asked = 0;
+  let scanReceivedBudget = false;
   const scan = await mockBackend({
     v1: (u) => {
       asked += 1;
-      const budget = Number(u.searchParams.get("false_positive_budget") || 25);
+      scanReceivedBudget = u.searchParams.has("false_positive_budget");
       return {
-        decision: budget >= 500 ? "block" : "allow",
+        decision: "allow",
         purl: "pkg:npm/borderline@1.0.0",
         sha256: null,
         severity: null,
@@ -1104,14 +1145,60 @@ test("v1: the budget is part of the cache key", async () => {
   };
   try {
     assert.equal(await ask(25), "allow");
-    assert.equal(await ask(1000), "block", "a second budget was served the first one's decision");
-    assert.equal(asked, 2);
-    // And the same budget is served from cache rather than re-asked.
+    assert.equal(await ask(1000), "block", "beamline did not apply the caller's budget");
+    assert.equal(asked, 1, "different budgets caused duplicate origin work");
+    assert.equal(scanReceivedBudget, false, "the budget was delegated to scan");
+    // And the same document is served from cache rather than re-asked.
     assert.equal(await ask(25), "allow");
-    assert.equal(asked, 2, "a cached budget was asked again");
+    assert.equal(asked, 1, "a cached document was asked again");
   } finally {
     await scan.close();
   }
+});
+
+test("v1: KV is L1 behind Cache API and still applies the budget", async () => {
+  let reads = 0;
+  let writes = 0;
+  const document = JSON.stringify({
+    decision: "allow",
+    purl: "pkg:npm/kv@1.0.0",
+    sha256: null,
+    severity: "suspicious",
+    fires_at: 500,
+    reason: null,
+    findings: [],
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  });
+  const kv = {
+    async get() {
+      reads += 1;
+      return document;
+    },
+    async put() {
+      writes += 1;
+    },
+  };
+  const env = testEnv(DEAD, { SCAN_URL: DEAD, BEAMLINE_KV: kv });
+  const ask = async (budget) => {
+    const ctx = waitCtx();
+    const res = await handle(
+      new Request(`http://beamline/v1/lookup?purl=pkg%3Anpm%2Fkv%401.0.0&false_positive_budget=${budget}`),
+      env,
+      ctx.ctx,
+    );
+    await ctx.flush();
+    return res;
+  };
+
+  const strict = await ask(25);
+  assert.equal(strict.headers.get("x-beamline-source"), "kv");
+  assert.equal((await strict.json()).decision, "allow");
+  const loose = await ask(1000);
+  assert.equal(loose.headers.get("x-beamline-source"), "cache");
+  assert.equal((await loose.json()).decision, "block");
+  assert.equal(reads, 1, "the L0 cache should shield KV after the first read");
+  assert.equal(writes, 0, "a KV read should not refresh the stored value");
 });
 
 // A malformed budget is refused rather than replaced by the default, for the
@@ -1314,6 +1401,7 @@ function testEnv(url, extra = {}) {
   return {
     HOPPER_URL: extra.HOPPER_URL ?? url,
     SCAN_URL: extra.SCAN_URL ?? url,
+    BEAMLINE_KV: extra.BEAMLINE_KV,
     // Carried through because it decides two things at once: whether a request
     // is authenticated at all, and what cache scope the answer goes out with.
     BEAMLINE_TOKEN: extra.BEAMLINE_TOKEN,

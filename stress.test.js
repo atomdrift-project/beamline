@@ -77,6 +77,20 @@ test("percentile is nearest-rank", () => {
   assert.equal(_test.percentile([1, 2, 3, 4], 50), 2);
 });
 
+test("route metrics count expected misses as successful requests", () => {
+  const metrics = _test.routeMetrics([
+    { eco: "npm", kind: "ok", ms: 10 },
+    { eco: "npm", kind: "miss", ms: 20 },
+    { eco: "pypi", kind: "note", ms: 30 },
+    { eco: "pypi", kind: "bug", ms: 40 },
+  ]);
+  assert.equal(metrics.success, 2);
+  assert.equal(metrics.successRate, 0.5);
+  assert.equal(metrics.p90, 40);
+  assert.deepEqual(metrics.byEco.npm, { n: 2, success: 2, successRate: 1, p90: 20 });
+  assert.deepEqual(metrics.byEco.pypi, { n: 2, success: 0, successRate: 0, p90: 40 });
+});
+
 test("classify treats a missing envelope as a bug, saturation as a note", () => {
   assert.equal(_test.classify({ status: 200 }), "ok");
   assert.equal(_test.classify({ status: 200, issues: ["sha"] }), "bug");
@@ -150,6 +164,11 @@ test("popular jobs interleave ecosystems", () => {
   // Round-robin, so a run spreads load across registries rather than doing all
   // of npm and then all of pypi.
   assert.deepEqual(mixed.slice(0, 4).map((j) => j.eco), ["npm", "pypi", "cargo", "golang"]);
+});
+
+test("popular jobs can be repeated to a request count", () => {
+  const base = [{ eco: "npm", purl: "a" }, { eco: "pypi", purl: "b" }];
+  assert.deepEqual(_test.repeatJobs(base, 2), [...base, ...base]);
 });
 
 // The v1 contract as a client has to read it. The shape never moving is the

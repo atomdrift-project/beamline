@@ -157,6 +157,7 @@ const V1_VERDICT_MAX_AGE = 3600;
 // a registry, which is what `?purl=` is for.
 const V1_MAX_UPLOAD_BYTES = 16 * 1024 * 1024;
 const V1_UNKNOWN_MAX_AGE = 60;
+const DEFAULT_FALSE_POSITIVE_BUDGET = 25;
 
 // GET /v1/lookup — what we know, at the caller's budget. Never analyzes.
 //
@@ -169,6 +170,7 @@ async function handleV1Lookup(env, ctx, url) {
   const purls = url.searchParams.getAll("purl").map((p) => p.trim()).filter(Boolean);
   const sha = (url.searchParams.get("sha256") || "").trim();
   const budgetRaw = url.searchParams.get("false_positive_budget");
+  const budget = parseFalsePositiveBudget(budgetRaw);
 
   if (!sha && !purls.length) {
     return v1Error(400, "missing_package", "Name a package with ?purl= or ?sha256=.");
@@ -183,7 +185,7 @@ async function handleV1Lookup(env, ctx, url) {
   // Refused rather than quietly replaced by the default: a caller who meant to
   // loosen their budget and got the strict one back would see verdicts they
   // never asked for, with nothing in the response to say why.
-  if (budgetRaw !== null && !/^\d{1,5}$/.test(budgetRaw.trim())) {
+  if (budget === null) {
     return v1Error(
       400,
       "invalid_false_positive_budget",
@@ -191,17 +193,10 @@ async function handleV1Lookup(env, ctx, url) {
     );
   }
 
-  // Keyed by the PURL as the caller spelled it, deliberately un-normalized.
-  // Scan answers with the spelling it was asked with, so one cached body is
-  // only a correct answer to the spelling that produced it — canonicalizing
-  // the key here would serve `pkg:npm/x` a body that says `npm/x`, and a
-  // caller matching replies to requests would find neither. Two spellings of
-  // one package cost two entries; the alternative costs correctness.
-  //
-  // The budget is part of the question, so it is part of the cache key. Two
-  // callers on different budgets are asking different things about the same
-  // artifact and must not be served each other's answer.
-  const path = v1CachePath(sha, purls, budgetRaw);
+  // The document is keyed by the artifact question, not by the caller's
+  // policy. Beamline applies false_positive_budget to `fires_at` below, so one
+  // stored document can answer every budget consistently.
+  const path = v1CachePath(sha, purls);
 
   const cache = await getCache(env);
   const cacheKey = new Request(`${url.origin}${path}`);
@@ -209,7 +204,8 @@ async function handleV1Lookup(env, ctx, url) {
   if (hit) {
     // Buffered rather than streamed through, because the answer decides how
     // long the caller may hold it. Decisions are one small object.
-    const body = await hit.text();
+    const document = await hit.text();
+    const body = v1BudgetedBody(document, budget);
     const res = new Response(body, hit);
     res.headers.set("X-Beamline-Source", "cache");
     // Derived from the answer, never read back from the cache.
@@ -221,12 +217,25 @@ async function handleV1Lookup(env, ctx, url) {
     // an `unknown` really is gone a minute later — but the caller was being
     // told to hold it for four hours, which is exactly the staleness the short
     // TTL exists to prevent.
-    res.headers.set("cache-control", clientScope(env, v1MaxAge(body)));
+    res.headers.set("cache-control", clientScope(env, v1MaxAge(document)));
     res.headers.delete("X-Beamline-Worker");
     return res;
   }
 
-  return v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budgetRaw);
+  if (!ctx.pin) {
+    const document = await kvGet(env, path);
+    if (document) {
+      const body = v1BudgetedBody(document, budget);
+      if (body) {
+        const res = v1Body(env, body, 200, null, v1MaxAge(document));
+        res.headers.set("X-Beamline-Source", "kv");
+        waitUntil(ctx, cache.put(cacheKey, storedDocument(document, env)));
+        return res;
+      }
+    }
+  }
+
+  return v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budget);
 }
 
 // Ask the workers in turn until one answers.
@@ -235,7 +244,7 @@ async function handleV1Lookup(env, ctx, url) {
 // lookup spends no analysis slot, and since every worker defers to the same
 // corpus when it does not know, they now give the same answer. Broadcasting
 // would multiply the load behind them to learn nothing.
-async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budgetRaw) {
+async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budget) {
   const ids = { rid: ctx.rid, sha256: sha || undefined, purl: purls[0] };
   const origin = new URL(cacheKey.url).origin;
   const workers = await lookupOrder(env, ctx, scanWorkers(env), ids);
@@ -279,18 +288,22 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budgetRaw) {
       }
       breakerFor(base).ok();
       logLine("v1_lookup", { src: "scan", status: 200, worker, ms: Date.now() - t0, ...ids });
-      const res = v1Body(env, answered.body, 200, worker, v1MaxAge(answered.body));
-      if (!v1MaxAge(answered.body)) return res;
+      const document = v1DocumentBody(answered.body);
+      const stored = document || answered.body;
+      const body = document ? v1BudgetedBody(document, budget) : answered.body;
+      const res = v1Body(env, body, 200, worker, v1MaxAge(stored));
+      if (!v1MaxAge(stored)) return res;
       // The asked-for key is stored by serveHit; the digest the answer names is
       // stored here. A lookup by PURL that reached a worker has just learned
       // the artifact's identity, and the next caller who knows only that
       // identity should not have to reach a worker to learn the same thing.
       // Skipped when they are the same key — a sha lookup has nothing to add.
-      const digestKey = `${origin}${v1CachePath(v1DecisionSha(answered.body) || "", [], budgetRaw)}`;
-      if (v1DecisionSha(answered.body) && digestKey !== cacheKey.url) {
-        waitUntil(ctx, backfillDigestKey(env, cache, origin, answered.body, budgetRaw));
+      const digestKey = `${origin}${v1CachePath(v1DecisionSha(stored) || "", [])}`;
+      if (v1DecisionSha(stored) && digestKey !== cacheKey.url) {
+        waitUntil(ctx, backfillDigestKey(env, cache, origin, stored));
       }
-      return serveHit(ctx, cache, cacheKey, res);
+      waitUntil(ctx, kvPut(env, path, stored));
+      return serveHit(ctx, cache, cacheKey, res, stored, env);
     } catch {
       breakerFor(base).fail();
     }
@@ -331,11 +344,10 @@ function v1Unavailable(sha, purl) {
 // were three separate string literals saying the same thing, and a key that
 // differs by one character between the writer and the reader is a cache that
 // never hits and never says why.
-function v1CachePath(sha, purls, budgetRaw) {
+function v1CachePath(sha, purls) {
   const query = [];
   if (sha) query.push(`sha256=${encodeURIComponent(sha)}`);
   for (const purl of purls) query.push(`purl=${encodeURIComponent(purl)}`);
-  if (budgetRaw !== null) query.push(`false_positive_budget=${encodeURIComponent(budgetRaw.trim())}`);
   return `/v1/lookup?${query.join("&")}`;
 }
 
@@ -354,25 +366,18 @@ function v1CachePath(sha, purls, budgetRaw) {
 // every time it is read would refresh its TTL forever, and an entry that never
 // ages is pinned rather than cached. A verdict is allowed to go stale on
 // schedule.
-async function backfillDigestKey(env, cache, origin, body, budgetRaw) {
+async function backfillDigestKey(env, cache, origin, body) {
   const sha = v1DecisionSha(body);
   if (!sha) return;
   const maxAge = v1MaxAge(body);
   if (!maxAge) return;
-  const key = new Request(`${origin}${v1CachePath(sha, [], budgetRaw)}`);
+  const key = new Request(`${origin}${v1CachePath(sha, [])}`);
   if (await cache.match(key).catch(() => null)) return;
   await cache.put(
     key,
-    storedCopy(
-      new Response(body, {
-        status: 200,
-        headers: {
-          "content-type": "application/json",
-          "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
-        },
-      }),
-    ),
+    storedDocument(body, env),
   );
+  await kvPut(env, v1CachePath(sha, []), body);
   logLine("v1_cache_backfill", { key: "sha256", sha, max_age: maxAge });
 }
 
@@ -386,6 +391,83 @@ function v1DecisionSha(body) {
   }
   const sha = row && typeof row === "object" ? row.sha256 : null;
   return typeof sha === "string" && SHA_RE.test(sha) ? sha : null;
+}
+
+function parseFalsePositiveBudget(raw) {
+  if (raw === null) return DEFAULT_FALSE_POSITIVE_BUDGET;
+  const value = String(raw).trim();
+  if (!/^\d{1,5}$/.test(value)) return null;
+  const budget = Number(value);
+  return budget <= 65535 ? budget : null;
+}
+
+function v1DocumentBody(body) {
+  let row;
+  try {
+    row = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (!row || typeof row !== "object") return null;
+  if (Array.isArray(row)) {
+    if (!row.every((item) => item && typeof item === "object")) return null;
+    return JSON.stringify(row.map((item) => canonicalV1Row(item)));
+  }
+  return JSON.stringify(canonicalV1Row(row));
+}
+
+function canonicalV1Row(row) {
+  return applyBudgetToRow(row, DEFAULT_FALSE_POSITIVE_BUDGET);
+}
+
+function v1BudgetedBody(body, budget) {
+  let row;
+  try {
+    row = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (!row || typeof row !== "object") return null;
+  return JSON.stringify(
+    Array.isArray(row) ? row.map((item) => applyBudgetToRow(item, budget)) : applyBudgetToRow(row, budget),
+  );
+}
+
+function applyBudgetToRow(row, budget) {
+  if (!row || typeof row !== "object" || Array.isArray(row)) return row;
+  if (row.engine_version && Number.isInteger(row.fires_at)) {
+    return { ...row, decision: row.fires_at >= 0 && row.fires_at <= budget ? "block" : "allow" };
+  }
+  return row;
+}
+
+// KV keys are hashes rather than raw URLs: a batch of PURLs can exceed KV's
+// 512-byte key limit, while the lookup path remains the single source of truth
+// for both Cache API and KV key identity.
+async function kvKey(path) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(path));
+  return `v1:${[...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function kvGet(env, path) {
+  const kv = env && env.BEAMLINE_KV;
+  if (!kv || typeof kv.get !== "function") return null;
+  try {
+    return await kv.get(await kvKey(path));
+  } catch (err) {
+    logLine("v1_kv_read", { ok: false, err: errText(err) });
+    return null;
+  }
+}
+
+async function kvPut(env, path, body) {
+  const kv = env && env.BEAMLINE_KV;
+  if (!kv || typeof kv.put !== "function") return;
+  const maxAge = v1MaxAge(body);
+  const options = maxAge === V1_UNKNOWN_MAX_AGE ? { expirationTtl: maxAge } : undefined;
+  const key = await kvKey(path);
+  if (options) await kv.put(key, body, options);
+  else await kv.put(key, body);
 }
 
 // A cached body /v1/analyze may answer with, or null.
@@ -467,6 +549,7 @@ function v1Error(status, code, message) {
 async function handleV1Analyze(request, env, ctx, url) {
   const purl = (url.searchParams.get("purl") || "").trim();
   const budgetRaw = url.searchParams.get("false_positive_budget");
+  const budget = parseFalsePositiveBudget(budgetRaw);
   // Two ways to name an artifact, and the artifact itself is one of them. A
   // caller holding bytes nobody has published — a build output, a file off
   // disk, something pulled from a mirror — has nothing to locate them by, and
@@ -494,7 +577,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   if (!purl && !bytes) {
     return v1Error(400, "missing_package", "Name a package with ?purl=, or send the artifact as the body.");
   }
-  if (budgetRaw !== null && !/^\d{1,5}$/.test(budgetRaw.trim())) {
+  if (budget === null) {
     return v1Error(
       400,
       "invalid_false_positive_budget",
@@ -506,7 +589,6 @@ async function handleV1Analyze(request, env, ctx, url) {
   // The PURL rides along with an upload too: scan grafts the registry
   // provenance onto the report and echoes it in each finding's `pkg`.
   if (purl) query.push(`purl=${encodeURIComponent(purl)}`);
-  if (budgetRaw !== null) query.push(`false_positive_budget=${encodeURIComponent(budgetRaw.trim())}`);
   const path = `/v1/analyze${query.length ? `?${query.join("&")}` : ""}`;
   const ids = { rid: ctx.rid, purl: purl || undefined, bytes: bytes ? bytes.byteLength : undefined };
   const t0 = Date.now();
@@ -526,17 +608,20 @@ async function handleV1Analyze(request, env, ctx, url) {
   // exactly as it does on the lookup: it exists to time a specific backend.
   if (purl && !bytes && !ctx.pin) {
     const cache = await getCache(env);
-    const key = new Request(`${url.origin}${v1CachePath(null, [purl], budgetRaw)}`);
+    const cachePath = v1CachePath(null, [purl]);
+    const key = new Request(`${url.origin}${cachePath}`);
     const hit = await cache.match(key).catch(() => null);
-    const body = hit ? await hit.text().catch(() => null) : null;
-    const decided = body ? v1CachedVerdict(body) : null;
+    let document = hit ? await hit.text().catch(() => null) : null;
+    if (!document) document = await kvGet(env, cachePath);
+    const decided = document ? v1CachedVerdict(document) : null;
     if (decided) {
       // Serving from cache used to warm nothing, because this path returns
       // before the write below ever runs. So a warm PURL key left the digest
       // key cold indefinitely: every caller holding only a hash paid a round
       // trip to learn something we were already holding, and answering them
       // never fixed it either.
-      waitUntil(ctx, backfillDigestKey(env, cache, url.origin, body, budgetRaw));
+      const body = v1BudgetedBody(document, budget);
+      waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document));
       logLine("v1_analyze", { src: "cache", status: 200, decision: decided.decision, ms: Date.now() - t0, ...ids });
       // Answered in the shape this route always answers in: one NDJSON line,
       // no progress frames because there was no run to report progress about.
@@ -545,7 +630,7 @@ async function handleV1Analyze(request, env, ctx, url) {
         headers: {
           "content-type": "application/x-ndjson",
           "cache-control": "no-store",
-          "X-Beamline-Source": "cache",
+        "X-Beamline-Source": hit ? "cache" : "kv",
         },
       });
     }
@@ -582,7 +667,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   const busyDeadline = t0 + numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS) * BUSY_BUDGET_SHARE;
   for (let attempt = 0; ; attempt++) {
     const pass = { busy: 0, broken: 0 };
-    const answered = await v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, bytes, pass);
+    const answered = await v1Dispatch(env, ctx, url, purl, path, budget, busy, ids, t0, bytes, pass);
     if (answered) return answered;
     const stillWorthOffering = pass.busy > 0 && Date.now() < busyDeadline;
     if ((attempt >= tries && !stillWorthOffering) || !scanWorkers(env).length) break;
@@ -604,7 +689,7 @@ async function handleV1Analyze(request, env, ctx, url) {
 
 // One pass over the fleet. Returns the response, or null when every worker
 // refused and the pass is worth making again.
-async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, bytes, pass) {
+async function v1Dispatch(env, ctx, url, purl, path, budget, busy, ids, t0, bytes, pass) {
   const workers = scanWorkers(env);
   let ranked = workers.length ? (await rankWorkers(env, ctx, workers, ids, { purl })).workers : [];
   if (busy) {
@@ -674,8 +759,14 @@ async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, b
     // cheap route reads. Teeing rather than buffering keeps the caller's copy
     // flowing while ours is still arriving.
     const [out, mine] = upstream.body.tee();
-    waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, purl, budgetRaw, mine));
-    return new Response(out, {
+    waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, purl, mine));
+    return new Response(
+      annotatedV1Stream(out, budget, {
+        requestId: ctx.rid,
+        purl,
+        startedAt: t0,
+      }),
+      {
       status: 200,
       headers: {
         "content-type": "application/x-ndjson",
@@ -683,7 +774,8 @@ async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, b
         "X-Beamline-Worker": worker,
         "X-Beamline-Source": "scan",
       },
-    });
+      },
+    );
   }
 
   return null;
@@ -696,14 +788,19 @@ async function v1Dispatch(env, ctx, url, purl, path, budgetRaw, busy, ids, t0, b
 // run was doing. A stream that ends without one was cut short, and caching a
 // truncated answer would turn one dropped connection into a wrong answer served
 // from the edge — so nothing is stored unless a decision actually arrived.
-async function cacheV1Decision(env, ctx, origin, purl, budgetRaw, stream) {
+async function cacheV1Decision(env, ctx, origin, purl, stream) {
   const ids = { rid: ctx.rid, purl };
   const decided = await lastDecision(stream);
   if (!decided) {
     logLine("v1_cache_write", { stored: false, reason: "no_decision", ...ids });
     return;
   }
-  const maxAge = v1MaxAge(decided);
+  const document = v1DocumentBody(decided);
+  if (!document) {
+    logLine("v1_cache_write", { stored: false, reason: "invalid_decision", ...ids });
+    return;
+  }
+  const maxAge = v1MaxAge(document);
   if (!maxAge) {
     logLine("v1_cache_write", { stored: false, reason: "uncacheable", ...ids });
     return;
@@ -720,27 +817,16 @@ async function cacheV1Decision(env, ctx, origin, purl, budgetRaw, stream) {
   // rather than the canonical one scan would have answered with. Both name the
   // same artifact and the digest is the identity, but it is a spelling a
   // different caller chose.
-  const sha = v1DecisionSha(decided);
-  const paths = [v1CachePath(null, [purl], budgetRaw)];
-  if (sha) paths.push(v1CachePath(sha, [], budgetRaw));
+  const sha = v1DecisionSha(document);
+  const paths = [v1CachePath(null, [purl])];
+  if (sha) paths.push(v1CachePath(sha, []));
   for (const path of paths) {
     try {
       await cache.put(
         new Request(`${origin}${path}`),
-        // Through storedCopy, not straight to put: this used to build its own
-        // `private` response and store it directly, which Cloudflare discards.
-        // The whole warm-write did nothing in production, passed every test,
-        // and reported nothing either way.
-        storedCopy(
-          new Response(decided, {
-            status: 200,
-            headers: {
-              "content-type": "application/json",
-              "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
-            },
-          }),
-        ),
+        storedDocument(document, env),
       );
+      await kvPut(env, path, document);
     } catch (err) {
       // One key failing is not a reason to abandon the other: a half-warmed
       // cache still saves the analysis the other key would have cost.
@@ -748,6 +834,121 @@ async function cacheV1Decision(env, ctx, origin, purl, budgetRaw, stream) {
     }
   }
   logLine("v1_cache_write", { stored: true, max_age: maxAge, keys: paths.length, sha: sha || undefined, ...ids });
+}
+
+// Add phase telemetry to the progress stream without changing the cached
+// decision. Scan's older progress frames only carried a nullable phase and a
+// total elapsed time, which made a missing phase indistinguishable from a
+// stalled run. The Worker owns the request clock, so it can also correlate the
+// frames without asking every scan version to learn a new wire format first.
+function annotatedV1Stream(stream, budget, meta) {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffered = "";
+  const phase = { name: null, startedElapsed: 0, lastElapsed: 0 };
+
+  const encodeLine = (line) => {
+    const rows = annotatedV1Lines(line, budget, meta, phase);
+    return rows.map((row) => encoder.encode(`${row}\n`));
+  };
+
+  return stream.pipeThrough(
+    new TransformStream({
+      transform(chunk, controller) {
+        buffered += decoder.decode(chunk, { stream: true });
+        const lines = buffered.split("\n");
+        buffered = lines.pop() ?? "";
+        for (const line of lines) {
+          for (const encoded of encodeLine(line)) controller.enqueue(encoded);
+        }
+      },
+      flush(controller) {
+        buffered += decoder.decode();
+        if (buffered) {
+          for (const encoded of encodeLine(buffered)) controller.enqueue(encoded);
+        }
+      },
+    }),
+  );
+}
+
+function annotatedV1Lines(line, budget, meta, phase) {
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return [line];
+  }
+  if (!row || typeof row !== "object" || Array.isArray(row)) {
+    return [budgetedV1Line(line, budget)];
+  }
+
+  const totalElapsed = finiteMs(row.elapsed_ms) ?? phase.lastElapsed;
+  if (Number.isFinite(totalElapsed)) phase.lastElapsed = totalElapsed;
+
+  // A decision is the terminal event. Close the last reported phase in its own
+  // frame so clients never have to infer completion from the decision shape.
+  if (Object.prototype.hasOwnProperty.call(row, "decision")) {
+    const done = phaseCompletion(meta, phase);
+    return [...(done ? [JSON.stringify(done)] : []), budgetedV1Line(line, budget)];
+  }
+
+  if (row.state !== "analyzing") return [budgetedV1Line(line, budget)];
+
+  const name = typeof row.phase === "string" && row.phase.trim() ? row.phase.trim() : "unknown";
+  const elapsed = Number.isFinite(totalElapsed) ? totalElapsed : 0;
+  const rows = [];
+  if (phase.name && phase.name !== name) {
+    const done = phaseCompletion(meta, phase, elapsed);
+    if (done) rows.push(JSON.stringify(done));
+    phase.name = null;
+  }
+  if (!phase.name) {
+    phase.name = name;
+    phase.startedElapsed = elapsed;
+    rows.push(JSON.stringify(phaseFrame(row, meta, phase, "started", elapsed)));
+  } else {
+    rows.push(JSON.stringify(phaseFrame(row, meta, phase, "running", elapsed)));
+  }
+  return rows;
+}
+
+function phaseFrame(row, meta, phase, state, elapsed) {
+  return {
+    ...row,
+    elapsed_ms: elapsed,
+    phase: phase.name,
+    phase_state: state,
+    phase_elapsed_ms: Math.max(0, elapsed - phase.startedElapsed),
+    total_elapsed_ms: elapsed,
+    phase_started_at: new Date(meta.startedAt + phase.startedElapsed).toISOString(),
+    request_id: meta.requestId,
+    ...(row.purl == null && meta.purl ? { purl: meta.purl } : {}),
+  };
+}
+
+function phaseCompletion(meta, phase, elapsed = phase.lastElapsed) {
+  if (!phase.name) return null;
+  const frame = phaseFrame(
+    { state: "analyzing", purl: meta.purl || undefined },
+    meta,
+    phase,
+    "completed",
+    Number.isFinite(elapsed) ? elapsed : phase.startedElapsed,
+  );
+  phase.name = null;
+  return frame;
+}
+
+function finiteMs(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function budgetedV1Line(line, budget) {
+  if (!line.includes('"decision"')) return line;
+  const body = v1BudgetedBody(line, budget);
+  return body || line;
 }
 
 // The last line of an NDJSON stream that carries a decision, or null.
@@ -1868,10 +2069,22 @@ function storedCopy(res) {
   return copy;
 }
 
-function serveHit(ctx, cache, cacheKey, res) {
+function storedDocument(body, env) {
+  return storedCopy(
+    new Response(body, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": `${cacheScope(env)}, max-age=${v1MaxAge(body)}`,
+      },
+    }),
+  );
+}
+
+function serveHit(ctx, cache, cacheKey, res, document, env) {
   // Cloned now, stored later: by the time the deferred put runs, the caller
   // may already have consumed the body it is holding.
-  const copy = storedCopy(res);
+  const copy = document ? storedDocument(document, env) : storedCopy(res);
   // A cache that throws, synchronously or not, must not fail the lookup.
   waitUntil(ctx, Promise.resolve().then(() => cache.put(cacheKey, copy)));
   return res;

@@ -8,14 +8,17 @@ WRANGLER    ?= wrangler@4.124.0
 OXLINT      ?= oxlint@1.79.0
 
 PORT        ?= 8080
-N           ?= 6
+N           ?= 100
 SAMPLES     ?=
 CONCURRENCY ?= 2
 DRAIN_S     ?= 5
 STRESS_OUT  ?=
 POPULAR     ?=
 ANALYZE_MISSES ?=
-BEAMLINE_URL ?=
+STRESS_ROUTE ?= both
+REPEAT      ?= 1
+API         ?= v1
+BEAMLINE_URL ?= https://api.isotope13.ai
 BEAMLINE_TOKEN ?=
 # Backend credentials. Unset means tok.js reads ~/.tok/<service>, which is
 # where the services themselves are pointed by --token-file.
@@ -28,8 +31,9 @@ export HOPPER_TOKEN
 export SCAN_TOKEN
 SCAN_RACE_DELAY_MS ?=
 SCAN_RETRIES ?=
+KV_NAMESPACE ?= beamline
 
-.PHONY: lint test stress-test pop-test deploy-cf
+.PHONY: lint test stress-test pop-test kv-create deploy-cf
 
 # Parse every file, then oxlint. No lint config is checked in: the defaults
 # are the standard, and the tree stays free of npm packages.
@@ -43,15 +47,16 @@ test:
 	node --test
 
 # Start a local beamline (unless BEAMLINE_URL is already set or :$(PORT) is up),
-# pull new npm / PyPI / crates / Go PURLs, submit them, print latency and bugs.
+# pull 100 npm / PyPI / crates / Go PURLs, then run lookup and analyze phases
+# against that same set, printing per-ecosystem success rate and p90 latency.
 # HOPPER_URL is optional here and reports the corpus's health alongside the
 # fleet's. Beamline no longer reaches hopper, so a run without it is a complete
 # run — one panel short, not one dependency short.
 stress-test:
-	@test -n "$(SCAN_URL)" || { echo "SCAN_URL is required"; exit 1; }
 	@url="$(BEAMLINE_URL)"; \
 	started=""; \
 	if [ -z "$$url" ]; then \
+	  test -n "$(SCAN_URL)" || { echo "SCAN_URL is required when starting a local beamline"; exit 1; }; \
 	  if node -e "fetch('http://127.0.0.1:$(PORT)/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" 2>/dev/null; then \
 	    url="http://127.0.0.1:$(PORT)"; \
 	    echo "using existing beamline at $$url"; \
@@ -78,7 +83,7 @@ stress-test:
 	  fi; \
 	fi; \
 	set +e; \
-	N="$(N)" SAMPLES="$(SAMPLES)" CONCURRENCY="$(CONCURRENCY)" BEAMLINE_URL="$$url" BEAMLINE_TOKEN="$(BEAMLINE_TOKEN)" \
+	N="$(N)" SAMPLES="$(SAMPLES)" REPEAT="$(REPEAT)" CONCURRENCY="$(CONCURRENCY)" STRESS_ROUTE="$(STRESS_ROUTE)" API="$(API)" BEAMLINE_URL="$$url" BEAMLINE_TOKEN="$(BEAMLINE_TOKEN)" \
 	  SCAN_URL="$(SCAN_URL)" HOPPER_URL="$(HOPPER_URL)" STRESS_OUT="$(STRESS_OUT)" POPULAR="$(POPULAR)" \
 	  HOPPER_TOKEN="$(HOPPER_TOKEN)" SCAN_TOKEN="$(SCAN_TOKEN)" ANALYZE_MISSES="$(ANALYZE_MISSES)" \
 	  node stress.js; \
@@ -95,7 +100,12 @@ stress-test:
 # Two runs are comparable, so the interesting number is how much came back from
 # a cache or an index rather than from a fresh analysis.
 pop-test:
-	@$(MAKE) --no-print-directory stress-test POPULAR=1 ANALYZE_MISSES=1
+	@$(MAKE) --no-print-directory stress-test POPULAR=1 ANALYZE_MISSES=1 STRESS_ROUTE=combined
+
+# Create the default KV namespace. Copy the returned ID into wrangler.toml's
+# BEAMLINE_KV binding before deploying.
+kv-create:
+	npx --yes $(WRANGLER) kv namespace create "$(KV_NAMESPACE)"
 
 # Publish beamline.js as a Cloudflare Worker. 200s land in caches.default.
 # SCAN_URL is the public hostname of the Cloudflare Tunnel in front of scan;
@@ -134,7 +144,7 @@ endef
 
 deploy-cf:
 	@test -n "$(SCAN_URL)" || { echo "SCAN_URL is required"; exit 1; }
-	npx --yes $(WRANGLER) deploy \
-	  --var "SCAN_URL:$(SCAN_URL)"
+	@test -n "$(KV)" || { echo "KV is required (Cloudflare KV namespace ID)"; exit 1; }
+	KV="$(KV)" SCAN_URL="$(SCAN_URL)" WRANGLER="$(WRANGLER)" node scripts/deploy-cf.mjs
 	$(call put_secret,BEAMLINE_TOKEN,beamline)
 	$(call put_secret,SCAN_TOKEN,scan)

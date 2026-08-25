@@ -97,13 +97,22 @@ decision. **Read lines until one carries `decision`. That is the answer.**
 ```
 $ curl -sN -X POST \
     'https://api.atomdrift.com/v1/analyze?purl=pypi/tensorflow@2.15.0'
-{"state":"analyzing","elapsed_ms":1002,"phase":"fetch","purl":"pypi/tens…"}
-{"state":"analyzing","elapsed_ms":6004,"phase":"unpack","purl":"pypi/tens…"}
-{"state":"analyzing","elapsed_ms":11006,"phase":"features+model","purl":"…"}
+{"state":"analyzing","elapsed_ms":1002,"total_elapsed_ms":1002,"phase":"fetch","phase_state":"started","phase_elapsed_ms":0,"request_id":"…","purl":"pypi/tens…"}
+{"state":"analyzing","elapsed_ms":6004,"total_elapsed_ms":6004,"phase":"fetch","phase_state":"completed","phase_elapsed_ms":5002,"request_id":"…","purl":"pypi/tens…"}
+{"state":"analyzing","elapsed_ms":6004,"total_elapsed_ms":6004,"phase":"unpack","phase_state":"started","phase_elapsed_ms":0,"request_id":"…","purl":"pypi/tens…"}
+{"state":"analyzing","elapsed_ms":11006,"total_elapsed_ms":11006,"phase":"unpack","phase_state":"completed","phase_elapsed_ms":5002,"request_id":"…","purl":"pypi/tens…"}
 {"decision":"allow","purl":"pypi/tensorflow@2.15.0","fires_at":-1,…}
 ```
 
-Progress frames carry `state`, `purl`, `elapsed_ms` and `phase`. They exist
+Progress frames carry `state`, `purl`, `elapsed_ms`, `total_elapsed_ms`, `phase`,
+`phase_state`, `phase_elapsed_ms`, `phase_started_at`, and `request_id`. Phase
+states are `started`, `running`, and `completed`. When scan does not report a
+phase, Beamline uses `phase: "unknown"` rather than emitting a null phase.
+Beamline emits a completion frame when a phase changes and immediately before
+the decision. These fields are stream telemetry only; they are not stored in
+the verdict cache.
+
+Progress frames exist
 because a silent connection is one an intermediary will eventually cut, and
 because a six-minute analysis and a hung one are otherwise indistinguishable.
 Ignore them if you like; they are never the answer.
@@ -172,8 +181,8 @@ you will tolerate. Pass it as a query parameter on either route.
 ```
 
 `decision` is `block` when `fires_at` is at or below your budget. Tune against
-`fires_at` values you have actually seen. The default follows the deploy's own
-operating point, so a retuned fleet moves with it.
+`fires_at` values you have actually seen. When omitted, beamline uses the
+strict default budget of 25.
 
 A budget that is not a whole number from 0 to 65535 is a `400`, never a silent
 fall back to the default.
@@ -294,7 +303,7 @@ There is no `503` for a package we could not reach a worker for. That is a
 | header | |
 | --- | --- |
 | `X-Request-Id` | Send your own to correlate with our logs. |
-| `X-Beamline-Source` | `cache`, `scan`, `none`. Operators only. |
+| `X-Beamline-Source` | `cache`, `kv`, `scan`, `none`. Operators only. |
 | `X-Beamline-Worker` | Which worker answered. For operators. |
 | `Cache-Control` | See below. |
 | `Content-Type` | `application/json`; `x-ndjson` from `/v1/analyze`. |
@@ -306,8 +315,13 @@ hour. Not knowing is cached for a minute — it stops being true the moment
 anything analyzes the artifact. `unavailable` is never cached; it describes this
 moment's reachability.
 
-`false_positive_budget` is part of the cache key: two callers on different
-budgets are asking different questions.
+The cached document is independent of `false_positive_budget`. Beamline applies
+the caller's budget to its `fires_at` value, so two callers on different budgets
+share one cached document while receiving the appropriate decision.
+
+The Cache API is L0. When configured, Workers KV is L1: it stores the same small
+document behind a hashed key and repopulates L0 on a hit. KV expiration, when
+configured, is measured from the write; reads do not refresh the expiration.
 
 The scope is `private` on an authenticated deployment — a verdict is knowledge
 about your artifact, not public data.

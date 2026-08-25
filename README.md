@@ -17,6 +17,15 @@ starts and give a fast worker the chance to answer before the next is asked.
 Each worker gets its own circuit breaker, so a sick one drops out of the race
 without taking scanning down with it.
 
+The optional Workers KV L1 namespace is titled `beamline` by default. Run
+`make kv-create`, then deploy by passing its returned ID as `KV`:
+
+```
+KV=<namespace-id> SCAN_URL=… make deploy-cf
+```
+
+The deploy recipe turns that ID into the `BEAMLINE_KV` binding for Wrangler.
+
 Three separate tokens, none of them baked into the tree: `BEAMLINE_TOKEN` is
 who may call beamline, `HOPPER_TOKEN` and `SCAN_TOKEN` are how beamline calls
 its backends. Each is taken from the environment, and otherwise from the first
@@ -30,4 +39,8 @@ unauthenticated.
 ```
 HOPPER_URL=… SCAN_URL=… node local.js
 HOPPER_URL=… SCAN_URL=… make deploy-cf
+
+`make stress-test` targets `https://api.isotope13.ai` by default and does not
+need `SCAN_URL`; set `BEAMLINE_URL=` explicitly when you want it to start a
+local beamline, in which case `SCAN_URL` is required.
 ```

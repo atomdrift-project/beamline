@@ -36,6 +36,8 @@ const outPath = process.env.STRESS_OUT || "";
 const api = (process.env.API || "v1").trim().toLowerCase() === "legacy" ? "legacy" : "v1";
 const popular = process.env.POPULAR === "1";
 const analyzeMisses = process.env.ANALYZE_MISSES === "1";
+const stressRoute = (process.env.STRESS_ROUTE || "combined").trim().toLowerCase();
+const repeat = Math.max(1, Number(process.env.REPEAT) || 1);
 const timeoutMs = Number(process.env.SCAN_TIMEOUT_MS) || 1_800_000;
 
 // Five very widely used packages per ecosystem, pinned to the versions that
@@ -88,34 +90,36 @@ if (isMain) {
 
 async function main() {
   if (!beamlineUrl) {
-    process.stderr.write("BEAMLINE_URL is required (make stress-test sets it)\n");
+    process.stderr.write("BEAMLINE_URL is required\n");
     process.exit(2);
   }
-  if (!scanUrl) {
-    process.stderr.write("SCAN_URL is required\n");
+  if (!["combined", "lookup", "analyze", "both"].includes(stressRoute)) {
+    process.stderr.write("STRESS_ROUTE must be combined, lookup, analyze, or both\n");
     process.exit(2);
   }
 
   process.stderr.write(
     `beamline ${beamlineUrl}\nscan     ${scanUrl}\n` +
     (hopperUrl ? `hopper   ${hopperUrl}\n` : "") +
-      `${popular ? "popular" : `N=${n}`}${samples ? ` SAMPLES=${samples}` : ""} concurrency=${concurrency}\n`,
+      `${popular ? "popular" : `N=${n}`}${samples ? ` SAMPLES=${samples}` : ""}${repeat > 1 ? ` REPEAT=${repeat}` : ""} concurrency=${concurrency} route=${stressRoute}\n`,
   );
   await pingBackends();
   // Before the volume pass: the shapes it cannot reach, checked once.
-  const contract = api === "v1" ? await contractProbe() : [];
+  // The combined run checks the v1 contract once before both phases. A
+  // route-only analyze pass is often used to finish or repeat a long run, so
+  // do not spend another analysis slot on the one-off upload probe there.
+  const contract = api === "v1" && stressRoute !== "analyze" ? await contractProbe() : [];
 
   // POPULAR=1 swaps the live registry feeds for the fixed list above.
   if (popular) {
-    const jobs = mixJobs(popularJobs(), samples || Infinity);
+    const baseJobs = mixJobs(popularJobs(), samples || Infinity);
+    const jobs = repeatJobs(baseJobs, repeat);
     process.stderr.write(`submitting ${jobs.length} popular PURLs\n`);
     const before = await raceSnapshot();
-    const rows = await pool(jobs, concurrency, submit);
-    const summary = summarize(rows);
-    printReport(rows, summary, []);
+    const result = await runRoutes(jobs, []);
     printRace(raceDelta(before, await raceSnapshot()));
-    if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, rows, summary, contract });
-    process.exit(summary.bugs.length || contract.length ? 1 : 0);
+    if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, ...result, contract });
+    process.exit(result.bugs.length || contract.length ? 1 : 0);
   }
 
   const feeds = await Promise.allSettled([
@@ -142,12 +146,34 @@ async function main() {
 
   process.stderr.write(`submitting ${jobs.length} PURLs\n`);
   const before = await raceSnapshot();
+  const result = await runRoutes(jobs, feedErrors);
+  printRace(raceDelta(before, await raceSnapshot()));
+  if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, ...result, contract });
+  process.exit(result.bugs.length || contract.length ? 1 : 0);
+}
+
+async function runRoutes(jobs, feedErrors) {
+  if (stressRoute === "both") {
+    process.stderr.write("lookup phase\n");
+    const lookupRows = await pool(jobs, concurrency, submitLookup);
+    const lookup = summarize(lookupRows);
+    printRouteReport("lookup", lookupRows, lookup, feedErrors);
+
+    process.stderr.write("analyze phase\n");
+    const analyzeRows = await pool(jobs, concurrency, submitAnalyze);
+    const analyze = summarize(analyzeRows);
+    printRouteReport("analyze", analyzeRows, analyze, feedErrors);
+    return {
+      lookup: { rows: lookupRows, summary: lookup },
+      analyze: { rows: analyzeRows, summary: analyze },
+      bugs: [...lookup.bugs, ...analyze.bugs],
+    };
+  }
+
   const rows = await pool(jobs, concurrency, submit);
   const summary = summarize(rows);
-  printReport(rows, summary, feedErrors);
-  printRace(raceDelta(before, await raceSnapshot()));
-  if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, rows, summary, contract });
-  process.exit(summary.bugs.length || contract.length ? 1 : 0);
+  printRouteReport(stressRoute, rows, summary, feedErrors);
+  return { rows, summary, bugs: summary.bugs };
 }
 
 async function named(eco, fn) {
@@ -158,7 +184,7 @@ async function named(eco, fn) {
 
 async function pingBackends() {
   const beam = await probe(`${beamlineUrl}/healthz`);
-  const scan = await probe(`${scanUrl}/_/health`);
+  const scan = scanUrl ? await probe(`${scanUrl}/_/health`) : "skipped";
   const hopper = await probe(`${hopperUrl}/healthz`);
   const hopperAlt = hopper === "ok" ? hopper : await probe(`${hopperUrl}/_/health`);
   if (hopperToken) {
@@ -173,27 +199,29 @@ async function pingBackends() {
   }
   process.stderr.write(`health   beamline=${beam} scan=${scan} hopper=${hopperAlt}\n`);
   if (beam !== "ok") throw new Error(`beamline healthz: ${beam}`);
-  if (scan !== "ok" && scan !== "saturated" && scan !== "degraded") {
+  if (scanUrl && scan !== "ok" && scan !== "saturated" && scan !== "degraded") {
     process.stderr.write(`warning: scan health is ${scan}\n`);
   }
-  try {
-    const auth = scanToken ? { authorization: `Bearer ${scanToken}` } : {};
-    const info = await get(`${scanUrl}/_/info`, 4000, auth).then((r) => r.json());
-    process.stderr.write(`scan     version=${info.version || "?"} slots=${info.slots ?? "?"}\n`);
-  } catch {
-    // info is optional
-  }
-  try {
-    const ap = await fetch(`${scanUrl}/analyze-purl`, {
-      method: "GET",
-      headers: { "user-agent": UA },
-      signal: AbortSignal.timeout(4000),
-    });
-    if (ap.status === 404) {
-      process.stderr.write("warning: scan has no /analyze-purl — PURL lookups 404 until this worker is upgraded\n");
+  if (scanUrl) {
+    try {
+      const auth = scanToken ? { authorization: `Bearer ${scanToken}` } : {};
+      const info = await get(`${scanUrl}/_/info`, 4000, auth).then((r) => r.json());
+      process.stderr.write(`scan     version=${info.version || "?"} slots=${info.slots ?? "?"}\n`);
+    } catch {
+      // info is optional
     }
-  } catch {
-    // preflight is optional
+    try {
+      const ap = await fetch(`${scanUrl}/analyze-purl`, {
+        method: "GET",
+        headers: { "user-agent": UA },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (ap.status === 404) {
+        process.stderr.write("warning: scan has no /analyze-purl — PURL lookups 404 until this worker is upgraded\n");
+      }
+    } catch {
+      // preflight is optional
+    }
   }
 }
 
@@ -331,7 +359,21 @@ async function fetchGo(limit) {
 // the PURL and no bytes, so scan resolves the artifact from the registry itself
 // and the provenance it grafts into the report comes from the same fetch.
 async function submit(item) {
+  if (stressRoute === "lookup") return submitLookup(item);
+  if (stressRoute === "analyze") return submitAnalyze(item);
   return api === "v1" ? submitV1(item) : submitLegacy(item);
+}
+
+async function submitLookup(item) {
+  const path = api === "v1" ? "/v1/lookup" : "/lookup";
+  return ask(item, `${beamlineUrl}${path}?purl=${encodeURIComponent(item.purl)}`, "GET");
+}
+
+async function submitAnalyze(item) {
+  if (api === "v1") {
+    return askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}`);
+  }
+  return ask(item, `${beamlineUrl}/analyze?purl=${encodeURIComponent(item.purl)}`, "POST");
 }
 
 async function submitLegacy(item) {
@@ -656,6 +698,12 @@ function mixJobs(groups, cap) {
   return out;
 }
 
+function repeatJobs(jobs, times) {
+  const out = [];
+  for (let i = 0; i < times; i++) out.push(...jobs);
+  return out;
+}
+
 function row(item, extra) {
   const out = { eco: item.eco, purl: item.purl, ...extra };
   out.kind = classify(out);
@@ -872,6 +920,49 @@ function fmtMap(obj) {
     .join(" ") || "-";
 }
 
+// A miss is a valid answer for the read-only lookup route: it means the
+// package is not in the corpus yet. Count it as a successful request here,
+// while keeping the hit/miss split in the detailed report below.
+function routeMetrics(rows) {
+  const successful = rows.filter((r) => r.kind === "ok" || r.kind === "miss");
+  const latency = rows
+    .map((r) => r.ms)
+    .filter((ms) => Number.isFinite(ms))
+    .sort((a, b) => a - b);
+  const byEco = {};
+  for (const eco of new Set(rows.map((r) => r.eco))) {
+    const group = rows.filter((r) => r.eco === eco);
+    const good = group.filter((r) => r.kind === "ok" || r.kind === "miss");
+    const lats = group
+      .map((r) => r.ms)
+      .filter((ms) => Number.isFinite(ms))
+      .sort((a, b) => a - b);
+    byEco[eco] = {
+      n: group.length,
+      success: good.length,
+      successRate: group.length ? good.length / group.length : 0,
+      p90: percentile(lats, 90),
+    };
+  }
+  return {
+    n: rows.length,
+    success: successful.length,
+    successRate: rows.length ? successful.length / rows.length : 0,
+    p90: percentile(latency, 90),
+    byEco,
+  };
+}
+
+function printRouteReport(route, rows, summary, feedErrors) {
+  const metrics = routeMetrics(rows);
+  const pct = (rate) => `${(rate * 100).toFixed(1)}%`;
+  process.stdout.write(`\n${route} metrics  success rate ${metrics.success}/${metrics.n} (${pct(metrics.successRate)})  p90 latency ${fmtMs(metrics.p90)}ms\n`);
+  for (const [eco, m] of Object.entries(metrics.byEco).sort()) {
+    process.stdout.write(`  ${eco.padEnd(6)} ${m.success}/${m.n} (${pct(m.successRate)})  p90 ${fmtMs(m.p90)}ms\n`);
+  }
+  printReport(rows, summary, feedErrors);
+}
+
 function countBy(rows, fn) {
   const out = {};
   for (const r of rows) {
@@ -1073,16 +1164,28 @@ async function contractProbe() {
   // depends on a registry nor spends a real analysis slot on something large.
   try {
     const artifact = Buffer.from(`stress-probe-${process.pid}-${Date.now()}\n`);
-    const { status, body } = await call("/v1/analyze", "POST", artifact);
+    const resp = await get(`${beamlineUrl}/v1/analyze`, timeoutMs + 10_000, auth, "POST", artifact);
+    const status = resp.status;
     if (status !== 200) {
+      const body = await readJson(resp).catch(() => null);
       issues.push(`upload: HTTP ${status} ${JSON.stringify(body?.error || body).slice(0, 120)}`);
     } else {
-      const decision = Array.isArray(body) ? body[body.length - 1] : body;
-      issues.push(...checkV1(200, decision, null));
-      // Bytes have no coordinate, and the digest is not one: a sha256 in the
-      // `purl` field is how the two routes stop agreeing.
-      if (decision?.purl != null) issues.push(`upload: answered with purl ${decision.purl}`);
-      if (!/^[0-9a-f]{64}$/.test(decision?.sha256 || "")) issues.push("upload: no sha256");
+      // v1 analyze streams progress and the final decision as NDJSON. The
+      // package pass already reads that shape; the contract probe must do the
+      // same instead of trying to parse the whole body as one JSON document.
+      let decision = null;
+      for await (const frame of ndjson(resp)) {
+        if (frame.decision) decision = frame;
+      }
+      if (!decision) {
+        issues.push("upload: stream ended with no decision");
+      } else {
+        issues.push(...checkV1(200, decision, null));
+        // Bytes have no coordinate, and the digest is not one: a sha256 in the
+        // `purl` field is how the two routes stop agreeing.
+        if (decision.purl != null) issues.push(`upload: answered with purl ${decision.purl}`);
+        if (!/^[0-9a-f]{64}$/.test(decision.sha256 || "")) issues.push("upload: no sha256");
+      }
     }
   } catch (e) {
     issues.push(`upload: ${e.message || e}`);
@@ -1124,9 +1227,11 @@ export const _test = {
   parseCratesIndexCommit,
   cratesSparsePath,
   percentile,
+  routeMetrics,
   classify,
   POPULAR,
   popularJobs,
+  repeatJobs,
   checkApi,
   mixJobs,
 };

@@ -6,8 +6,11 @@ compatibility_date = "2026-08-19"
 # SCAN_URL is not stored here; make deploy-cf passes it from the environment.
 
 # logLine emits one object per lookup carrying `src`, which names the layer
-# that answered — cache or scan. Workers Logs
+# that answered — cache, kv, or scan. Workers Logs
 # indexes those fields, so the cache hit rate is a query rather than a guess.
+# The default KV namespace title is `beamline`. `make deploy-cf` receives its
+# account-specific ID through KV and materializes the binding for deployment:
+#   npx wrangler kv namespace create beamline
 [observability]
 enabled = true
 head_sampling_rate = 1
