@@ -1,6 +1,6 @@
 # beamline
 
-Beamline looks up a PURL, a SHA-256, or uploaded bytes and returns a
+Beamline looks up a PURL, an exact URL, a SHA-256, or uploaded bytes and returns a
 hostility level. Hostile answers include at most three findings.
 See [API.md](API.md).
 

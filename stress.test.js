@@ -111,7 +111,7 @@ test("checkApi accepts a documented 200 and rejects ml/raw and hits on clean", (
     get(name) {
       return {
         "x-sha256": sha,
-        "x-beamline-source": "hopper",
+        "x-beamline-source": "scan:primary",
         "content-type": "application/json",
         "cache-control": "public, max-age=86400",
       }[name];

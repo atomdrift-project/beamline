@@ -389,6 +389,120 @@ test("numEnv keeps a bad knob from becoming a bad default", () => {
 
 // --- /v1/analyze --------------------------------------------------------
 
+test("v1 analyze: follow is normalized and forwarded", async () => {
+  let forwarded;
+  const scan = await mockBackend({
+    onAnalyzeQuery: (url) => { forwarded = url.searchParams.get("follow"); },
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/app@1.0.0"}'],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(
+      new Request(
+        "http://beamline/v1/analyze?purl=pkg%3Anpm%2Fapp%401.0.0&follow=references&follow=ci-actions",
+        { method: "POST" },
+      ),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200);
+    await res.text();
+    assert.equal(forwarded, "dependencies,references,ci-actions");
+  } finally {
+    await scan.close();
+  }
+});
+
+test("v1 analyze: exact URL reaches scan and warms locator aliases", async () => {
+  const artifactUrl = "https://cdn.example.test/files/app-1.0.0.tgz";
+  const purl = "pkg:npm/app@1.0.0";
+  let forwarded;
+  const scan = await mockBackend({
+    onAnalyzeQuery: (url) => { forwarded = url; },
+    analyzeStream: () => [
+      `{"decision":"allow","purl":"${purl}","url":"${artifactUrl}","sha256":"${HELLO_SHA}","fires_at":-1,"engine_version":"2.8.0"}`,
+    ],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const ctx = waitCtx();
+    const analyzed = await handle(
+      new Request(`http://beamline/v1/analyze?url=${encodeURIComponent(artifactUrl)}`, { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    const decision = JSON.parse((await analyzed.text()).trim().split("\n").pop());
+    assert.equal(decision.url, artifactUrl);
+    assert.equal(forwarded.searchParams.get("url"), artifactUrl);
+    await ctx.flush();
+
+    const cached = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      noopCtx(),
+    );
+    assert.equal(cached.headers.get("x-beamline-source"), "cache");
+    assert.equal((await cached.json()).sha256, HELLO_SHA);
+    assert.equal(scan.hits.analyze, 1);
+  } finally {
+    await scan.close();
+  }
+});
+
+test("v1 analyze: malformed follow policy is rejected at the edge", async () => {
+  for (const follow of ["deps", "none,references", ""]) {
+    const res = await handle(
+      new Request(`http://beamline/v1/analyze?purl=pkg%3Anpm%2Fapp%401.0.0&follow=${encodeURIComponent(follow)}`, {
+        method: "POST",
+      }),
+      testEnv(DEAD),
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error.code, "invalid_follow_policy");
+  }
+});
+
+test("v1 analyze: explicit follow bypasses and does not replace canonical cache", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const scan = await mockBackend({
+    analyzeStream: (url) => url.searchParams.has("follow")
+      ? [`{"decision":"block","fires_at":3,"purl":"${purl}","engine_version":"test"}`]
+      : [`{"decision":"allow","fires_at":-1,"purl":"${purl}","engine_version":"test"}`],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const firstCtx = waitCtx();
+  try {
+    const first = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+      env,
+      firstCtx.ctx,
+    );
+    await first.text();
+    await firstCtx.flush();
+
+    const customCtx = waitCtx();
+    const custom = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}&follow=none`, { method: "POST" }),
+      env,
+      customCtx.ctx,
+    );
+    assert.equal(JSON.parse((await custom.text()).trim()).decision, "block");
+    await customCtx.flush();
+    assert.equal(scan.hits.analyze, 2, "explicit policy incorrectly used the warm canonical cache");
+
+    const cached = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(JSON.parse((await cached.text()).trim()).decision, "allow");
+    assert.equal(scan.hits.analyze, 2, "custom result replaced the canonical cache entry");
+  } finally {
+    await scan.close();
+  }
+});
+
 // The body is passed through untouched. Buffering it to hand back one tidy
 // object would put the silence back on the hop between us and the caller —
 // the hop with a proxy we do not control on it, and the one this whole design
@@ -455,6 +569,35 @@ test("v1 analyze: an omitted upstream phase is explicit and correlated", async (
     assert.equal(lines[2].decision, "allow");
     assert.equal("phase" in lines[0], true);
     assert.notEqual(lines[0].phase, null);
+  } finally {
+    await scan.close();
+  }
+});
+
+test("v1 analyze: semantic scan phases reach the caller", async () => {
+  const scan = await mockBackend({
+    analyzeStream: [
+      '{"state":"analyzing","purl":"pkg:npm/slow@1.0.0","elapsed_ms":100,"phase":"purl:registry"}',
+      '{"state":"analyzing","purl":"pkg:npm/slow@1.0.0","elapsed_ms":500,"phase":"purl:payload"}',
+      '{"state":"analyzing","purl":"pkg:npm/slow@1.0.0","elapsed_ms":900,"phase":"fetch+graft"}',
+      '{"state":"analyzing","purl":"pkg:npm/slow@1.0.0","elapsed_ms":1200,"phase":"features+model"}',
+      '{"decision":"allow","fires_at":-1,"purl":"pkg:npm/slow@1.0.0"}',
+    ],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fslow%401.0.0", { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    const phases = (await res.text())
+      .trim()
+      .split("\n")
+      .map(JSON.parse)
+      .filter((row) => row.state === "analyzing" && row.phase_state === "started")
+      .map((row) => row.phase);
+    assert.deepEqual(phases, ["purl:registry", "purl:payload", "fetch+graft", "features+model"]);
   } finally {
     await scan.close();
   }
@@ -1061,7 +1204,63 @@ test("v1: a worker's answer is passed through intact", async () => {
     );
     assert.equal(res.status, 200);
     assert.deepEqual(await res.json(), decided);
-    assert.equal(res.headers.get("x-beamline-source"), "scan");
+    assert.equal(res.headers.get("x-beamline-source"), "scan:analysis");
+  } finally {
+    await scan.close();
+  }
+});
+
+test("v1: scan source is exposed as the single Beamline source header", async () => {
+  const scan = await mockBackend({
+    v1: {
+      decision: "allow",
+      purl: "pkg:npm/replica@1.0.0",
+      sha256: HELLO_SHA,
+      severity: "benign",
+      fires_at: -1,
+      reason: null,
+      findings: [],
+      engine_version: "2.8.0",
+      analyzed_at: "2026-08-01T00:00:00Z",
+    },
+    v1Headers: { "x-scan-source": "scan:replica" },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Freplica%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.headers.get("x-beamline-source"), "scan:replica");
+  } finally {
+    await scan.close();
+  }
+});
+
+test("v1: Bloom source is exposed as a derived Beamline source", async () => {
+  const scan = await mockBackend({
+    v1: {
+      decision: "unknown",
+      purl: "pkg:npm/bloom@1.0.0",
+      sha256: null,
+      severity: null,
+      fires_at: null,
+      reason: null,
+      findings: [],
+      engine_version: null,
+      analyzed_at: null,
+    },
+    v1Headers: { "x-scan-source": "scan:bloom" },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fbloom%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.headers.get("x-beamline-source"), "scan:bloom");
   } finally {
     await scan.close();
   }
@@ -1199,6 +1398,77 @@ test("v1: KV is L1 behind Cache API and still applies the budget", async () => {
   assert.equal((await loose.json()).decision, "block");
   assert.equal(reads, 1, "the L0 cache should shield KV after the first read");
   assert.equal(writes, 0, "a KV read should not refresh the stored value");
+});
+
+test("v1: exact URL aliases the URL, PURL, and SHA cache keys", async () => {
+  const artifactUrl = "https://registry.example.test/npm/app/-/app-1.0.0.tgz";
+  const purl = "pkg:npm/app@1.0.0";
+  let forwarded;
+  const scan = await mockBackend({
+    v1: (url) => {
+      forwarded = url;
+      return {
+        decision: "allow",
+        purl,
+        sha256: HELLO_SHA,
+        severity: "benign",
+        fires_at: -1,
+        reason: null,
+        findings: [],
+        engine_version: "2.8.0",
+        analyzed_at: "2026-08-01T00:00:00Z",
+      };
+    },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const firstCtx = waitCtx();
+    const first = await handle(
+      new Request(`http://beamline/v1/lookup?url=${encodeURIComponent(artifactUrl)}`),
+      env,
+      firstCtx.ctx,
+    );
+    assert.equal(first.headers.get("x-beamline-source"), "scan:analysis");
+    assert.equal((await first.json()).url, artifactUrl);
+    assert.equal(forwarded.searchParams.get("url"), artifactUrl);
+    await firstCtx.flush();
+
+    for (const query of [
+      `url=${encodeURIComponent(artifactUrl)}`,
+      `purl=${encodeURIComponent(purl)}`,
+      `sha256=${HELLO_SHA}`,
+    ]) {
+      const res = await handle(new Request(`http://beamline/v1/lookup?${query}`), env, noopCtx());
+      assert.equal(res.status, 200, query);
+      assert.equal(res.headers.get("x-beamline-source"), "cache", query);
+      const body = await res.json();
+      assert.equal(body.sha256, HELLO_SHA, query);
+      if (query.startsWith("url=")) assert.equal(body.url, artifactUrl);
+      else assert.equal(body.url, undefined);
+    }
+    assert.equal(scan.hits.v1, 1, "aliases should prevent a second scan lookup");
+  } finally {
+    await scan.close();
+  }
+});
+
+test("v1: URL and PURL cannot be combined, and URLs are validated", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const mixed = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0&url=https%3A%2F%2Fx.test%2Fx"),
+    env,
+    noopCtx(),
+  );
+  assert.equal(mixed.status, 400);
+  assert.equal((await mixed.json()).error.code, "multiple_locators");
+
+  const invalid = await handle(
+    new Request("http://beamline/v1/lookup?url=file%3A%2F%2F%2Ftmp%2Fx"),
+    env,
+    noopCtx(),
+  );
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).error.code, "invalid_url");
 });
 
 // A malformed budget is refused rather than replaced by the default, for the
@@ -1502,8 +1772,9 @@ function mockBackend(opts) {
         if (forced && forced !== 200) {
           return send(res, forced, { error: { code: "at_capacity" } });
         }
-        res.writeHead(200, { "content-type": "application/x-ndjson" });
-        for (const line of opts.analyzeStream || []) res.write(`${line}\n`);
+        res.writeHead(200, { "content-type": "application/x-ndjson", ...opts.analyzeHeaders });
+        const lines = typeof opts.analyzeStream === "function" ? opts.analyzeStream(url) : opts.analyzeStream;
+        for (const line of lines || []) res.write(`${line}\n`);
         return res.end();
       }
       if (url.pathname === "/v1/lookup") {
@@ -1511,7 +1782,7 @@ function mockBackend(opts) {
         const out = typeof opts.v1 === "function" ? opts.v1(url) : opts.v1;
         if (!out) return send(res, 404, { error: { code: "unknown_artifact" } });
         if (out.status && out.status !== 200) return send(res, out.status, { error: { code: "boom" } });
-        return send(res, 200, out);
+        return send(res, 200, out, opts.v1Headers || {});
       }
       if (url.pathname === "/status") {
         hits.status += 1;

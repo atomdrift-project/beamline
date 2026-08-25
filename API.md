@@ -4,9 +4,11 @@ Two routes. `/v1/lookup` reports what is already known; `/v1/analyze` finds out.
 
 ```
 GET  /v1/lookup?purl={purl}                   free, cacheable, never analyzes
+GET  /v1/lookup?url={url}                     exact URL; same cache behavior
 GET  /v1/lookup?sha256={64hex}
 GET  /v1/lookup?purl=a&purl=b                 up to 50 per URL
 POST /v1/analyze?purl={purl}                  answers from cache or spends an
+POST /v1/analyze?url={url}                    exact URL; scan fetches and hashes it
 POST /v1/analyze                              analysis slot; streams. The
                                               artifact may be the raw body
 
@@ -30,6 +32,11 @@ string — a qualified PURL would silently become a different one.
 The `pkg:` prefix is optional and the scheme and type are case-folded, so
 `npm/left-pad@1.3.0` and `PKG:NPM/left-pad@1.3.0` are one key. The rest is left
 as sent: npm grandfathered in mixed-case names.
+
+An exact `url` is an absolute `http` or `https` URL. Encode it as a query
+parameter; scan fetches that URL verbatim and returns the resulting SHA-256.
+The URL, resolved PURL when known, and SHA-256 are cache aliases, so later
+lookups can use whichever spelling they have.
 
 Send both keys when you know both. The digest is asked first, because it names
 exact bytes; the PURL is a second chance, because the corpus can know release
@@ -68,12 +75,21 @@ one.
 Over 50 packages is a `413`. There is no batch limit on `/v1/analyze` because it
 takes one package.
 
+For an exact URL, use one `url` parameter. The response includes `url` exactly
+as sent; it may also include a resolved `purl` and includes `sha256` when the
+analysis fetched the artifact successfully.
+
 ## POST /v1/analyze
 
 Name a package, or send the artifact itself. A caller holding bytes nobody
 has published — a build output, a file off disk, something pulled from a
 mirror — has nothing to locate them by, and publishing first in order to find
 out what you have is the wrong way round.
+
+To analyze an already-resolved artifact URL, use
+`POST /v1/analyze?url=https%3A%2F%2F…`. Scan fetches that exact URL, computes the
+SHA-256, and Beamline stores the result under the URL and digest (and under a
+PURL when scan supplies one).
 
 ```
 $ curl -sN -X POST --data-binary @suspect.tgz \
@@ -111,6 +127,42 @@ phase, Beamline uses `phase: "unknown"` rather than emitting a null phase.
 Beamline emits a completion frame when a phase changes and immediately before
 the decision. These fields are stream telemetry only; they are not stored in
 the verdict cache.
+
+For PURL analyses, `purl:registry` identifies registry metadata lookup,
+`purl:payload` identifies fetching the initial package payload, and
+`purl:registry-document` identifies the registry-document fallback. The later
+`fetch+graft` phase is dependency retrieval and grafting, not initial payload
+acquisition.
+
+### Following discovered references
+
+The requested artifact is always retrieved and analyzed. `follow` controls
+which references discovered *inside* that artifact are also retrieved,
+analyzed, and folded into its verdict:
+
+| value | follows |
+| --- | --- |
+| `none` | Nothing beyond the requested artifact. |
+| `dependencies` | Dependencies declared in manifests and lockfiles. |
+| `references` | Packages and URLs named by install or download commands. |
+| `ci-actions` | Third-party CI actions; also implies `dependencies`. |
+| `all` | Every category above. |
+
+Values may be comma-separated or repeated:
+
+```
+POST /v1/analyze?purl=…&follow=none
+POST /v1/analyze?purl=…&follow=dependencies,references
+POST /v1/analyze?purl=…&follow=dependencies&follow=references
+```
+
+Omitting `follow` uses the deployment's configured policy. A request may
+restrict that policy but cannot enable a category disabled by the operator;
+that is `follow_policy_not_allowed`.
+
+An explicit `follow` request bypasses the shared verdict cache and its result
+is not written there. Following different references can change the verdict,
+so a policy-specific answer must not replace the deployment's canonical one.
 
 Progress frames exist
 because a silent connection is one an intermediary will eventually cut, and
@@ -157,6 +209,7 @@ know — see [findings](#findings).
 | --- | --- | --- |
 | `decision` | string | `allow`, `block`, `unknown`, `unavailable`. |
 | `purl` | string\|null | The package, spelled as you asked. |
+| `url` | string\|null | The exact URL, spelled as you asked; present for URL requests. |
 | `sha256` | string\|null | The exact bytes analyzed. |
 | `severity` | string\|null | `benign`, `suspicious`, `hostile`. |
 | `fires_at` | int\|null | Tightest budget at which this grades hostile. |
@@ -273,8 +326,13 @@ reworded.
 
 | code | status | |
 | --- | --- | --- |
-| `missing_package` | 400 | Neither `purl` nor `sha256`. |
+| `missing_package` | 400 | Neither `purl`, `url`, nor `sha256`. |
+| `multiple_locators` | 400 | `purl` and `url` were supplied together. |
+| `invalid_url` | 400 | Not an absolute `http` or `https` URL. |
+| `url_with_body` | 400 | An exact URL cannot be combined with uploaded bytes. |
 | `invalid_false_positive_budget` | 400 | Not a whole number from 0 to 65535. |
+| `invalid_follow_policy` | 400 | Unknown, empty, or contradictory `follow` selection. |
+| `follow_policy_not_allowed` | 400 | Requests traversal disabled by the deployment. |
 | `invalid_purl` | 400 | Not a package URL. |
 | `invalid_sha256` | 400 | Not 64 hexadecimal characters. |
 | `too_many_packages` | 413 | Over 50 in one URL. Use several requests. |
@@ -303,10 +361,16 @@ There is no `503` for a package we could not reach a worker for. That is a
 | header | |
 | --- | --- |
 | `X-Request-Id` | Send your own to correlate with our logs. |
-| `X-Beamline-Source` | `cache`, `kv`, `scan`, `none`. Operators only. |
+| `X-Beamline-Source` | `cache`, `kv`, `scan:bloom`, `scan:analysis`, `scan:replica`, `scan:primary`, `none`. Operators only. |
 | `X-Beamline-Worker` | Which worker answered. For operators. |
 | `Cache-Control` | See below. |
 | `Content-Type` | `application/json`; `x-ndjson` from `/v1/analyze`. |
+
+`scan:bloom` means the scan server answered from Bloom-derived knowledge;
+`scan:analysis` means it answered from a locally held or newly produced
+analysis; and `scan:replica` / `scan:primary` mean it obtained the answer from
+Hopper's replica or primary. `cache` and `kv` identify Beamline's own edge
+layers. `none` means no backend produced an answer.
 
 ## Caching
 
@@ -327,7 +391,8 @@ The scope is `private` on an authenticated deployment — a verdict is knowledge
 about your artifact, not public data.
 
 A decision produced by `/v1/analyze` populates the lookup cache for that
-package, and `/v1/analyze` reads that same cache before it dispatches. Asking
+artifact. URL, PURL, and SHA-256 spellings are stored as aliases, and
+`/v1/analyze` reads those same aliases before it dispatches. Asking
 the expensive way twice therefore costs one analysis, not two: the second call
 returns the stored verdict as a single NDJSON line carrying
 `X-Beamline-Source: cache`, with no progress frames, because there was no run to
@@ -342,3 +407,5 @@ Three things never answer from the cache:
   and the second says we could not find out.
 - a request carrying `X-Beamline-Pin`, which exists to time a specific
   backend.
+- a request carrying an explicit `follow` policy, because its result is scoped
+  to that policy and is not a canonical verdict.

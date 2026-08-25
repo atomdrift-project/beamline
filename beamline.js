@@ -168,18 +168,26 @@ const DEFAULT_FALSE_POSITIVE_BUDGET = 25;
 // produce it.
 async function handleV1Lookup(env, ctx, url) {
   const purls = url.searchParams.getAll("purl").map((p) => p.trim()).filter(Boolean);
+  const urls = url.searchParams.getAll("url").map((value) => value.trim()).filter(Boolean);
   const sha = (url.searchParams.get("sha256") || "").trim();
   const budgetRaw = url.searchParams.get("false_positive_budget");
   const budget = parseFalsePositiveBudget(budgetRaw);
+  const locators = urls.length ? urls.map((value) => ({ type: "url", value })) : purls.map((value) => ({ type: "purl", value }));
 
-  if (!sha && !purls.length) {
-    return v1Error(400, "missing_package", "Name a package with ?purl= or ?sha256=.");
+  if (purls.length && urls.length) {
+    return v1Error(400, "multiple_locators", "Use ?purl= or ?url=, not both.");
   }
-  if (purls.length > V1_MAX_KEYS) {
+  if (urls.some((value) => !validArtifactUrl(value))) {
+    return v1Error(400, "invalid_url", "url must be an absolute http or https URL.");
+  }
+  if (!sha && !locators.length) {
+    return v1Error(400, "missing_package", "Name an artifact with ?purl=, ?url=, or ?sha256=.");
+  }
+  if (locators.length > V1_MAX_KEYS) {
     return v1Error(
       413,
       "too_many_packages",
-      `${purls.length} packages exceeds the limit of ${V1_MAX_KEYS} for a URL.`,
+      `${locators.length} packages exceeds the limit of ${V1_MAX_KEYS} for a URL.`,
     );
   }
   // Refused rather than quietly replaced by the default: a caller who meant to
@@ -196,7 +204,8 @@ async function handleV1Lookup(env, ctx, url) {
   // The document is keyed by the artifact question, not by the caller's
   // policy. Beamline applies false_positive_budget to `fires_at` below, so one
   // stored document can answer every budget consistently.
-  const path = v1CachePath(sha, purls);
+  const path = v1CachePath(sha, locators);
+  const locator = locators.length === 1 ? locators[0] : null;
 
   const cache = await getCache(env);
   const cacheKey = new Request(`${url.origin}${path}`);
@@ -205,7 +214,7 @@ async function handleV1Lookup(env, ctx, url) {
     // Buffered rather than streamed through, because the answer decides how
     // long the caller may hold it. Decisions are one small object.
     const document = await hit.text();
-    const body = v1BudgetedBody(document, budget);
+    const body = v1BudgetedBody(document, budget, locator);
     const res = new Response(body, hit);
     res.headers.set("X-Beamline-Source", "cache");
     // Derived from the answer, never read back from the cache.
@@ -225,7 +234,7 @@ async function handleV1Lookup(env, ctx, url) {
   if (!ctx.pin) {
     const document = await kvGet(env, path);
     if (document) {
-      const body = v1BudgetedBody(document, budget);
+      const body = v1BudgetedBody(document, budget, locator);
       if (body) {
         const res = v1Body(env, body, 200, null, v1MaxAge(document));
         res.headers.set("X-Beamline-Source", "kv");
@@ -235,7 +244,7 @@ async function handleV1Lookup(env, ctx, url) {
     }
   }
 
-  return v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budget);
+  return v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget);
 }
 
 // Ask the workers in turn until one answers.
@@ -244,8 +253,9 @@ async function handleV1Lookup(env, ctx, url) {
 // lookup spends no analysis slot, and since every worker defers to the same
 // corpus when it does not know, they now give the same answer. Broadcasting
 // would multiply the load behind them to learn nothing.
-async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budget) {
-  const ids = { rid: ctx.rid, sha256: sha || undefined, purl: purls[0] };
+async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget) {
+  const ids = v1LocatorIds(ctx.rid, sha, locators);
+  const locator = locators.length === 1 ? locators[0] : null;
   const origin = new URL(cacheKey.url).origin;
   const workers = await lookupOrder(env, ctx, scanWorkers(env), ids);
   const t0 = Date.now();
@@ -260,7 +270,7 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budget) {
         ctx,
         async (resp) => {
           const body = await resp.text();
-          return { status: resp.status, body };
+          return { status: resp.status, body, source: resp.headers.get("X-Scan-Source") };
         },
       );
       // A 404 is not this request being wrong. This route never answers one
@@ -279,31 +289,30 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budget) {
       // also say. Passed through verbatim so the caller reads scan's own reason.
       if (answered.status >= 400 && answered.status < 500) {
         breakerFor(base).ok();
-        logLine("v1_lookup", { src: "scan", status: answered.status, worker, ms: Date.now() - t0, ...ids });
-        return v1Body(env, answered.body, answered.status, worker, 0);
+        const source = beamlineSource(answered.source);
+        logLine("v1_lookup", { src: source, status: answered.status, worker, ms: Date.now() - t0, ...ids });
+        return v1Body(env, answered.body, answered.status, worker, 0, source);
       }
       if (answered.status !== 200) {
         breakerFor(base).fail();
         continue;
       }
       breakerFor(base).ok();
-      logLine("v1_lookup", { src: "scan", status: 200, worker, ms: Date.now() - t0, ...ids });
+      const source = beamlineSource(answered.source);
+      logLine("v1_lookup", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
       const document = v1DocumentBody(answered.body);
       const stored = document || answered.body;
-      const body = document ? v1BudgetedBody(document, budget) : answered.body;
-      const res = v1Body(env, body, 200, worker, v1MaxAge(stored));
+      const body = document ? v1BudgetedBody(document, budget, locator) : answered.body;
+      const res = v1Body(env, body, 200, worker, v1MaxAge(stored), source);
       if (!v1MaxAge(stored)) return res;
-      // The asked-for key is stored by serveHit; the digest the answer names is
+      // The asked-for key and every resolved alias are stored together; the
+      // digest the answer names is
       // stored here. A lookup by PURL that reached a worker has just learned
       // the artifact's identity, and the next caller who knows only that
       // identity should not have to reach a worker to learn the same thing.
       // Skipped when they are the same key — a sha lookup has nothing to add.
-      const digestKey = `${origin}${v1CachePath(v1DecisionSha(stored) || "", [])}`;
-      if (v1DecisionSha(stored) && digestKey !== cacheKey.url) {
-        waitUntil(ctx, backfillDigestKey(env, cache, origin, stored));
-      }
-      waitUntil(ctx, kvPut(env, path, stored));
-      return serveHit(ctx, cache, cacheKey, res, stored, env);
+      waitUntil(ctx, cacheV1Aliases(env, cache, origin, path, locator, stored));
+      return res;
     } catch {
       breakerFor(base).fail();
     }
@@ -316,17 +325,17 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, purls, budget) {
   // proceeds fails open on both.
   logLine("v1_lookup", { src: "none", status: 200, unavailable: true, ms: Date.now() - t0, ...ids });
   const rows = [];
-  if (sha && !purls.length) rows.push(v1Unavailable(sha, null));
-  for (const purl of purls) rows.push(v1Unavailable(purls.length === 1 && sha ? sha : null, purl));
+  if (sha && !locators.length) rows.push(v1Unavailable(sha, null));
+  for (const item of locators) rows.push(v1Unavailable(locators.length === 1 && sha ? sha : null, item));
   return v1Body(env, JSON.stringify(rows.length === 1 ? rows[0] : rows), 200, null, 0);
 }
 
 // A decision we could not reach a worker to make. Carries nothing about the
 // artifact: it is a statement about us.
-function v1Unavailable(sha, purl) {
-  return {
+function v1Unavailable(sha, locator) {
+  const row = {
     decision: "unavailable",
-    purl: purl || null,
+    purl: locator?.type === "purl" ? locator.value : null,
     sha256: sha || null,
     severity: null,
     fires_at: null,
@@ -335,6 +344,8 @@ function v1Unavailable(sha, purl) {
     engine_version: null,
     analyzed_at: null,
   };
+  if (locator?.type === "url") row.url = locator.value;
+  return row;
 }
 
 // The cache key a v1 decision is stored under.
@@ -344,10 +355,12 @@ function v1Unavailable(sha, purl) {
 // were three separate string literals saying the same thing, and a key that
 // differs by one character between the writer and the reader is a cache that
 // never hits and never says why.
-function v1CachePath(sha, purls) {
+function v1CachePath(sha, locators) {
   const query = [];
   if (sha) query.push(`sha256=${encodeURIComponent(sha)}`);
-  for (const purl of purls) query.push(`purl=${encodeURIComponent(purl)}`);
+  for (const locator of locators || []) {
+    query.push(`${locator.type}=${encodeURIComponent(locator.value)}`);
+  }
   return `/v1/lookup?${query.join("&")}`;
 }
 
@@ -381,6 +394,48 @@ async function backfillDigestKey(env, cache, origin, body) {
   logLine("v1_cache_backfill", { key: "sha256", sha, max_age: maxAge });
 }
 
+// A locator is an alias, not a second document. Once scan resolves a URL or
+// PURL to bytes, file the same canonical document under every name we know:
+// the request's locator, the resolved PURL (when present), and the SHA-256.
+// Full copies are deliberate: a KV read then costs one lookup and does not
+// require a redirect lookup or a second consistency window.
+function v1CacheAliasPaths(origin, requestedPath, locator, body) {
+  const paths = new Set([requestedPath]);
+  if (locator) paths.add(v1CachePath(null, [locator]));
+  const sha = v1DecisionSha(body);
+  if (sha) paths.add(v1CachePath(sha, []));
+  let row;
+  try {
+    row = JSON.parse(body);
+  } catch {
+    row = null;
+  }
+  if (row && !Array.isArray(row) && typeof row === "object") {
+    if (typeof row.purl === "string" && row.purl.trim()) {
+      paths.add(v1CachePath(null, [{ type: "purl", value: row.purl.trim() }]));
+    }
+    if (typeof row.url === "string" && validArtifactUrl(row.url.trim())) {
+      paths.add(v1CachePath(null, [{ type: "url", value: row.url.trim() }]));
+    }
+  }
+  return [...paths].map((path) => new Request(`${origin}${path}`));
+}
+
+async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body) {
+  const keys = v1CacheAliasPaths(origin, requestedPath, locator, body);
+  await Promise.all(
+    keys.map(async (key) => {
+      try {
+        await cache.put(key, storedDocument(body, env));
+        const parsed = new URL(key.url);
+        await kvPut(env, `${parsed.pathname}${parsed.search}`, body);
+      } catch (err) {
+        logLine("v1_cache_write", { stored: false, key: key.url, err: errText(err) });
+      }
+    }),
+  );
+}
+
 // The digest a decision names, when it names a well-formed one.
 function v1DecisionSha(body) {
   let row;
@@ -399,6 +454,65 @@ function parseFalsePositiveBudget(raw) {
   if (!/^\d{1,5}$/.test(value)) return null;
   const budget = Number(value);
   return budget <= 65535 ? budget : null;
+}
+
+function validArtifactUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function v1LocatorIds(rid, sha, locators) {
+  const first = locators?.[0];
+  return {
+    rid,
+    sha256: sha || undefined,
+    purl: first?.type === "purl" ? first.value : undefined,
+    url: first?.type === "url" ? first.value : undefined,
+  };
+}
+
+// Parse which references discovered inside the root artifact should be
+// followed. The root itself is always retrieved; this controls only traversal
+// after that. Repeated query keys and comma-separated values are equivalent.
+function parseFollow(searchParams) {
+  const values = searchParams.getAll("follow");
+  if (!values.length) return { explicit: false, value: null };
+
+  const selected = new Set();
+  let none = false;
+  let all = false;
+  let saw = false;
+  for (const value of values) {
+    for (const raw of value.split(",")) {
+      const target = raw.trim();
+      if (!target) continue;
+      saw = true;
+      if (target === "none") none = true;
+      else if (target === "all") all = true;
+      else if (["dependencies", "references", "ci-actions"].includes(target)) selected.add(target);
+      else {
+        return {
+          error: `Unknown follow target ${JSON.stringify(target)}. Use all, dependencies, references, ci-actions, or none.`,
+        };
+      }
+    }
+  }
+  if (!saw) return { error: "follow must name all, dependencies, references, ci-actions, or none." };
+  if (none && (all || selected.size)) {
+    return { error: "follow=none cannot be combined with another follow target." };
+  }
+  if (none) return { explicit: true, value: "none" };
+  if (all) return { explicit: true, value: "all" };
+  // CI actions are dependency references with additional CI context. Include
+  // dependencies in the canonical spelling so logs and upstream requests make
+  // that implication visible.
+  if (selected.has("ci-actions")) selected.add("dependencies");
+  const order = ["dependencies", "references", "ci-actions"];
+  return { explicit: true, value: order.filter((target) => selected.has(target)).join(",") };
 }
 
 function v1DocumentBody(body) {
@@ -420,7 +534,7 @@ function canonicalV1Row(row) {
   return applyBudgetToRow(row, DEFAULT_FALSE_POSITIVE_BUDGET);
 }
 
-function v1BudgetedBody(body, budget) {
+function v1BudgetedBody(body, budget, locator) {
   let row;
   try {
     row = JSON.parse(body);
@@ -428,9 +542,10 @@ function v1BudgetedBody(body, budget) {
     return null;
   }
   if (!row || typeof row !== "object") return null;
-  return JSON.stringify(
-    Array.isArray(row) ? row.map((item) => applyBudgetToRow(item, budget)) : applyBudgetToRow(row, budget),
-  );
+  const rows = Array.isArray(row) ? row.map((item) => applyBudgetToRow(item, budget)) : applyBudgetToRow(row, budget);
+  if (!locator || locator.type !== "url") return JSON.stringify(rows);
+  const addUrl = (item) => (item && typeof item === "object" && !Array.isArray(item) ? { ...item, url: locator.value } : item);
+  return JSON.stringify(Array.isArray(rows) ? rows.map(addUrl) : addUrl(rows));
 }
 
 function applyBudgetToRow(row, budget) {
@@ -515,13 +630,38 @@ function v1MaxAge(body) {
   return V1_VERDICT_MAX_AGE;
 }
 
-function v1Body(env, body, status, worker, maxAge) {
+function beamlineSource(source) {
+  switch (source) {
+    case "cache":
+    case "kv":
+    case "none":
+      return source;
+    case "scan:bloom":
+    case "scan:analysis":
+    case "scan:replica":
+    case "scan:primary":
+      return source;
+    // Normalize older scan workers during a rolling deployment.
+    case "bloom":
+      return "scan:bloom";
+    case "replica":
+      return "scan:replica";
+    case "primary":
+      return "scan:primary";
+    case "scan":
+    case "index":
+    default:
+      return "scan:analysis";
+  }
+}
+
+function v1Body(env, body, status, worker, maxAge, source) {
   const headers = { "content-type": "application/json" };
   headers["cache-control"] = maxAge
     ? `${cacheScope(env)}, max-age=${maxAge}`
     : "no-store";
   if (worker) headers["X-Beamline-Worker"] = worker;
-  headers["X-Beamline-Source"] = worker ? "scan" : "none";
+  headers["X-Beamline-Source"] = worker ? beamlineSource(source) : "none";
   return new Response(body, { status, headers });
 }
 
@@ -548,8 +688,16 @@ function v1Error(status, code, message) {
 // half-delivered.
 async function handleV1Analyze(request, env, ctx, url) {
   const purl = (url.searchParams.get("purl") || "").trim();
+  const artifactUrl = (url.searchParams.get("url") || "").trim();
   const budgetRaw = url.searchParams.get("false_positive_budget");
   const budget = parseFalsePositiveBudget(budgetRaw);
+  const follow = parseFollow(url.searchParams);
+  if (follow.error) return v1Error(400, "invalid_follow_policy", follow.error);
+  if (purl && artifactUrl) return v1Error(400, "multiple_locators", "Use ?purl= or ?url=, not both.");
+  if (artifactUrl && !validArtifactUrl(artifactUrl)) {
+    return v1Error(400, "invalid_url", "url must be an absolute http or https URL.");
+  }
+  const locator = purl ? { type: "purl", value: purl } : artifactUrl ? { type: "url", value: artifactUrl } : null;
   // Two ways to name an artifact, and the artifact itself is one of them. A
   // caller holding bytes nobody has published — a build output, a file off
   // disk, something pulled from a mirror — has nothing to locate them by, and
@@ -574,8 +722,8 @@ async function handleV1Analyze(request, env, ctx, url) {
     }
     if (buffered.byteLength > 0) bytes = buffered;
   }
-  if (!purl && !bytes) {
-    return v1Error(400, "missing_package", "Name a package with ?purl=, or send the artifact as the body.");
+  if (!locator && !bytes) {
+    return v1Error(400, "missing_package", "Name an artifact with ?purl=, ?url=, or send it as the body.");
   }
   if (budget === null) {
     return v1Error(
@@ -588,9 +736,15 @@ async function handleV1Analyze(request, env, ctx, url) {
   const query = [];
   // The PURL rides along with an upload too: scan grafts the registry
   // provenance onto the report and echoes it in each finding's `pkg`.
-  if (purl) query.push(`purl=${encodeURIComponent(purl)}`);
+  if (locator) query.push(`${locator.type}=${encodeURIComponent(locator.value)}`);
+  if (follow.explicit) query.push(`follow=${encodeURIComponent(follow.value)}`);
   const path = `/v1/analyze${query.length ? `?${query.join("&")}` : ""}`;
-  const ids = { rid: ctx.rid, purl: purl || undefined, bytes: bytes ? bytes.byteLength : undefined };
+  const ids = {
+    rid: ctx.rid,
+    ...v1LocatorIds(ctx.rid, null, locator ? [locator] : []),
+    bytes: bytes ? bytes.byteLength : undefined,
+    follow: follow.explicit ? follow.value : undefined,
+  };
   const t0 = Date.now();
 
   // Already answered?
@@ -606,9 +760,9 @@ async function handleV1Analyze(request, env, ctx, url) {
   // and the PURL riding along with one names provenance rather than the thing
   // being asked about, so it cannot stand in for the artifact. `pin` bypasses,
   // exactly as it does on the lookup: it exists to time a specific backend.
-  if (purl && !bytes && !ctx.pin) {
+  if (locator && !bytes && !ctx.pin && !follow.explicit) {
     const cache = await getCache(env);
-    const cachePath = v1CachePath(null, [purl]);
+    const cachePath = v1CachePath(null, [locator]);
     const key = new Request(`${url.origin}${cachePath}`);
     const hit = await cache.match(key).catch(() => null);
     let document = hit ? await hit.text().catch(() => null) : null;
@@ -620,7 +774,7 @@ async function handleV1Analyze(request, env, ctx, url) {
       // key cold indefinitely: every caller holding only a hash paid a round
       // trip to learn something we were already holding, and answering them
       // never fixed it either.
-      const body = v1BudgetedBody(document, budget);
+      const body = v1BudgetedBody(document, budget, locator);
       waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document));
       logLine("v1_analyze", { src: "cache", status: 200, decision: decided.decision, ms: Date.now() - t0, ...ids });
       // Answered in the shape this route always answers in: one NDJSON line,
@@ -645,7 +799,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   // progress rather than starting another beside it, so a caller who
   // reconnected belongs back on that worker — anywhere else pays for the whole
   // analysis a second time.
-  const busy = purl ? await runningWorker(env, ctx, { purl, sha: null }, ids) : null;
+  const busy = locator ? await runningWorker(env, ctx, locator, ids) : null;
   const tries = numEnv(env, "SCAN_RETRIES", SCAN_RETRIES);
   const backoffBase = numEnv(env, "SCAN_RETRY_BASE_MS", SCAN_RETRY_BASE_MS);
 
@@ -667,7 +821,21 @@ async function handleV1Analyze(request, env, ctx, url) {
   const busyDeadline = t0 + numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS) * BUSY_BUDGET_SHARE;
   for (let attempt = 0; ; attempt++) {
     const pass = { busy: 0, broken: 0 };
-    const answered = await v1Dispatch(env, ctx, url, purl, path, budget, busy, ids, t0, bytes, pass);
+    const cacheResult = Boolean(locator && !bytes && !follow.explicit);
+    const answered = await v1Dispatch(
+      env,
+      ctx,
+      url,
+      locator,
+      path,
+      budget,
+      busy,
+      ids,
+      t0,
+      bytes,
+      pass,
+      cacheResult,
+    );
     if (answered) return answered;
     const stillWorthOffering = pass.busy > 0 && Date.now() < busyDeadline;
     if ((attempt >= tries && !stillWorthOffering) || !scanWorkers(env).length) break;
@@ -681,7 +849,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   // find out" is an answer about it that their policy may treat differently
   // from "nobody has analyzed this".
   logLine("v1_analyze", { src: "none", status: 200, unavailable: true, ms: Date.now() - t0, ...ids });
-  return new Response(`${JSON.stringify(v1Unavailable(null, purl || null))}\n`, {
+  return new Response(`${JSON.stringify(v1Unavailable(null, locator))}\n`, {
     status: 200,
     headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" },
   });
@@ -689,9 +857,10 @@ async function handleV1Analyze(request, env, ctx, url) {
 
 // One pass over the fleet. Returns the response, or null when every worker
 // refused and the pass is worth making again.
-async function v1Dispatch(env, ctx, url, purl, path, budget, busy, ids, t0, bytes, pass) {
+async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheResult) {
   const workers = scanWorkers(env);
-  let ranked = workers.length ? (await rankWorkers(env, ctx, workers, ids, { purl })).workers : [];
+  const hint = locator?.type === "purl" ? { purl: locator.value } : {};
+  let ranked = workers.length ? (await rankWorkers(env, ctx, workers, ids, hint)).workers : [];
   if (busy) {
     // A preference, not a pin: a worker whose breaker is open is not in the
     // pool at all, and a run we cannot reach is not worth waiting for.
@@ -753,17 +922,22 @@ async function v1Dispatch(env, ctx, url, purl, path, budget, busy, ids, t0, byte
       });
     }
 
-    logLine("v1_analyze", { src: "scan", status: 200, worker, ms: Date.now() - t0, ...ids });
+    const source = beamlineSource(upstream.headers.get("X-Scan-Source"));
+    logLine("v1_analyze", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
     // One copy to the caller, one to be read out of band: a fresh verdict is
     // exactly what the next lookup wants, so analyzing warms the cache the
     // cheap route reads. Teeing rather than buffering keeps the caller's copy
     // flowing while ours is still arriving.
-    const [out, mine] = upstream.body.tee();
-    waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, purl, mine));
+    let out = upstream.body;
+    if (cacheResult) {
+      const streams = upstream.body.tee();
+      out = streams[0];
+      waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, streams[1]));
+    }
     return new Response(
       annotatedV1Stream(out, budget, {
         requestId: ctx.rid,
-        purl,
+        locator,
         startedAt: t0,
       }),
       {
@@ -772,7 +946,7 @@ async function v1Dispatch(env, ctx, url, purl, path, budget, busy, ids, t0, byte
         "content-type": "application/x-ndjson",
         "cache-control": "no-store",
         "X-Beamline-Worker": worker,
-        "X-Beamline-Source": "scan",
+        "X-Beamline-Source": source,
       },
       },
     );
@@ -788,8 +962,8 @@ async function v1Dispatch(env, ctx, url, purl, path, budget, busy, ids, t0, byte
 // run was doing. A stream that ends without one was cut short, and caching a
 // truncated answer would turn one dropped connection into a wrong answer served
 // from the edge — so nothing is stored unless a decision actually arrived.
-async function cacheV1Decision(env, ctx, origin, purl, stream) {
-  const ids = { rid: ctx.rid, purl };
+async function cacheV1Decision(env, ctx, origin, locator, stream) {
+  const ids = v1LocatorIds(ctx.rid, null, locator ? [locator] : []);
   const decided = await lastDecision(stream);
   if (!decided) {
     logLine("v1_cache_write", { stored: false, reason: "no_decision", ...ids });
@@ -806,34 +980,9 @@ async function cacheV1Decision(env, ctx, origin, purl, stream) {
     return;
   }
   const cache = await getCache(env);
-  // Both ways the artifact can be named, from the one analysis that learned it.
-  //
-  // The decision carries the digest it resolved to, and a caller may well ask
-  // by that next — a lockfile pins a hash, a scanner reports one. Storing only
-  // the PURL key left `/v1/lookup?sha256=…` cold for an answer we were holding.
-  //
-  // One caveat, deliberately accepted: the body is spelled the way *this*
-  // caller named the package, so a later sha lookup reads back that spelling
-  // rather than the canonical one scan would have answered with. Both name the
-  // same artifact and the digest is the identity, but it is a spelling a
-  // different caller chose.
-  const sha = v1DecisionSha(document);
-  const paths = [v1CachePath(null, [purl])];
-  if (sha) paths.push(v1CachePath(sha, []));
-  for (const path of paths) {
-    try {
-      await cache.put(
-        new Request(`${origin}${path}`),
-        storedDocument(document, env),
-      );
-      await kvPut(env, path, document);
-    } catch (err) {
-      // One key failing is not a reason to abandon the other: a half-warmed
-      // cache still saves the analysis the other key would have cost.
-      logLine("v1_cache_write", { stored: false, reason: "put_failed", key: path, err: errText(err), ...ids });
-    }
-  }
-  logLine("v1_cache_write", { stored: true, max_age: maxAge, keys: paths.length, sha: sha || undefined, ...ids });
+  const requestedPath = v1CachePath(null, locator ? [locator] : []);
+  await cacheV1Aliases(env, cache, origin, requestedPath, locator, document);
+  logLine("v1_cache_write", { stored: true, max_age: maxAge, keys: v1CacheAliasPaths(origin, requestedPath, locator, document).length, ...ids });
 }
 
 // Add phase telemetry to the progress stream without changing the cached
@@ -880,7 +1029,7 @@ function annotatedV1Lines(line, budget, meta, phase) {
     return [line];
   }
   if (!row || typeof row !== "object" || Array.isArray(row)) {
-    return [budgetedV1Line(line, budget)];
+    return [budgetedV1Line(line, budget, meta.locator)];
   }
 
   const totalElapsed = finiteMs(row.elapsed_ms) ?? phase.lastElapsed;
@@ -890,10 +1039,10 @@ function annotatedV1Lines(line, budget, meta, phase) {
   // frame so clients never have to infer completion from the decision shape.
   if (Object.prototype.hasOwnProperty.call(row, "decision")) {
     const done = phaseCompletion(meta, phase);
-    return [...(done ? [JSON.stringify(done)] : []), budgetedV1Line(line, budget)];
+    return [...(done ? [JSON.stringify(done)] : []), budgetedV1Line(line, budget, meta.locator)];
   }
 
-  if (row.state !== "analyzing") return [budgetedV1Line(line, budget)];
+  if (row.state !== "analyzing") return [budgetedV1Line(line, budget, meta.locator)];
 
   const name = typeof row.phase === "string" && row.phase.trim() ? row.phase.trim() : "unknown";
   const elapsed = Number.isFinite(totalElapsed) ? totalElapsed : 0;
@@ -923,14 +1072,19 @@ function phaseFrame(row, meta, phase, state, elapsed) {
     total_elapsed_ms: elapsed,
     phase_started_at: new Date(meta.startedAt + phase.startedElapsed).toISOString(),
     request_id: meta.requestId,
-    ...(row.purl == null && meta.purl ? { purl: meta.purl } : {}),
+    ...(row.purl == null && meta.locator?.type === "purl" ? { purl: meta.locator.value } : {}),
+    ...(row.url == null && meta.locator?.type === "url" ? { url: meta.locator.value } : {}),
   };
 }
 
 function phaseCompletion(meta, phase, elapsed = phase.lastElapsed) {
   if (!phase.name) return null;
   const frame = phaseFrame(
-    { state: "analyzing", purl: meta.purl || undefined },
+    {
+      state: "analyzing",
+      ...(meta.locator?.type === "purl" ? { purl: meta.locator.value } : {}),
+      ...(meta.locator?.type === "url" ? { url: meta.locator.value } : {}),
+    },
     meta,
     phase,
     "completed",
@@ -945,9 +1099,9 @@ function finiteMs(value) {
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
-function budgetedV1Line(line, budget) {
+function budgetedV1Line(line, budget, locator) {
   if (!line.includes('"decision"')) return line;
-  const body = v1BudgetedBody(line, budget);
+  const body = v1BudgetedBody(line, budget, locator);
   return body || line;
 }
 
@@ -997,7 +1151,7 @@ async function runningWorker(env, ctx, input, ids) {
   const workers = scanWorkers(env);
   const keys = [];
   if (input.sha) keys.push(`sha256=${input.sha}`);
-  if (input.purl) keys.push(`purl=${encodeURIComponent(input.purl)}`);
+  if (input.type && input.value) keys.push(`${input.type}=${encodeURIComponent(input.value)}`);
   if (!workers.length || !keys.length) return null;
   const path = `/status?${keys.join("&")}`;
   const asked = await Promise.all(workers.map((base) => statusAsk(env, ctx, path, base)));
@@ -1841,14 +1995,14 @@ function verdictResponse(env, verdict, input, maxAge) {
   const headers = {
     "content-type": "application/json",
     "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
-    "x-beamline-source": "scan-cache",
+    "x-beamline-source": "scan:analysis",
   };
   if (view.sha) headers["x-sha256"] = view.sha;
   return new Response(JSON.stringify(view), { status: 200, headers });
 }
 
 function bloomStub(env, sha, purl) {
-  return envelopeResponse(env, { ml: { lvl: -1, eng: "beamline" } }, sha, "bloom", 3600, null, purl);
+  return envelopeResponse(env, { ml: { lvl: -1, eng: "beamline" } }, sha, "scan:bloom", 3600, null, purl);
 }
 
 function envelopeResponse(env, envelope, sha, source, maxAge, totalMs, purl) {
@@ -1864,9 +2018,8 @@ function envelopeResponse(env, envelope, sha, source, maxAge, totalMs, purl) {
 }
 
 // Authenticated answers are private to everything between us and the client.
-// Our own cache is a different matter — see serveHit.
-// The scope a client's copy carries, restoring what serveHit dropped for the
-// benefit of our own cache.
+// Our own cache is a different matter. The scope a client's copy carries is
+// restored independently from the copy stored in the edge cache.
 function clientScope(env, maxAge) {
   return maxAge ? `${cacheScope(env)}, max-age=${maxAge}` : cacheScope(env);
 }
@@ -2079,15 +2232,6 @@ function storedDocument(body, env) {
       },
     }),
   );
-}
-
-function serveHit(ctx, cache, cacheKey, res, document, env) {
-  // Cloned now, stored later: by the time the deferred put runs, the caller
-  // may already have consumed the body it is holding.
-  const copy = document ? storedDocument(document, env) : storedCopy(res);
-  // A cache that throws, synchronously or not, must not fail the lookup.
-  waitUntil(ctx, Promise.resolve().then(() => cache.put(cacheKey, copy)));
-  return res;
 }
 
 function waitUntil(ctx, p) {

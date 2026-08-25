@@ -551,7 +551,15 @@ const ALLOWED_200 = new Set(["sha", "purl", "lvl", "eng", "why", "hits"]);
 // missing here, so every response carrying a located hit — which is the useful
 // kind — was reported as an API violation. The harness was stale, not the API.
 const ALLOWED_HIT = new Set(["id", "crit", "file", "pkg", "desc", "off", "line"]);
-const SOURCES = new Set(["cache", "scan-cache", "bloom", "hopper", "scan", "none"]);
+const SOURCES = new Set([
+  "cache",
+  "kv",
+  "scan:bloom",
+  "scan:analysis",
+  "scan:replica",
+  "scan:primary",
+  "none",
+]);
 // Every key a v1 decision carries, and every key it may carry — the contract is
 // that the shape never moves, so a field appearing or vanishing is a defect
 // rather than a variation.
@@ -832,7 +840,7 @@ function summarize(rows) {
     single: percentile(paired.map((r) => r.ms).sort((a, b) => a - b), 50),
     both: percentile(paired.map((r) => r.both.ms).sort((a, b) => a - b), 50),
   };
-  const served = ok.filter((r) => r.source === "scan" && r.worker);
+  const served = ok.filter((r) => r.source && r.source.startsWith("scan:") && r.worker);
   const byWorker = countBy(served, (r) => r.worker);
   const workerLatency = {};
   for (const w of Object.keys(byWorker)) {
