@@ -105,6 +105,18 @@ test("classify treats a missing envelope as a bug, saturation as a note", () => 
   assert.equal(_test.classify({ status: 0 }), "bug");
 });
 
+test("stream failures retain backend provenance", () => {
+  const failure = {
+    status: 200,
+    source: "scan:analysis",
+    worker: "scan-rdu.isotope13.ai",
+    issues: ["stream ended with no decision"],
+  };
+  assert.equal(_test.classify(failure), "bug");
+  assert.equal(failure.source, "scan:analysis");
+  assert.equal(failure.worker, "scan-rdu.isotope13.ai");
+});
+
 test("checkApi accepts a documented 200 and rejects ml/raw and hits on clean", () => {
   const sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
   const headers = {

@@ -469,13 +469,15 @@ async function askStream(item, url) {
   const t0 = Date.now();
   try {
     const resp = await get(url, timeoutMs + 10_000, headers, "POST");
+    const source = resp.headers.get("x-beamline-source") || "";
+    const worker = resp.headers.get("x-beamline-worker") || "";
     if (resp.status !== 200) {
       const body = await readJson(resp).catch(() => null);
       return row(item, {
         ms: Date.now() - t0,
         status: resp.status,
-        source: resp.headers.get("x-beamline-source") || "",
-        worker: resp.headers.get("x-beamline-worker") || "",
+        source,
+        worker,
         error: body?.error?.code || body?.error,
         issues: [`analyze status ${resp.status}`],
       });
@@ -483,8 +485,14 @@ async function askStream(item, url) {
     let frames = 0;
     let decision = null;
     let firstMs = 0;
+    let requestId = "";
+    let lastState = "";
+    let lastPhase = "";
     for await (const line of ndjson(resp)) {
       if (!firstMs) firstMs = Date.now() - t0;
+      if (line.request_id) requestId = line.request_id;
+      if (line.state) lastState = line.state;
+      if (line.phase) lastPhase = line.phase;
       if (line.decision) {
         decision = line;
         break;
@@ -496,15 +504,28 @@ async function askStream(item, url) {
       // No decision line means the stream was cut short, not that the answer
       // was negative. Recorded as a defect: a client that took the last frame
       // for an answer would file a verdict nobody produced.
-      return row(item, { ms, status: 200, frames, issues: ["stream ended with no decision"] });
+      return row(item, {
+        ms,
+        status: 200,
+        frames,
+        source,
+        worker,
+        requestId,
+        lastState,
+        lastPhase,
+        issues: ["stream ended with no decision"],
+      });
     }
     return row(item, {
       ms,
       firstMs,
       frames,
       status: 200,
-      source: resp.headers.get("x-beamline-source") || "",
-      worker: resp.headers.get("x-beamline-worker") || "",
+      source,
+      worker,
+      requestId,
+      lastState,
+      lastPhase,
       decision: decision.decision,
       sha: decision.sha256 || "",
       lvl: decision.fires_at,
@@ -749,6 +770,8 @@ function logRow(r) {
   let extra = r.status === 200 ? `lvl=${r.lvl}` : `${r.status} ${r.error || r.state || ""}`;
   if (r.decision) extra = `${r.decision} ${extra}`;
   if (r.frames !== undefined) extra += ` frames=${r.frames}${r.firstMs ? ` first=${r.firstMs}ms` : ""}`;
+  if (r.requestId) extra += ` request_id=${r.requestId}`;
+  if (r.lastState || r.lastPhase) extra += ` last=${r.lastState || "?"}${r.lastPhase ? `:${r.lastPhase}` : ""}`;
   if (r.sha) extra += ` sha=${String(r.sha).slice(0, 12)}`;
   if (r.issues && r.issues.length) extra += ` [${r.issues.join("; ")}]`;
   process.stderr.write(`${tag} ${ms}ms ${src} ${eco} ${r.purl}  ${extra}${how}\n`);
