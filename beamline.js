@@ -1197,7 +1197,7 @@ function annotatedV1Lines(line, budget, meta, phase) {
 }
 
 function phaseFrame(row, meta, phase, state, elapsed) {
-  return {
+  const frame = {
     ...row,
     elapsed_ms: elapsed,
     phase: phase.name,
@@ -1209,6 +1209,7 @@ function phaseFrame(row, meta, phase, state, elapsed) {
     ...(row.purl == null && meta.locator?.type === "purl" ? { purl: meta.locator.value } : {}),
     ...(row.url == null && meta.locator?.type === "url" ? { url: meta.locator.value } : {}),
   };
+  return frame;
 }
 
 function phaseCompletion(meta, phase, elapsed = phase.lastElapsed) {

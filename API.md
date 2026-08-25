@@ -127,6 +127,9 @@ Progress frames carry `state`, `purl`, `elapsed_ms`, `total_elapsed_ms`, `phase`
 `phase_state`, `phase_elapsed_ms`, `phase_started_at`, and `request_id`. Phase
 states are `started`, `running`, and `completed`. When scan does not report a
 phase, Beamline uses `phase: "unknown"` rather than emitting a null phase.
+For uploads without a PURL, progress identifies the artifact with `sha256`, not
+`purl`. A PURL supplied alongside an upload remains provenance and is returned
+as `purl`.
 Beamline emits a completion frame when a phase changes and immediately before
 the assessment. These fields are stream telemetry only; they are not stored in
 the verdict cache.

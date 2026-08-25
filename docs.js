@@ -177,11 +177,11 @@ function docsHtml(authRequired) {
         <p>Beamline fetches the exact URL and returns its SHA-256. The response includes a PURL when one is known.</p>
         <h3 id="content-upload"><a class="heading-link" href="#content-upload">Upload bytes</a></h3>
         <div class="route-example"><code>POST /v1/analyze</code></div>
-        <div class="runner" data-runner data-method="POST" data-stream data-upload data-path="/v1/analyze?follow=none">
+        <div class="runner" data-runner data-method="POST" data-stream data-upload data-path="/v1/analyze">
           <div class="request"><button class="run-button" type="button" aria-label="Run content upload example">Run</button><pre><code>curl -sN -X POST \
   --data-binary @sample.tgz \
   -H "Content-Type: application/octet-stream" \
-  "https://api.isotope13.ai/v1/analyze?follow=none"</code></pre>
+  "https://api.isotope13.ai/v1/analyze"</code></pre>
           <div class="file-picker"><label for="beamline-file">Choose a local sample</label><input id="beamline-file" type="file"></div></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
