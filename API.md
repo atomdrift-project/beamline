@@ -53,12 +53,11 @@ served — it describes different bytes.
 ```
 $ curl 'https://api.atomdrift.com/v1/lookup?purl=npm/left-pad@1.3.0'
 {
-  "decision": "allow",
+  "status": "analyzed",
   "purl": "npm/left-pad@1.3.0",
   "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
   "severity": "benign",
   "fires_at": -1,
-  "reason": null,
   "findings": [],
   "engine_version": "2.8.0",
   "analyzed_at": "2026-08-01T00:00:00Z"
@@ -112,7 +111,7 @@ which is what `?purl=` is for. An empty body is `empty_artifact`; one over the
 cap is `artifact_too_large`.
 
 The reply is newline-delimited JSON: progress while the run is going, then the
-decision. **Read lines until one carries `decision`. That is the answer.**
+assessment. **Read lines until one carries `status`. That is the answer.**
 
 ```
 $ curl -sN -X POST \
@@ -121,7 +120,7 @@ $ curl -sN -X POST \
 {"state":"analyzing","elapsed_ms":6004,"total_elapsed_ms":6004,"phase":"fetch","phase_state":"completed","phase_elapsed_ms":5002,"request_id":"…","purl":"pypi/tens…"}
 {"state":"analyzing","elapsed_ms":6004,"total_elapsed_ms":6004,"phase":"unpack","phase_state":"started","phase_elapsed_ms":0,"request_id":"…","purl":"pypi/tens…"}
 {"state":"analyzing","elapsed_ms":11006,"total_elapsed_ms":11006,"phase":"unpack","phase_state":"completed","phase_elapsed_ms":5002,"request_id":"…","purl":"pypi/tens…"}
-{"decision":"allow","purl":"pypi/tensorflow@2.15.0","fires_at":-1,…}
+{"status":"analyzed","purl":"pypi/tensorflow@2.15.0","fires_at":-1,…}
 ```
 
 Progress frames carry `state`, `purl`, `elapsed_ms`, `total_elapsed_ms`, `phase`,
@@ -129,7 +128,7 @@ Progress frames carry `state`, `purl`, `elapsed_ms`, `total_elapsed_ms`, `phase`
 states are `started`, `running`, and `completed`. When scan does not report a
 phase, Beamline uses `phase: "unknown"` rather than emitting a null phase.
 Beamline emits a completion frame when a phase changes and immediately before
-the decision. These fields are stream telemetry only; they are not stored in
+the assessment. These fields are stream telemetry only; they are not stored in
 the verdict cache.
 
 For PURL analyses, `purl:registry` identifies registry metadata lookup,
@@ -188,10 +187,10 @@ because a silent connection is one an intermediary will eventually cut, and
 because a six-minute analysis and a hung one are otherwise indistinguishable.
 Ignore them if you like; they are never the answer.
 
-An analysis that finishes before the first frame is due emits only the decision,
+An analysis that finishes before the first frame is due emits only the assessment,
 so a fast call is a single JSON object.
 
-**A stream that ends without a decision was cut short, not answered.** Retry it.
+**A stream that ends without a status was cut short, not answered.** Retry it.
 Nothing is lost: the worker finishes regardless and files the verdict, so the
 retry usually answers from the index in milliseconds. Reconnecting rejoins the
 run already in progress rather than starting a second one.
@@ -199,65 +198,67 @@ run already in progress rather than starting a second one.
 Analyses run to 30 minutes on the heaviest packages. The connection is simply
 held.
 
-## The decision
+## Status and severity
 
-| `decision` | means | typical action |
+The response reports facts about the artifact and about Beamline separately.
+It does not make an install decision for the caller.
+
+| `status` | means | `severity` |
 | --- | --- | --- |
-| `allow` | Analyzed. Not hostile at your budget. | proceed |
-| `block` | Analyzed. Hostile at your budget. | stop |
-| `unanalyzed` | Nobody has analyzed this. Nothing is wrong. | your policy |
-| `unavailable` | **We could not answer.** Nothing about it. | your policy |
+| `analyzed` | Beamline has an assessment. | Derived from `fires_at` at the requested budget. |
+| `unanalyzed` | Nobody has analyzed this. | `unknown` |
+| `unavailable` | **We could not answer.** | `unknown` |
 
 `unanalyzed` and `unavailable` are deliberately distinct. You may reasonably
 install unanalyzed packages while refusing to install anything during an
 outage — or the reverse. A partial answer is never an HTTP error: if we can
-decide four of five packages, that is a `200` carrying four decisions and one
+assess four of five packages, that is a `200` carrying four assessments and one
 `unavailable`.
 
-An `unavailable` decision carries `null` for `severity`, `fires_at`,
-`engine_version` and `analyzed_at`, and an empty `findings`. It is a statement
-about us, not about the artifact; there is nothing in it to read.
+An `unavailable` status carries `severity: "unknown"`, omits `fires_at`,
+`engine_version`, and `analyzed_at`, and carries an empty `findings` array. It
+is a statement about us, not about the artifact; there is nothing in it to read.
 
 ## The response object
 
-Every field is always present. Unknown is `null`, empty is `[]`. This applies to
-the decision object itself; the objects inside `findings` omit what they do not
-know — see [findings](#findings).
+Fields with no value are omitted to save bandwidth. Unknown severity is
+`"unknown"`; empty collections are `[]`. Optional metadata and finding details
+must therefore be read by presence, not by expecting a `null` placeholder.
 
 | field | type | |
 | --- | --- | --- |
-| `decision` | string | `allow`, `block`, `unanalyzed`, `unavailable`. |
-| `purl` | string\|null | The package, spelled as you asked. |
-| `url` | string\|null | The exact URL, spelled as you asked; present for URL requests. |
-| `sha256` | string\|null | The exact bytes analyzed. |
-| `severity` | string\|null | `benign`, `suspicious`, `hostile`. |
-| `fires_at` | int\|null | Tightest budget at which this grades hostile. |
-| `reason` | string\|null | One sentence, when we have one. |
+| `status` | string | `analyzed`, `unanalyzed`, or `unavailable`. |
+| `purl` | string | The package, spelled as you asked; omitted when absent. |
+| `url` | string | The exact URL, spelled as you asked; omitted when absent. |
+| `sha256` | string | The exact bytes analyzed; omitted when absent. |
+| `severity` | string | `benign`, `suspicious`, `hostile`, or `unknown`; computed from `fires_at` and the requested budget. |
+| `fires_at` | int | Tightest budget at which this grades hostile; omitted when no level applies. |
+| `reason` | string | One sentence, when we have one; omitted otherwise. |
 | `findings` | array | At most three, worst first. Empty unless one fired. |
-| `engine_version` | string\|null | Scanner build that produced it. |
-| `analyzed_at` | string\|null | RFC 3339. |
+| `engine_version` | string | Scanner build that produced it; omitted when absent. |
+| `analyzed_at` | string | RFC 3339; omitted when absent. |
 
-### fires_at and false_positive_budget
+### fires_at, false_positive_budget, and severity
 
 Same scale, different things. `fires_at` is **measured**: the tightest
 budget, in false positives per 100 million benign files, at which this
 artifact grades hostile. Lower is worse. `-1` fires at no budget at all;
-`null` means no level applies to the record.
+An omitted `fires_at` means no level applies to the record.
 
 `false_positive_budget` is **chosen**: how many false positives per 100 million
-you will tolerate. Pass it as a query parameter on either route.
+you will tolerate. Pass it to either route; the default is 25. We recommend
+choosing a value from 1 to 250. Values through 3000 are accepted because 3000
+is the suspicious ceiling; larger values are rejected.
 
 ```
-?false_positive_budget=25     the default: strict
-?false_positive_budget=1000   looser; catches more, and more false alarms
+?false_positive_budget=25     strict policy
+?false_positive_budget=250    recommended upper end
 ```
 
-`decision` is `block` when `fires_at` is at or below your budget. Tune against
-`fires_at` values you have actually seen. When omitted, beamline uses the
-strict default budget of 25.
-
-A budget that is not a whole number from 0 to 65535 is a `400`, never a silent
-fall back to the default.
+Beamline derives `severity` from the measured level: `-1` is `benign`; a level
+at or below the requested budget is `hostile`; a level above the budget but no
+higher than 3000 is `suspicious`; and a level above 3000 is `benign`. The
+caller can still use `fires_at` directly for additional policy decisions.
 
 ### findings
 
@@ -265,23 +266,20 @@ fall back to the default.
 | --- | --- | --- |
 | `id` | string | Stable trait id, e.g. `objectives/execution/shell/bash`. |
 | `crit` | int | 3 notable, 4 suspicious, 5 hostile. |
-| `file` | string\|null | Path inside the artifact. |
-| `pkg` | string\|null | The component it is about. |
-| `desc` | string\|null | One line. |
-| `off` | int\|null | Byte offset within `file`. |
-| `line` | int\|null | 1-based source line. Text matches only. |
+| `file` | string | Path inside the artifact; omitted when unavailable. |
+| `pkg` | string | The component it is about; omitted when unavailable. |
+| `desc` | string | One line; omitted when unavailable. |
+| `off` | int | Byte offset within `file`; omitted when unavailable. |
+| `line` | int | 1-based source line; omitted when unavailable. Text matches only. |
 
 `id` and `crit` are the only fields always present. The rest are **omitted**
 when there is nothing to say — `file`, `desc`, `off` and `line` are all absent
 when the verdict came from the corpus rather than from a local index, because
 the corpus keeps the trait and its criticality and not the detail.
 
-That is the opposite of the rule the enclosing decision object follows, and the
-two differ because the questions differ. A decision answers a fixed set of
-things, so its nine keys never move and `"engine_version": null` is itself the
-answer to "which engine". A finding has no fixed set: how much is known about
-one depends on where it came from, and four nulls would be most of the object.
-Read a finding's extras with a presence check, not a null check.
+That follows the same sparse-field rule as the enclosing assessment object. A
+finding has no fixed set: how much is known about one depends on where it came
+from. Read optional fields with a presence check.
 
 Only matches native to the file they are reported on appear. An archive repeats
 its members' findings on itself; those copies are dropped in favour of the
@@ -294,21 +292,19 @@ about them anyway. Rather than answer `unanalyzed` about a package several
 independent feeds call malware, we answer with what those feeds say — marked as
 what it is.
 
-Such an answer carries `engine_version: null` and `analyzed_at: null` alongside
-a real `decision`. **`engine_version` is the field to branch on:** it is present
+Such an answer omits `engine_version` and `analyzed_at` alongside
+a real `status`. **`engine_version` is the field to branch on:** it is present
 whenever an engine of ours produced the verdict and absent whenever nothing
 did. A finding names the evidence:
 
 ```json
 {
-  "decision": "block",
+  "status": "analyzed",
   "purl": "npm/left-pad@1.3.0",
   "severity": "hostile",
   "fires_at": 10,
   "reason": "Cited as malicious by 2 independent threat intelligence feeds.",
-  "findings": [{"id": "intel/feed/malicious", "crit": 5, "desc": "…", "file": null, "pkg": null, "off": null, "line": null}],
-  "engine_version": null,
-  "analyzed_at": null
+  "findings": [{"id": "intel/feed/malicious", "crit": 5, "desc": "…"}]
 }
 ```
 
@@ -349,7 +345,6 @@ reworded.
 | `multiple_locators` | 400 | `purl` and `url` were supplied together. |
 | `invalid_url` | 400 | Not an absolute `http` or `https` URL. |
 | `url_with_body` | 400 | An exact URL cannot be combined with uploaded bytes. |
-| `invalid_false_positive_budget` | 400 | Not a whole number from 0 to 65535. |
 | `invalid_follow_policy` | 400 | Unknown, empty, or contradictory `follow` selection. |
 | `invalid_purl` | 400 | Not a package URL. |
 | `invalid_sha256` | 400 | Not 64 hexadecimal characters. |
@@ -359,11 +354,11 @@ reworded.
 | `invalid_body` | 400 | The body could not be read. |
 
 Beamline's own refusals, such as an unknown route, answer an error object
-without a package-level decision.
+without a package-level assessment.
 
 | status | |
 | --- | --- |
-| 200 | A decision, or a list of them. Includes `unanalyzed` and `unavailable`. |
+| 200 | An assessment, or a list of them. Includes `unanalyzed` and `unavailable`. |
 | 400 | Your request. See `code`. |
 | 401 | Bad or missing bearer token when `BEAMLINE_TOKEN` is configured. |
 | 404 | No such route. |
@@ -397,9 +392,10 @@ hour. Not knowing is cached for a minute — it stops being true the moment
 anything analyzes the artifact. `unavailable` is never cached; it describes this
 moment's reachability.
 
-The cached document is independent of `false_positive_budget`. Beamline applies
-the caller's budget to its `fires_at` value, so two callers on different budgets
-share one cached document while receiving the appropriate decision.
+The cached document contains the measured `fires_at` value. Callers on different
+budgets share one cached assessment; Beamline derives the returned `severity`
+for each caller's budget, while callers may use `fires_at` for their own final
+action policy.
 
 The Cache API is L0. When configured, Workers KV is L1: it stores the same small
 document behind a hashed key and repopulates L0 on a hit. Every KV write carries
@@ -411,7 +407,7 @@ horizon.
 The scope is `private` on an authenticated deployment — a verdict is knowledge
 about your artifact, not public data.
 
-A decision produced by `/v1/analyze` populates the lookup cache for that
+A status produced by `/v1/analyze` populates the lookup cache for that
 artifact. URL, PURL, and SHA-256 spellings are stored as aliases of one
 question, and `/v1/analyze` reads those same aliases before it dispatches.
 Names alias; policies do not — an answer that followed nothing is filed under

@@ -184,6 +184,7 @@ const V1_KV_MAX_AGE = 90 * 24 * 60 * 60;
 // write into a throw.
 const KV_MIN_TTL = 60;
 const DEFAULT_FALSE_POSITIVE_BUDGET = 25;
+const SUSPICIOUS_LEVEL_CEILING = 3000;
 
 // GET /v1/lookup — what we know, at the caller's budget. Never analyzes.
 //
@@ -193,11 +194,11 @@ const DEFAULT_FALSE_POSITIVE_BUDGET = 25;
 // the corpus itself. One question, one answer, one place that knows how to
 // produce it.
 async function handleV1Lookup(env, ctx, url) {
+  const budgetRaw = url.searchParams.get("false_positive_budget");
+  const budget = parseFalsePositiveBudget(budgetRaw);
   const purls = url.searchParams.getAll("purl").map((p) => p.trim()).filter(Boolean);
   const urls = url.searchParams.getAll("url").map((value) => value.trim()).filter(Boolean);
   const sha = (url.searchParams.get("sha256") || "").trim();
-  const budgetRaw = url.searchParams.get("false_positive_budget");
-  const budget = parseFalsePositiveBudget(budgetRaw);
   const locators = urls.length ? urls.map((value) => ({ type: "url", value })) : purls.map((value) => ({ type: "purl", value }));
 
   if (purls.length && urls.length) {
@@ -216,16 +217,16 @@ async function handleV1Lookup(env, ctx, url) {
       `${locators.length} packages exceeds the limit of ${V1_MAX_KEYS} for a URL.`,
     );
   }
-  // Refused rather than quietly replaced by the default: a caller who meant to
-  // loosen their budget and got the strict one back would see verdicts they
-  // never asked for, with nothing in the response to say why.
   if (budget === null) {
     return v1Error(
       400,
       "invalid_false_positive_budget",
-      `false_positive_budget must be a whole number from 0 to 65535, not ${JSON.stringify(budgetRaw)}.`,
+      `false_positive_budget must be a whole number from 0 to 3000, not ${JSON.stringify(budgetRaw)}.`,
     );
   }
+  // Refused rather than quietly replaced by the default: a caller who meant to
+  // loosen their budget and got the strict one back would see verdicts they
+  // never asked for, with nothing in the response to say why.
 
   // Which question is being asked about the artifact. `follow` is part of it,
   // so it is part of the key; false_positive_budget is not, because beamline
@@ -282,7 +283,7 @@ async function handleV1Lookup(env, ctx, url) {
 // lookup spends no analysis slot, and since every worker defers to the same
 // corpus when it does not know, they now give the same answer. Broadcasting
 // would multiply the load behind them to learn nothing.
-async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, follow) {
+async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, _budget, follow) {
   const ids = v1LocatorIds(ctx.rid, sha, locators);
   const locator = locators.length === 1 ? locators[0] : null;
   const origin = new URL(cacheKey.url).origin;
@@ -336,7 +337,7 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
       logLine("v1_lookup", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
       const document = v1DocumentBody(answered.body);
       const stored = document || answered.body;
-      const body = document ? v1BudgetedBody(document, budget, locator) : answered.body;
+      const body = document ? v1BudgetedBody(document, budget, locator) : (v1BudgetedBody(answered.body, budget, locator) || answered.body);
       const res = v1Body(env, body, 200, worker, v1MaxAge(stored), source);
       if (!v1MaxAge(stored)) return res;
       // The asked-for key and every resolved alias are stored together; the
@@ -368,10 +369,10 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
 // artifact: it is a statement about us.
 function v1Unavailable(sha, locator) {
   const row = {
-    decision: "unavailable",
+    status: "unavailable",
     purl: locator?.type === "purl" ? locator.value : null,
     sha256: sha || null,
-    severity: null,
+    severity: "unknown",
     fires_at: null,
     reason: null,
     findings: [],
@@ -379,7 +380,7 @@ function v1Unavailable(sha, locator) {
     analyzed_at: null,
   };
   if (locator?.type === "url") row.url = locator.value;
-  return row;
+  return compactV1Row(row);
 }
 
 // The cache key a v1 decision is stored under.
@@ -507,9 +508,9 @@ function v1DecisionSha(body) {
 function parseFalsePositiveBudget(raw) {
   if (raw === null) return DEFAULT_FALSE_POSITIVE_BUDGET;
   const value = String(raw).trim();
-  if (!/^\d{1,5}$/.test(value)) return null;
+  if (!/^\d{1,4}$/.test(value)) return null;
   const budget = Number(value);
-  return budget <= 65535 ? budget : null;
+  return budget >= 0 && budget <= SUSPICIOUS_LEVEL_CEILING ? budget : null;
 }
 
 function validArtifactUrl(value) {
@@ -617,7 +618,7 @@ function v1DocumentBody(body) {
 }
 
 function canonicalV1Row(row) {
-  return applyBudgetToRow(row, DEFAULT_FALSE_POSITIVE_BUDGET);
+  return compactV1Row(normalizeV1Row(row));
 }
 
 function v1BudgetedBody(body, budget, locator, legacyCachedUnknown = false) {
@@ -632,24 +633,50 @@ function v1BudgetedBody(body, budget, locator, legacyCachedUnknown = false) {
   // cache reads so entries written before the rename remain useful. A live
   // worker returning the old name stays visible and fails the v1 contract
   // probe instead of hiding a partial or regressed deployment.
-  const budgetRow = (item) => {
+  const normalizedRow = (item) => {
     const normalized = legacyCachedUnknown && item && typeof item === "object" && !Array.isArray(item) && item.decision === "unknown"
       ? { ...item, decision: "unanalyzed" }
       : item;
-    return applyBudgetToRow(normalized, budget);
+    return compactV1Row(normalizeV1Row(normalized, budget));
   };
-  const rows = Array.isArray(row) ? row.map(budgetRow) : budgetRow(row);
+  const rows = Array.isArray(row) ? row.map(normalizedRow) : normalizedRow(row);
   if (!locator || locator.type !== "url") return JSON.stringify(rows);
   const addUrl = (item) => (item && typeof item === "object" && !Array.isArray(item) ? { ...item, url: locator.value } : item);
   return JSON.stringify(Array.isArray(rows) ? rows.map(addUrl) : addUrl(rows));
 }
 
-function applyBudgetToRow(row, budget) {
+function normalizeV1Row(row, budget = null) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return row;
-  if (row.engine_version && Number.isInteger(row.fires_at)) {
-    return { ...row, decision: row.fires_at >= 0 && row.fires_at <= budget ? "block" : "allow" };
+  const status = row.status || (row.decision === "allow" || row.decision === "block" ? "analyzed" : row.decision);
+  const normalized = { ...row, status: status || "unknown" };
+  delete normalized.decision;
+  if (normalized.status !== "analyzed") {
+    normalized.severity = "unknown";
+  } else if (Number.isInteger(normalized.fires_at) && budget !== null) {
+    normalized.severity = severityForLevel(normalized.fires_at, budget);
+  } else if (normalized.severity == null) {
+    normalized.severity = "unknown";
   }
-  return row;
+  return normalized;
+}
+
+function severityForLevel(firesAt, budget) {
+  if (firesAt < 0) return "benign";
+  if (firesAt <= budget) return "hostile";
+  if (firesAt <= SUSPICIOUS_LEVEL_CEILING) return "suspicious";
+  return "benign";
+}
+
+// Null means the field has no information. Do not make every client pay for
+// keys whose only value is null; nested findings use the same sparse shape.
+function compactV1Row(value) {
+  if (Array.isArray(value)) return value.map(compactV1Row);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, item]) => item !== null)
+      .map(([key, item]) => [key, compactV1Row(item)]),
+  );
 }
 
 // KV keys are hashes rather than raw URLs: a batch of PURLs can exceed KV's
@@ -703,8 +730,7 @@ function v1CachedVerdict(body) {
     return null;
   }
   if (!row || typeof row !== "object" || Array.isArray(row)) return null;
-  const decision = row.decision;
-  if (typeof decision !== "string" || decision === "unanalyzed" || decision === "unavailable") return null;
+  if (row.status !== "analyzed" && !(row.decision === "allow" || row.decision === "block")) return null;
   if (!row.engine_version) return null;
   return row;
 }
@@ -722,7 +748,8 @@ function v1CachedVerdict(body) {
 // A pre-engine_version verdict lands in the short bucket too. That costs a
 // little more traffic and is never wrong, which is the right side to err on.
 function v1MaxAge(body) {
-  if (body.includes('"unavailable"')) return 0;
+  if (body.includes('"status":"unavailable"') || body.includes('"decision":"unavailable"')) return 0;
+  if (body.includes('"status":"unanalyzed"') || body.includes('"decision":"unanalyzed"')) return V1_NO_ENGINE_MAX_AGE;
   if (body.includes('"engine_version":null')) return V1_NO_ENGINE_MAX_AGE;
   return V1_VERDICT_MAX_AGE;
 }
@@ -824,7 +851,7 @@ async function handleV1Analyze(request, env, ctx, url) {
     return v1Error(
       400,
       "invalid_false_positive_budget",
-      `false_positive_budget must be a whole number from 0 to 65535, not ${JSON.stringify(budgetRaw)}.`,
+      `false_positive_budget must be a whole number from 0 to 3000, not ${JSON.stringify(budgetRaw)}.`,
     );
   }
   // Resolved after the body, because how the artifact was named decides the
@@ -883,7 +910,7 @@ async function handleV1Analyze(request, env, ctx, url) {
       // never fixed it either.
       const body = v1BudgetedBody(document, budget, locator);
       waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document, follow.value));
-      logLine("v1_analyze", { src: "cache", status: 200, decision: decided.decision, ms: Date.now() - t0, ...ids });
+      logLine("v1_analyze", { src: "cache", status: 200, artifact_status: decided.status, ms: Date.now() - t0, ...ids });
       // Answered in the shape this route always answers in: one NDJSON line,
       // no progress frames because there was no run to report progress about.
       return new Response(`${body.trimEnd()}\n`, {

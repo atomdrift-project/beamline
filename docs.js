@@ -117,9 +117,9 @@ function docsHtml(authRequired) {
       <section id="start">
         <div class="eyebrow">Supply-chain malware detection API</div>
         <h1><a class="heading-link" href="#start">Find 0-day malware in the software supply chain.</a></h1>
-        <p class="lead">Beamline is an API for finding 0-day malware in the software supply chain. Calls wait for a decision and may be retried.</p>
+        <p class="lead">Beamline is an API for finding 0-day malware in the software supply chain. Calls wait for an assessment and may be retried.</p>
         <div class="hero-points" aria-label="Why Beamline">
-          <article class="hero-point"><strong class="hero-point-title">Your false-positive policy</strong><p>Set <code>false_positive_budget</code> to match the risk tolerance of your use case, from strict blocking to broader detection.</p></article>
+          <article class="hero-point"><strong class="hero-point-title">Your false-positive policy</strong><p>Set <code>false_positive_budget</code> to match your risk tolerance, then use the measured <code>fires_at</code> level for any additional policy.</p></article>
           <article class="hero-point"><strong class="hero-point-title">Built for what is not known yet</strong><p>Analyze packages, exact downloads, and uploaded artifacts—not just files that already appear on a threat list.</p></article>
           <article class="hero-point"><strong class="hero-point-title">Open-source foundation</strong><p>Beamline is based on the open-source <a href="https://atomdrift.org/">Atomdrift project</a>.</p></article>
         </div>
@@ -159,7 +159,7 @@ function docsHtml(authRequired) {
       </section>
 
       <section id="analyze"><h2><a class="heading-link" href="#analyze">Analyze</a></h2>
-        <p><code>POST /v1/analyze</code> streams newline-delimited JSON until a decision arrives. Complex samples may take minutes. Retrying the same PURL or URL reuses an analysis already in progress.</p>
+        <p><code>POST /v1/analyze</code> streams newline-delimited JSON until an assessment arrives. Complex samples may take minutes. Retrying the same PURL or URL reuses an analysis already in progress.</p>
         <h3 id="analyze-purl"><a class="heading-link" href="#analyze-purl">PURL</a></h3>
         <div class="route-example"><code>POST /v1/analyze?purl=…</code></div>
         <div class="runner" data-runner data-method="POST" data-stream data-path="/v1/analyze?purl=pkg%3Acargo%2Ftokio%401.40.0">
@@ -189,13 +189,13 @@ function docsHtml(authRequired) {
       </section>
 
       <section id="false-positive-budget"><h2><a class="heading-link" href="#false-positive-budget">False-positive budget</a></h2>
-        <p><code>?false_positive_budget=</code> sets the false-positive rate you accept, measured per 100 million benign files. Add it to either route. The default is 25.</p>
+        <p><code>false_positive_budget</code> sets the false-positive rate you accept, measured per 100 million benign files. It defaults to 25 and controls the returned <code>severity</code>. We recommend choosing 1–250; values through 3000 are accepted because 3000 is the suspicious ceiling.</p>
         <pre><code>GET /v1/lookup?purl=…&amp;false_positive_budget=25
-POST /v1/analyze?url=…&amp;false_positive_budget=1000</code></pre>
+POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
         <table class="endpoint-table" aria-label="False-positive budget examples"><thead><tr><th>Value</th><th>Behavior</th></tr></thead><tbody>
-          <tr><td>0</td><td>Block only when <code>fires_at</code> is 0.</td></tr><tr><td>25</td><td>Block when <code>fires_at</code> is 0–25. Default.</td></tr><tr><td>1000</td><td>Block when <code>fires_at</code> is 0–1000. Broader detection, with more false positives.</td></tr>
+          <tr><td>0</td><td>Block only when <code>fires_at</code> is 0.</td></tr><tr><td>25</td><td>Block when <code>fires_at</code> is 0–25. Default.</td></tr><tr><td>250</td><td>Recommended upper end; block when <code>fires_at</code> is 0–250.</td></tr>
         </tbody></table>
-        <p>Use a whole number from 0 to 65535. The response field <code>fires_at</code> is the tightest budget at which the artifact is hostile. Beamline returns <code>block</code> when <code>fires_at</code> is zero or greater and no higher than your budget. <code>-1</code> never fires.</p>
+        <p>Use a whole number from 0 to 3000. We recommend 1 to 250. The response field <code>fires_at</code> is the tightest budget at which the artifact is hostile. Severity is <code>hostile</code> at or below the requested budget, <code>suspicious</code> above it through 3000, and <code>benign</code> above 3000 or at <code>-1</code>.</p>
       </section>
 
       <section id="follow"><h2><a class="heading-link" href="#follow">Following references <span class="new-label">New</span></a></h2>
@@ -210,35 +210,32 @@ POST /v1/analyze?url=…&amp;false_positive_budget=1000</code></pre>
 
       <section id="response"><h2><a class="heading-link" href="#response">Response</a></h2>
         <pre><code>{
-  "decision": "allow",
+  "status": "analyzed",
   "purl": "pkg:npm/axios@1.19.0",
-  "url": null,
   "sha256": "a511049fdaec40a320368b3ee965079b3e14481f82d052584f746bbdc3f01ede",
   "severity": "benign",
   "fires_at": -1,
-  "reason": null,
   "findings": [],
   "engine_version": "2.8.0",
   "analyzed_at": "2026-08-23T11:48:00Z"
 }</code></pre>
-        <p><code>decision</code> is the result to act on. It reflects the requested <code>?false_positive_budget=</code> and has four values:</p>
+        <p><code>status</code> describes whether Beamline has an assessment; <code>severity</code> describes that assessment. A response is factual and does not choose whether your system should proceed. Fields with no value are omitted to save bandwidth:</p>
         <ul class="meanings">
-          <li><code>decision: "allow"</code> did not meet your blocking threshold. It is not a guarantee that the artifact is safe.</li>
-          <li><code>decision: "block"</code> met your blocking threshold.</li>
-          <li><code>decision: "unanalyzed"</code> means nobody has analyzed the artifact.</li>
-          <li><code>decision: "unavailable"</code> means Beamline could not answer. It says nothing about the artifact.</li>
+          <li><code>status: "analyzed"</code> means <code>severity</code> was derived from <code>fires_at</code> and the requested budget.</li>
+          <li><code>status: "unanalyzed"</code> means nobody has analyzed the artifact; severity is <code>unknown</code>.</li>
+          <li><code>status: "unavailable"</code> means Beamline could not answer; severity is <code>unknown</code>.</li>
         </ul>
-        <p>For streaming analysis, only a line containing <code>decision</code> is a verdict. Other lines report progress. Retry if the stream ends without one.</p>
+        <p>For streaming analysis, only the terminal line containing <code>status</code> is the assessment. Other lines report progress. Retry if the stream ends without one.</p>
       </section>
 
       <section id="use-cases"><h2><a class="heading-link" href="#use-cases">Use cases</a></h2>
         <section aria-labelledby="ci-systems"><h3 id="ci-systems"><a class="heading-link" href="#ci-systems">CI systems</a></h3>
-          <p>Use <code>POST /v1/analyze</code> when a job requires a verdict. Name registry dependencies with <code>purl</code>. Upload local build outputs.</p>
-          <p>Wait for the line containing <code>decision</code>, then:</p>
-          <table class="endpoint-table" aria-label="CI actions by decision"><thead><tr><th>Decision</th><th>CI action</th></tr></thead><tbody>
-            <tr><td>allow</td><td>Continue under your policy.</td></tr><tr><td>block</td><td>Fail the job.</td></tr><tr><td>unavailable</td><td>Retry with backoff. If it persists, apply your outage policy.</td></tr>
+          <p>Use <code>POST /v1/analyze</code> when a job needs a fresh assessment. Name registry dependencies with <code>purl</code>. Upload local build outputs.</p>
+          <p>Wait for the terminal line containing <code>status</code>, then apply your policy to <code>severity</code> and <code>fires_at</code>:</p>
+          <table class="endpoint-table" aria-label="CI actions by status"><thead><tr><th>Status</th><th>CI action</th></tr></thead><tbody>
+            <tr><td>analyzed</td><td>Compare <code>fires_at</code> with your budget.</td></tr><tr><td>unanalyzed</td><td>Apply your unknown-artifact policy.</td></tr><tr><td>unavailable</td><td>Retry with backoff or apply your outage policy.</td></tr>
           </tbody></table>
-          <p class="muted">A stream that ends before a decision is not an answer. Retry it. Keep the returned <code>sha256</code> with the build record.</p>
+          <p class="muted">A stream that ends before a status is not an answer. Retry it. Keep the returned <code>sha256</code> with the build record.</p>
         </section>
 
         <section aria-labelledby="transparent-proxy"><h3 id="transparent-proxy"><a class="heading-link" href="#transparent-proxy">Transparent proxy integration</a></h3>
@@ -260,7 +257,7 @@ POST /v1/analyze?url=…&amp;false_positive_budget=1000</code></pre>
     "message": "url must be an absolute http or https URL."
   }
 }</code></pre>
-        <p><code>400</code> means the request is invalid. <code>401</code> means a bearer token is required or invalid. <code>413</code> means too many packages or an oversized upload. <code>429</code> means capacity is temporarily full; retry with backoff. If Beamline cannot answer about an artifact, it returns <code>200</code> with <code>decision: "unavailable"</code>.</p>
+        <p><code>400</code> means the request is invalid. <code>401</code> means a bearer token is required or invalid. <code>413</code> means too many packages or an oversized upload. <code>429</code> means capacity is temporarily full; retry with backoff. If Beamline cannot answer about an artifact, it returns <code>200</code> with <code>status: "unavailable"</code>.</p>
       </section>
 
       <section id="support" class="footer"><h2><a class="heading-link" href="#support">Support</a></h2><p>Need help? Have a suggestion? Reach out to <a href="mailto:support@isotope13.ai">support@isotope13.ai</a>.</p><p class="muted"><a href="https://github.com/atomdrift-project/beamline">Source on GitHub</a> · <a href="https://github.com/atomdrift-project/beamline/blob/main/API.md">Full API reference</a> · <a href="https://lab.atomdrift.org/">Sample data</a></p></section>
