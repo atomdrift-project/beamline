@@ -26,15 +26,12 @@ KV=<namespace-id> SCAN_URL=… make deploy-cf
 
 The deploy recipe turns that ID into the `BEAMLINE_KV` binding for Wrangler.
 
-Three separate tokens, none of them baked into the tree: `BEAMLINE_TOKEN` is
-who may call beamline, `HOPPER_TOKEN` and `SCAN_TOKEN` are how beamline calls
-its backends. Each is taken from the environment, and otherwise from the first
-non-empty line of `~/.tok/<service>` — the file the services themselves are
-pointed at with `--token-file`. `make deploy-cf` uploads all three as Worker
-secrets from the same source, so a local run and a deployed Worker
-authenticate identically, and a token with no value is left alone rather than
-uploaded empty. With no `BEAMLINE_TOKEN` anywhere, beamline serves every route
-unauthenticated.
+`BEAMLINE_TOKEN` is optional client policy: pass it in the environment to
+require a bearer token, or omit it to leave the API open. `HOPPER_TOKEN` and
+`SCAN_TOKEN` are backend credentials; those may still come from the first
+non-empty line of `~/.tok/<service>`. The deploy recipe uploads backend
+credentials only, so a local token file cannot accidentally turn on client
+authentication in production.
 
 ```
 HOPPER_URL=… SCAN_URL=… node local.js

@@ -20,8 +20,8 @@ REPEAT      ?= 1
 API         ?= v1
 BEAMLINE_URL ?= https://api.isotope13.ai
 BEAMLINE_TOKEN ?=
-# Backend credentials. Unset means tok.js reads ~/.tok/<service>, which is
-# where the services themselves are pointed by --token-file.
+# SCAN_TOKEN is a backend credential. BEAMLINE_TOKEN is client policy and is
+# environment-only: an unset value deliberately leaves the API open.
 HOPPER_TOKEN ?=
 SCAN_TOKEN ?=
 # Exported so the deploy-cf recipe can pipe a value into wrangler without it
@@ -38,10 +38,10 @@ KV_NAMESPACE ?= beamline
 # Parse every file, then oxlint. No lint config is checked in: the defaults
 # are the standard, and the tree stays free of npm packages.
 lint:
-	@for f in beamline.js local.js stress.js tok.js scripts/route-bench.mjs beamline.test.js stress.test.js; do \
+	@for f in beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs beamline.test.js stress.test.js; do \
 	  node --check "$$f" || exit 1; \
 	done
-	npx --yes $(OXLINT) --deny-warnings beamline.js local.js stress.js tok.js scripts/route-bench.mjs beamline.test.js stress.test.js
+	npx --yes $(OXLINT) --deny-warnings beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs beamline.test.js stress.test.js
 
 test:
 	node --test
@@ -118,17 +118,10 @@ kv-create:
 # and does not need a credential for.
 # SCAN_URL may list several workers, comma-separated, to race them:
 #   SCAN_URL=https://scan-a.example,https://scan-b.example make deploy-cf
-# Tokens, all three separate, uploaded as Worker secrets after the deploy:
-#   BEAMLINE_TOKEN   # who may call beamline
+# Backend credentials are uploaded as Worker secrets after the deploy:
 #   SCAN_TOKEN       # beamline -> scan
-# Each takes the environment if set, otherwise the first non-empty line of
-# ~/.tok/<service> — the same file tok.js reads locally, so a deployed Worker
-# and a local run authenticate identically. The secrets go up after the deploy
-# because `wrangler secret put` needs the Worker to exist; on a first-ever
-# deploy that leaves a short window where the new Worker is running without
-# them. Nothing is uploaded for a token with no value: the deployed secret is
-# left as it is rather than cleared, so a missing file cannot silently drop
-# beamline to unauthenticated.
+# BEAMLINE_TOKEN is intentionally not read from ~/.tok or uploaded here. Set
+# it explicitly in the environment if client authentication is wanted.
 define put_secret
 	@if [ -n "$$$(1)" ]; then \
 	  echo "$(1): from the environment"; \
@@ -146,5 +139,4 @@ deploy-cf:
 	@test -n "$(SCAN_URL)" || { echo "SCAN_URL is required"; exit 1; }
 	@test -n "$(KV)" || { echo "KV is required (Cloudflare KV namespace ID)"; exit 1; }
 	KV="$(KV)" SCAN_URL="$(SCAN_URL)" WRANGLER="$(WRANGLER)" node scripts/deploy-cf.mjs
-	$(call put_secret,BEAMLINE_TOKEN,beamline)
 	$(call put_secret,SCAN_TOKEN,scan)

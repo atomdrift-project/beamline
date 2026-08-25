@@ -2,6 +2,8 @@
 
 Two routes. `/v1/lookup` reports what is already known; `/v1/analyze` finds out.
 
+`GET /` serves the API documentation.
+
 ```
 GET  /v1/lookup?purl={purl}                   free, cacheable, never analyzes
 GET  /v1/lookup?url={url}                     exact URL; same cache behavior
@@ -19,9 +21,11 @@ GET  /_/routes                                the router's own reasoning
 Only `/v1/analyze` costs anything, and only when the answer is not already
 known.
 
-If `BEAMLINE_TOKEN` is set, every route except the health checks requires
-`Authorization: Bearer …`. Your token authenticates you to us and travels no
-further; beamline holds separate credentials for its backends.
+Client authentication is optional. If `BEAMLINE_TOKEN` is set, API routes
+require `Authorization: Bearer …`; if it is absent, no client token is checked.
+The documentation and health routes are public either way. A client token
+authenticates you to us and travels no further; beamline holds separate
+credentials for its backends.
 
 ## Keys
 
@@ -340,14 +344,14 @@ reworded.
 | `artifact_too_large` | 413 | Over the 16 MiB upload cap; use `purl`. |
 | `invalid_body` | 400 | The body could not be read. |
 
-Beamline's own refusals, such as an unauthenticated request or an unknown
-route, answer `{"error":"unauthorized"}` and the like, without a code.
+Beamline's own refusals, such as an unknown route, answer an error object
+without a package-level decision.
 
 | status | |
 | --- | --- |
 | 200 | A decision, or a list of them. Includes `unknown` and `unavailable`. |
 | 400 | Your request. See `code`. |
-| 401 | Bad or missing bearer token. |
+| 401 | Bad or missing bearer token when `BEAMLINE_TOKEN` is configured. |
 | 404 | No such route. |
 | 405 | Right route, wrong method. `Allow` names the one that works. |
 | 413 | Too many packages. |

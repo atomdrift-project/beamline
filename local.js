@@ -30,11 +30,9 @@ const TUNABLES = [
 
 const env = Object.fromEntries(TUNABLES.map((k) => [k, process.env[k] || ""]));
 
-// Two credentials, each with its own ~/.tok file: BEAMLINE_TOKEN is who may
-// call us, SCAN_TOKEN is how we call scan. An unset one falls back to the file,
-// so a local run needs no arguments. Leaving ~/.tok/beamline absent leaves this
-// beamline unauthenticated, exactly as an unset BEAMLINE_TOKEN always has.
-env.BEAMLINE_TOKEN ||= readToken("beamline");
+// The client token is deliberately environment-only: if BEAMLINE_TOKEN is not
+// passed, the API is open. SCAN_TOKEN still falls back to ~/.tok because it is
+// a backend credential, not a policy switch for callers.
 env.SCAN_TOKEN ||= readToken("scan");
 
 // Workaround, not design. On Node 26 fetch does not dispatch a second

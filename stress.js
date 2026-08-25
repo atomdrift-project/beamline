@@ -20,9 +20,9 @@ const n = Math.max(1, Number(process.env.N) || DEFAULT_N);
 const samples = Math.max(0, Number(process.env.SAMPLES) || 0);
 const concurrency = Math.max(1, Number(process.env.CONCURRENCY) || DEFAULT_CONCURRENCY);
 const beamlineUrl = trimSlash(process.env.BEAMLINE_URL);
-// Same ~/.tok fallback the server takes, so a run against a local beamline
-// started without arguments still presents the token that beamline read.
-const token = (process.env.BEAMLINE_TOKEN || "").trim() || readToken("beamline");
+// Client authentication is opt-in through the environment. Do not discover a
+// local beamline token implicitly: an absent value means the API is open.
+const token = (process.env.BEAMLINE_TOKEN || "").trim();
 const scanToken = (process.env.SCAN_TOKEN || "").trim() || readToken("scan");
 const hopperToken = (process.env.HOPPER_TOKEN || "").trim() || readToken("hopper");
 // SCAN_URL may list several interchangeable workers; probe the first.

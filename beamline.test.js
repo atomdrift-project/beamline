@@ -29,6 +29,17 @@ test("GET /healthz", async () => {
   assert.equal((await res.json()).status, "ok");
 });
 
+test("GET / serves the public API documentation", async () => {
+  const res = await handle(new Request("http://beamline/"), { BEAMLINE_TOKEN: "secret" }, {});
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-type"), /^text\/html/);
+  const body = await res.text();
+  assert.match(body, /Beamline API/);
+  assert.match(body, /Transparent proxy integration/);
+  assert.match(body, /follow=none/);
+  assert.match(body, /BEAMLINE_TOKEN/);
+});
+
 test("BEAMLINE_TOKEN accepts a comma-separated list", () => {
   assert.deepEqual(_test.tokenList("alpha, beta,gamma"), ["alpha", "beta", "gamma"]);
   assert.deepEqual(_test.tokenList("solo"), ["solo"]);
@@ -86,9 +97,10 @@ test("a dropped version prefix says so", async () => {
 
 
 
-test("query purl is not a route", async () => {
+test("the documentation page ignores query parameters", async () => {
   const res = await handle(new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"), {}, {});
-  assert.equal(res.status, 404);
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /Lookup what we know/);
 });
 
 

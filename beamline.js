@@ -5,6 +5,8 @@
 // that cannot answer a lookup from its own index asks the corpus, which keeps
 // the credential and the failover in one place instead of two.
 
+import { docsResponse } from "./docs.js";
+
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DEFAULT_SCAN_TIMEOUT_MS = 1_800_000;
 // How long a worker gets to answer a lookup before we give up on it and hold
@@ -90,6 +92,14 @@ async function dispatch(request, env, ctx) {
   if (url.pathname === "/healthz" || url.pathname === "/_/health") {
     if (request.method !== "GET") return methodNotAllowed("GET");
     return json({ status: "ok" }, 200);
+  }
+
+  // Documentation is intentionally public even when API routes use the
+  // optional client-token gate. A caller should be able to discover how to
+  // authenticate before having a token.
+  if (url.pathname === "/") {
+    if (request.method !== "GET") return methodNotAllowed("GET");
+    return docsResponse();
   }
 
   const allowed = tokenList(env.BEAMLINE_TOKEN);
