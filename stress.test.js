@@ -188,7 +188,7 @@ test("popular jobs can be repeated to a request count", () => {
 // that vanishes is a defect the harness must report rather than tolerate.
 test("v1 check: a well-formed decision passes", () => {
   const ok = {
-    decision: "block",
+    status: "analyzed",
     purl: "pkg:npm/evil@1.0.0",
     sha256: "a".repeat(64),
     severity: "hostile",
@@ -203,7 +203,7 @@ test("v1 check: a well-formed decision passes", () => {
 
 test("v1 check: a missing key is a defect, not a variation", () => {
   const missing = {
-    decision: "allow",
+    status: "analyzed",
     purl: "pkg:npm/fine@1.0.0",
     sha256: null,
     severity: "benign",
@@ -220,7 +220,7 @@ test("v1 check: a missing key is a defect, not a variation", () => {
 // be treating our own failure as evidence about somebody's package.
 test("v1 check: an outage may not carry evidence", () => {
   const leaky = {
-    decision: "unavailable",
+    status: "unavailable",
     purl: "pkg:npm/x@1.0.0",
     sha256: null,
     severity: "benign",
@@ -240,7 +240,7 @@ test("v1 check: an outage may not carry evidence", () => {
 // stopped has nothing to act on.
 test("v1 check: a block must be able to say why", () => {
   const mute = {
-    decision: "block",
+    status: "analyzed",
     purl: "pkg:npm/evil@1.0.0",
     sha256: null,
     severity: "hostile",
@@ -251,13 +251,13 @@ test("v1 check: a block must be able to say why", () => {
     analyzed_at: "2026-08-01T00:00:00Z",
   };
   assert.deepEqual(_test.checkV1(200, mute, "pkg:npm/evil@1.0.0"), [
-    "block carried neither a reason nor a finding",
+    "analyzed carried neither a reason nor a finding",
   ]);
 });
 
 test("v1 check: an answer about a different package is a defect", () => {
   const wrong = {
-    decision: "allow",
+    status: "analyzed",
     purl: "pkg:npm/other@2.0.0",
     sha256: null,
     severity: "benign",
@@ -272,12 +272,11 @@ test("v1 check: an answer about a different package is a defect", () => {
   assert.match(issues[0], /answered about/);
 });
 
-// A miss is a decision now, not a status: v1 answers 200 for a package nobody
-// has analyzed. Classifying on the status alone would count every miss as a
-// success and report a hit rate of 100%.
+// A miss is a status now, not a transport error: v1 answers 200 for a package
+// nobody has analyzed. Classifying on the HTTP status alone would count every
+// miss as a success and report a hit rate of 100%.
 test("v1: a miss and an outage are told apart inside a 200", () => {
-  assert.equal(_test.classify({ status: 200, decision: "unanalyzed" }), "miss");
-  assert.equal(_test.classify({ status: 200, decision: "unavailable" }), "note");
-  assert.equal(_test.classify({ status: 200, decision: "allow" }), "ok");
-  assert.equal(_test.classify({ status: 200, decision: "block" }), "ok");
+  assert.equal(_test.classify({ status: 200, artifactStatus: "unanalyzed" }), "miss");
+  assert.equal(_test.classify({ status: 200, artifactStatus: "unavailable" }), "note");
+  assert.equal(_test.classify({ status: 200, artifactStatus: "analyzed" }), "ok");
 });

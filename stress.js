@@ -601,6 +601,7 @@ function checkV1(status, body, askedPurl) {
   for (const key of Object.keys(body)) if (!V1_FIELDS.has(key)) issues.push(`v1 unexpected ${key}`);
   if (!("status" in body)) issues.push("v1 missing status");
   if (!("severity" in body)) issues.push("v1 missing severity");
+  if (!("reason" in body)) issues.push("v1 missing reason");
   if (!V1_STATUSES.has(body.status)) issues.push(`v1 status ${JSON.stringify(body.status)}`);
   if (!V1_SEVERITIES.has(body.severity)) {
     issues.push(`v1 severity ${JSON.stringify(body.severity)}`);
@@ -616,6 +617,8 @@ function checkV1(status, body, askedPurl) {
     if (Array.isArray(body.findings) && body.findings.length) {
       issues.push(`${body.status} carried findings`);
     }
+  } else if (body.severity === "hostile" && !body.reason && !(Array.isArray(body.findings) && body.findings.length)) {
+    issues.push("analyzed carried neither a reason nor a finding");
   }
   if (askedPurl && body.purl && body.purl !== askedPurl) {
     issues.push(`answered about ${body.purl}, asked about ${askedPurl}`);

@@ -42,7 +42,7 @@ test("GET / serves the public API documentation", async () => {
   assert.match(body, /Use cases/);
   assert.match(body, /href="#false-positive-budget"/);
   assert.match(body, /false_positive_budget=25/);
-  assert.match(body, /<code>\?false_positive_budget=<\/code>/);
+  assert.match(body, /<code>false_positive_budget<\/code>/);
   assert.match(body, /Following references/);
   assert.match(body, /<code>\?follow=<\/code> controls/);
   assert.match(body, /CI systems/);
@@ -54,8 +54,6 @@ test("GET / serves the public API documentation", async () => {
   assert.equal((body.match(/class="heading-link"/g) || []).length, (body.match(/<h[123](?:\s|>)/g) || []).length);
   assert.match(body, /href="#lookup-url"/);
   assert.match(body, /href="#content-upload"/);
-  assert.match(body, /data-upload data-path="\/v1\/analyze\?follow=none"/);
-  assert.match(body, /api\.isotope13\.ai\/v1\/analyze\?follow=none/);
   assert.match(body, /follow=none/);
   assert.match(body, /Authentication is required/);
   assert.match(body, /Authorization: Bearer/);
@@ -66,9 +64,9 @@ test("GET / serves the public API documentation", async () => {
   assert.doesNotMatch(body, /Runnable curl|class="runbar"/);
   assert.match(body, /class="response"/);
   assert.match(body, /class="meanings"/);
-  assert.match(body, /<code>decision<\/code> is the result to act on/);
-  assert.match(body, /decision: "allow"/);
-  assert.match(body, /only a line containing <code>decision<\/code> is a verdict/);
+  assert.match(body, /<code>status<\/code> describes whether Beamline has an assessment/);
+  assert.match(body, /status: "analyzed"/);
+  assert.match(body, /only the terminal line containing <code>status<\/code> is the assessment/);
   assert.match(body, /runner\.has-response/);
   assert.match(body, /runner\.hasAttribute\("data-stream"\) \? output\.scrollHeight : 0/);
   assert.match(body, /data-path="\/v1\/lookup\?url=/);
@@ -233,7 +231,7 @@ test("a fleet that is merely full is waited on, not given up on", async () => {
       waitCtx().ctx,
     );
     const decided = JSON.parse((await res.text()).trim().split("\n").pop());
-    assert.equal(decided.decision, "allow", "gave up on a fleet that was only busy");
+    assert.equal(decided.status, "analyzed", "gave up on a fleet that was only busy");
     assert.ok(refusals > _test.BREAKER_FAILS, `only ${refusals} refusals; the budget did not stretch`);
   } finally {
     await worker.close();
@@ -620,7 +618,7 @@ test("v1 analyze: a non-default follow policy is a separate entry, not a bypass"
       env,
       customCtx.ctx,
     );
-    assert.equal(JSON.parse((await custom.text()).trim()).decision, "block");
+    assert.equal(JSON.parse((await custom.text()).trim()).status, "analyzed");
     await customCtx.flush();
     assert.equal(scan.hits.analyze, 2, "explicit policy incorrectly used the default policy's entry");
 
@@ -629,7 +627,7 @@ test("v1 analyze: a non-default follow policy is a separate entry, not a bypass"
       env,
       waitCtx().ctx,
     );
-    assert.equal(JSON.parse((await repeated.text()).trim()).decision, "block");
+    assert.equal(JSON.parse((await repeated.text()).trim()).status, "analyzed");
     assert.equal(scan.hits.analyze, 2, "an explicit policy paid for its own analysis twice");
 
     const cached = await handle(
@@ -637,7 +635,7 @@ test("v1 analyze: a non-default follow policy is a separate entry, not a bypass"
       env,
       waitCtx().ctx,
     );
-    assert.equal(JSON.parse((await cached.text()).trim()).decision, "allow");
+    assert.equal(JSON.parse((await cached.text()).trim()).status, "analyzed");
     assert.equal(scan.hits.analyze, 2, "the explicit result replaced the default policy's entry");
   } finally {
     await scan.close();
@@ -683,10 +681,91 @@ test("v1 analyze: progress reaches the caller, not just the decision", async () 
     assert.equal(modelStarted.phase_state, "started");
     assert.equal(modelCompleted.phase, "features+model");
     assert.equal(modelCompleted.phase_state, "completed");
-    assert.equal(JSON.parse(lines[4]).decision, "block");
+    assert.equal(JSON.parse(lines[4]).status, "analyzed");
   } finally {
     await scan.close();
   }
+});
+
+// The analysis itself may run for minutes. It belongs to the response stream,
+// which keeps the invocation alive while the caller is connected; waitUntil's
+// short post-response budget is reserved for filing the completed decision.
+test("v1 analyze: waitUntil starts only after the terminal decision", async () => {
+  let releaseDecision;
+  const held = new Promise((resolve) => { releaseDecision = resolve; });
+  let finishStream;
+  const streamHeld = new Promise((resolve) => { finishStream = resolve; });
+  const scan = await mockBackend({
+    analyzeStream: async function* () {
+      yield '{"state":"analyzing","purl":"pkg:npm/slow@1.0.0","elapsed_ms":1002,"phase":"unpack"}';
+      await held;
+      yield '{"decision":"allow","fires_at":-1,"purl":"pkg:npm/slow@1.0.0","engine_version":"test"}';
+      await streamHeld;
+    },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fslow%401.0.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    const first = await reader.read();
+    assert.match(decoder.decode(first.value, { stream: true }), /"state":"analyzing"/);
+    assert.equal(ctx.pending(), 0, "the in-flight analysis was registered as background work");
+
+    releaseDecision();
+    let tail = "";
+    while (!tail.includes('"status":"analyzed"')) {
+      const { value } = await reader.read();
+      tail += decoder.decode(value, { stream: true });
+    }
+    assert.match(tail, /"status":"analyzed"/);
+    assert.equal(ctx.pending(), 1, "the completed decision did not schedule its cache write");
+    await reader.cancel();
+    await ctx.flush();
+
+    const looked = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fslow%401.0.0"),
+      env,
+      noopCtx(),
+    );
+    assert.equal(looked.headers.get("x-beamline-source"), "cache");
+    assert.equal((await looked.json()).status, "analyzed");
+  } finally {
+    releaseDecision();
+    finishStream();
+    await scan.close();
+  }
+});
+
+test("v1 analyze: canceling before a decision schedules no cache work", async () => {
+  const encoder = new TextEncoder();
+  let sourceCanceled = false;
+  let completed = 0;
+  const source = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('{"state":"analyzing","elapsed_ms":1002,"phase":"unpack"}\n'));
+    },
+    cancel() {
+      sourceCanceled = true;
+    },
+  });
+  const reader = _test.annotatedV1Stream(
+    source,
+    25,
+    { requestId: "test", locator: { type: "purl", value: "pkg:npm/slow@1.0.0" }, startedAt: Date.now() },
+    () => { completed += 1; },
+  ).getReader();
+
+  await reader.read();
+  await reader.cancel();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sourceCanceled, true, "cancel did not propagate to the upstream stream");
+  assert.equal(completed, 0, "a canceled stream was treated as complete");
 });
 
 test("v1 analyze: an omitted upstream phase is explicit and correlated", async () => {
@@ -707,7 +786,7 @@ test("v1 analyze: an omitted upstream phase is explicit and correlated", async (
     assert.equal(lines[0].phase, "unknown");
     assert.equal(lines[0].phase_state, "started");
     assert.equal(lines[1].phase_state, "completed");
-    assert.equal(lines[2].decision, "allow");
+    assert.equal(lines[2].status, "analyzed");
     assert.equal("phase" in lines[0], true);
     assert.notEqual(lines[0].phase, null);
   } finally {
@@ -760,7 +839,7 @@ test("v1 analyze: a busy worker is routed around before any byte is sent", async
       waitCtx().ctx,
     );
     assert.equal(res.status, 200);
-    assert.equal(JSON.parse((await res.text()).trim()).decision, "allow");
+    assert.equal(JSON.parse((await res.text()).trim()).status, "analyzed");
     assert.ok(busy.hits.analyze > 0, "the busy worker was never asked");
   } finally {
     await Promise.all([busy.close(), free.close()]);
@@ -795,7 +874,7 @@ test("v1 analyze: the decision lands where /v1/lookup will find it", async () =>
       waitCtx().ctx,
     );
     assert.equal(looked.headers.get("x-beamline-source"), "cache", "the fresh verdict was not cached");
-    assert.equal((await looked.json()).decision, "block", "the lookup did not see what the analysis found");
+    assert.equal((await looked.json()).status, "analyzed", "the lookup did not see what the analysis found");
   } finally {
     await scan.close();
   }
@@ -817,6 +896,7 @@ test("v1 analyze: a truncated stream is not cached", async () => {
       ctx.ctx,
     );
     await analyzed.text();
+    assert.equal(ctx.pending(), 0, "a stream with no decision scheduled cache work");
     await ctx.flush();
 
     const looked = await handle(
@@ -861,7 +941,7 @@ test("v1 analyze: the decision is cached on a token-protected deployment too", a
     );
     assert.equal(looked.headers.get("x-beamline-source"), "cache", "a private answer was never stored");
     assert.match(looked.headers.get("cache-control"), /^private/, "the client copy lost its scope");
-    assert.equal((await looked.json()).decision, "block");
+    assert.equal((await looked.json()).status, "analyzed");
   } finally {
     await scan.close();
   }
@@ -889,7 +969,7 @@ test("v1 analyze: a verdict already cached is answered without a second analysis
     assert.equal(scan.hits.analyze, 1, "the cached verdict was re-analysed anyway");
     assert.equal(again.headers.get("x-beamline-source"), "cache");
     assert.equal(again.headers.get("content-type"), "application/x-ndjson");
-    assert.equal(JSON.parse(body.trim()).decision, "block", "the cached answer was not the verdict");
+    assert.equal(JSON.parse(body.trim()).status, "analyzed", "the cached answer was not the verdict");
     assert.equal(body.endsWith("\n"), true, "an NDJSON answer must end its line");
   } finally {
     await scan.close();
@@ -927,7 +1007,7 @@ test("v1 analyze: a cached `unanalyzed` is not an answer to `analyze`", async ()
     );
     const body = await analyzed.text();
     assert.equal(scan.hits.analyze, 1, "a cached `unanalyzed` was served instead of analysing");
-    assert.equal(JSON.parse(body.trim()).decision, "allow");
+    assert.equal(JSON.parse(body.trim()).status, "analyzed");
   } finally {
     await scan.close();
   }
@@ -962,7 +1042,7 @@ test("v1 analyze: a row no engine produced is never a verdict, whatever it is ca
       );
       const body = await analyzed.text();
       assert.equal(scan.hits.analyze, 1, `${decision}: served as a verdict instead of analysing`);
-      assert.equal(JSON.parse(body.trim()).decision, "allow", decision);
+      assert.equal(JSON.parse(body.trim()).status, "analyzed", decision);
     } finally {
       await scan.close();
     }
@@ -1030,7 +1110,7 @@ test("v1 analyze: the decision is cached under its digest as well as its PURL", 
       waitCtx().ctx,
     );
     assert.equal(bySha.headers.get("x-beamline-source"), "cache", "the digest key was never warmed");
-    assert.equal((await bySha.json()).decision, "block");
+    assert.equal((await bySha.json()).status, "analyzed");
 
     // The digest key is an addition, not a replacement.
     const byPurl = await handle(
@@ -1067,7 +1147,7 @@ test("v1 analyze: a decision naming no digest still caches under its PURL", asyn
       waitCtx().ctx,
     );
     assert.equal(looked.headers.get("x-beamline-source"), "cache", "a digestless decision was not cached at all");
-    assert.equal((await looked.json()).decision, "allow");
+    assert.equal((await looked.json()).status, "analyzed");
   } finally {
     await scan.close();
   }
@@ -1150,7 +1230,7 @@ test("v1: legacy unknown is normalized only when read from cache", async () => {
       env,
       ctx.ctx,
     );
-    assert.equal((await live.json()).decision, "unknown", "a live contract violation was hidden");
+    assert.equal((await live.json()).status, "unknown", "a live contract violation was hidden");
     await ctx.flush();
 
     const l0 = await handle(
@@ -1159,10 +1239,10 @@ test("v1: legacy unknown is normalized only when read from cache", async () => {
       noopCtx(),
     );
     assert.equal(l0.headers.get("x-beamline-source"), "cache");
-    assert.equal((await l0.json()).decision, "unanalyzed");
+    assert.equal((await l0.json()).status, "unanalyzed");
 
     assert.ok(
-      [...stored.values()].some((value) => JSON.parse(value).decision === "unknown"),
+      [...stored.values()].some((value) => JSON.parse(value).status === "unknown"),
       "the migration rewrote stored data instead of normalizing the read",
     );
     const kvEnv = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_KV: kv, cache: _test.memoryCache() });
@@ -1172,7 +1252,7 @@ test("v1: legacy unknown is normalized only when read from cache", async () => {
       noopCtx(),
     );
     assert.equal(l1.headers.get("x-beamline-source"), "kv");
-    assert.equal((await l1.json()).decision, "unanalyzed");
+    assert.equal((await l1.json()).status, "unanalyzed");
   } finally {
     await scan.close();
   }
@@ -1206,7 +1286,7 @@ test("v1 lookup: an answer from scan is filed under its digest too", async () =>
       noopCtx(),
     );
     assert.equal(byDigest.headers.get("x-beamline-source"), "cache", "the digest door was left shut");
-    assert.equal((await byDigest.json()).decision, "block");
+    assert.equal((await byDigest.json()).status, "analyzed");
     assert.equal(scan.hits.v1, 1, "the digest lookup cost a second trip to a worker");
   } finally {
     await scan.close();
@@ -1248,7 +1328,7 @@ test("v1 analyze: answering from cache still opens the digest door", async () =>
 
     const filed = await cache.match(new Request(`http://beamline/v1/lookup?sha256=${sha}&follow=references`));
     assert.ok(filed, "the digest key was left cold by an answer that named the digest");
-    assert.equal(JSON.parse(await filed.text()).decision, "block");
+    assert.equal(JSON.parse(await filed.text()).status, "analyzed");
   } finally {
     await scan.close();
   }
@@ -1321,7 +1401,7 @@ test("v1 analyze: a reconnect is sent back to the worker already running it", as
       env,
       waitCtx().ctx,
     );
-    assert.equal(JSON.parse((await res.text()).trim()).decision, "block", "the reconnect started a second analysis");
+    assert.equal(JSON.parse((await res.text()).trim()).status, "analyzed", "the reconnect started a second analysis");
     assert.equal(idle.hits.analyze, 0, "a duplicate analysis was dispatched to an idle worker");
   } finally {
     await Promise.all([idle.close(), busy.close()]);
@@ -1346,7 +1426,7 @@ test("v1 analyze: a fully busy fleet is asked again rather than given up on", as
       env,
       waitCtx().ctx,
     );
-    assert.equal(JSON.parse((await res.text()).trim()).decision, "allow", "gave up while the fleet was merely busy");
+    assert.equal(JSON.parse((await res.text()).trim()).status, "analyzed", "gave up while the fleet was merely busy");
     assert.ok(asked >= 3, `asked ${asked} times, want a retry after each refusal`);
   } finally {
     await worker.close();
@@ -1361,7 +1441,7 @@ test("v1 analyze: every worker down answers unavailable, not an error", async ()
     waitCtx().ctx,
   );
   assert.equal(res.status, 200);
-  assert.equal(JSON.parse((await res.text()).trim()).decision, "unavailable");
+  assert.equal(JSON.parse((await res.text()).trim()).status, "unavailable");
 });
 
 test("v1 analyze: naming nothing is refused, and the route is POST only", async () => {
@@ -1403,9 +1483,9 @@ test("v1: every worker down answers unavailable, not an error", async () => {
   );
   assert.equal(res.status, 200, "an outage was reported as a request failure");
   const body = await res.json();
-  assert.equal(body.decision, "unavailable");
-  assert.notEqual(body.decision, "unanalyzed", "an outage was reported as a fact about the package");
-  assert.equal(body.fires_at, null);
+  assert.equal(body.status, "unavailable");
+  assert.notEqual(body.status, "unanalyzed", "an outage was reported as a fact about the package");
+  assert.equal(body.fires_at, undefined);
   assert.deepEqual(body.findings, []);
   assert.equal(res.headers.get("cache-control"), "no-store", "an outage was made cacheable");
 });
@@ -1434,7 +1514,16 @@ test("v1: a worker's answer is passed through intact", async () => {
       waitCtx().ctx,
     );
     assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), decided);
+    const body = await res.json();
+    assert.equal(body.status, "analyzed");
+    assert.equal(body.purl, decided.purl);
+    assert.equal(body.sha256, decided.sha256);
+    assert.equal(body.severity, decided.severity);
+    assert.equal(body.fires_at, decided.fires_at);
+    assert.equal(body.reason, decided.reason);
+    assert.deepEqual(body.findings, decided.findings);
+    assert.equal(body.engine_version, decided.engine_version);
+    assert.equal(body.analyzed_at, decided.analyzed_at);
     assert.equal(res.headers.get("x-beamline-source"), "scan:analysis");
   } finally {
     await scan.close();
@@ -1571,15 +1660,15 @@ test("v1: beamline applies the budget and stores one document", async () => {
       ctx.ctx,
     );
     await ctx.flush();
-    return (await res.json()).decision;
+    return (await res.json()).severity;
   };
   try {
-    assert.equal(await ask(25), "allow");
-    assert.equal(await ask(1000), "block", "beamline did not apply the caller's budget");
+    assert.equal(await ask(25), "suspicious");
+    assert.equal(await ask(1000), "hostile", "beamline did not apply the caller's budget");
     assert.equal(asked, 1, "different budgets caused duplicate origin work");
     assert.equal(scanReceivedBudget, false, "the budget was delegated to scan");
     // And the same document is served from cache rather than re-asked.
-    assert.equal(await ask(25), "allow");
+    assert.equal(await ask(25), "suspicious");
     assert.equal(asked, 1, "a cached document was asked again");
   } finally {
     await scan.close();
@@ -1623,10 +1712,10 @@ test("v1: KV is L1 behind Cache API and still applies the budget", async () => {
 
   const strict = await ask(25);
   assert.equal(strict.headers.get("x-beamline-source"), "kv");
-  assert.equal((await strict.json()).decision, "allow");
+  assert.equal((await strict.json()).severity, "suspicious");
   const loose = await ask(1000);
   assert.equal(loose.headers.get("x-beamline-source"), "cache");
-  assert.equal((await loose.json()).decision, "block");
+  assert.equal((await loose.json()).severity, "hostile");
   assert.equal(reads, 1, "the L0 cache should shield KV after the first read");
   assert.equal(writes, 0, "a KV read should not refresh the stored value");
 });
@@ -1813,7 +1902,7 @@ test("v1: a failing worker falls through to a healthy one", async () => {
       waitCtx().ctx,
     );
     assert.equal(res.status, 200);
-    assert.equal((await res.json()).decision, "allow");
+    assert.equal((await res.json()).status, "analyzed");
   } finally {
     await Promise.all([sick.close(), well.close()]);
   }
@@ -2017,6 +2106,9 @@ function waitCtx() {
     async flush() {
       while (jobs.length) await Promise.all(jobs.splice(0));
     },
+    pending() {
+      return jobs.length;
+    },
   };
 }
 
@@ -2060,7 +2152,7 @@ function mockBackend(opts) {
         }
         res.writeHead(200, { "content-type": "application/x-ndjson", ...opts.analyzeHeaders });
         const lines = typeof opts.analyzeStream === "function" ? opts.analyzeStream(url) : opts.analyzeStream;
-        for (const line of lines || []) res.write(`${line}\n`);
+        for await (const line of lines || []) res.write(`${line}\n`);
         return res.end();
       }
       if (url.pathname === "/v1/lookup") {
@@ -2740,7 +2832,7 @@ test("v1: a worker without the route is skipped, not relayed", async () => {
       waitCtx().ctx,
     );
     assert.equal(res.status, 200, "a worker's missing route was reported to the caller as a missing package");
-    assert.equal((await res.json()).decision, "allow");
+    assert.equal((await res.json()).status, "analyzed");
   } finally {
     await Promise.all([old.close(), rolled.close()]);
   }
@@ -2812,7 +2904,7 @@ test("v1 analyze: the artifact may be the body", async () => {
       waitCtx().ctx,
     );
     assert.equal(res.status, 200, "an uploaded artifact was refused");
-    assert.equal(JSON.parse((await res.text()).trim()).decision, "allow");
+    assert.equal(JSON.parse((await res.text()).trim()).status, "analyzed");
     assert.equal(got, "hello", "the bytes did not reach the worker intact");
   } finally {
     await scan.close();
@@ -2883,7 +2975,7 @@ test("v1 analyze: an empty body is no body, not an empty artifact", async () => 
       waitCtx().ctx,
     );
     assert.equal(res.status, 200, "a named package with no bytes was refused");
-    assert.equal(JSON.parse((await res.text()).trim()).decision, "allow");
+    assert.equal(JSON.parse((await res.text()).trim()).status, "analyzed");
     assert.equal(asked, "pkg:npm/x@1.0.0", "the package was not analyzed");
   } finally {
     await scan.close();
@@ -2930,7 +3022,7 @@ test("v1 analyze: a feed-derived level is not an answer to `analyze`", async () 
       env,
       waitCtx().ctx,
     );
-    assert.equal(JSON.parse(await look.text()).decision, "block");
+    assert.equal(JSON.parse(await look.text()).status, "analyzed");
     // Derived answers are not verdicts, so they age out on the short schedule.
     assert.match(look.headers.get("cache-control"), /max-age=60/);
 

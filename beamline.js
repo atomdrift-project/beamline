@@ -283,7 +283,7 @@ async function handleV1Lookup(env, ctx, url) {
 // lookup spends no analysis slot, and since every worker defers to the same
 // corpus when it does not know, they now give the same answer. Broadcasting
 // would multiply the load behind them to learn nothing.
-async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, _budget, follow) {
+async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, follow) {
   const ids = v1LocatorIds(ctx.rid, sha, locators);
   const locator = locators.length === 1 ? locators[0] : null;
   const origin = new URL(cacheKey.url).origin;
@@ -634,8 +634,9 @@ function v1BudgetedBody(body, budget, locator, legacyCachedUnknown = false) {
   // worker returning the old name stays visible and fails the v1 contract
   // probe instead of hiding a partial or regressed deployment.
   const normalizedRow = (item) => {
-    const normalized = legacyCachedUnknown && item && typeof item === "object" && !Array.isArray(item) && item.decision === "unknown"
-      ? { ...item, decision: "unanalyzed" }
+    const normalized = legacyCachedUnknown && item && typeof item === "object" && !Array.isArray(item)
+      && (item.decision === "unknown" || item.status === "unknown")
+      ? { ...item, status: "unanalyzed", decision: undefined }
       : item;
     return compactV1Row(normalizeV1Row(normalized, budget));
   };
@@ -748,9 +749,14 @@ function v1CachedVerdict(body) {
 // A pre-engine_version verdict lands in the short bucket too. That costs a
 // little more traffic and is never wrong, which is the right side to err on.
 function v1MaxAge(body) {
-  if (body.includes('"status":"unavailable"') || body.includes('"decision":"unavailable"')) return 0;
-  if (body.includes('"status":"unanalyzed"') || body.includes('"decision":"unanalyzed"')) return V1_NO_ENGINE_MAX_AGE;
-  if (body.includes('"engine_version":null')) return V1_NO_ENGINE_MAX_AGE;
+  try {
+    const row = JSON.parse(body);
+    const rows = Array.isArray(row) ? row : [row];
+    if (rows.some((item) => item?.status === "unavailable" || item?.decision === "unavailable")) return 0;
+    if (rows.some((item) => item?.status !== "analyzed" || !item?.engine_version)) return V1_NO_ENGINE_MAX_AGE;
+  } catch {
+    return V1_NO_ENGINE_MAX_AGE;
+  }
   return V1_VERDICT_MAX_AGE;
 }
 
@@ -1058,22 +1064,21 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
 
     const source = beamlineSource(upstream.headers.get("X-Scan-Source"));
     logLine("v1_analyze", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
-    // One copy to the caller, one to be read out of band: a fresh verdict is
-    // exactly what the next lookup wants, so analyzing warms the cache the
-    // cheap route reads. Teeing rather than buffering keeps the caller's copy
-    // flowing while ours is still arriving.
-    let out = upstream.body;
-    if (cacheFollow) {
-      const streams = upstream.body.tee();
-      out = streams[0];
-      waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, streams[1], cacheFollow));
-    }
+    // The caller's stream is also the cache observer. Keeping one pipeline
+    // means a minutes-long analysis is request work, not a minutes-long
+    // waitUntil task. Only after the terminal decision arrives do we hand the
+    // bounded Cache API / KV writes to waitUntil.
+    const cacheDecision = cacheFollow
+      ? (decided) => {
+          waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, decided, cacheFollow));
+        }
+      : null;
     return new Response(
-      annotatedV1Stream(out, budget, {
+      annotatedV1Stream(upstream.body, budget, {
         requestId: ctx.rid,
         locator,
         startedAt: t0,
-      }),
+      }, cacheDecision),
       {
       status: 200,
       headers: {
@@ -1089,20 +1094,11 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
   return null;
 }
 
-// Read the streamed answer out of band and store its decision where the cheap
-// route will find it.
-//
-// The decision is the last line scan sends; everything before it says what the
-// run was doing. A stream that ends without one was cut short, and caching a
-// truncated answer would turn one dropped connection into a wrong answer served
-// from the edge — so nothing is stored unless a decision actually arrived.
-async function cacheV1Decision(env, ctx, origin, locator, stream, follow) {
+// Store a completed stream's decision where the cheap route will find it.
+// This function starts only after the decision arrives, so waitUntil covers
+// bounded cache writes rather than the analysis that produced them.
+async function cacheV1Decision(env, ctx, origin, locator, decided, follow) {
   const ids = v1LocatorIds(ctx.rid, null, locator ? [locator] : []);
-  const decided = await lastDecision(stream);
-  if (!decided) {
-    logLine("v1_cache_write", { stored: false, reason: "no_decision", ...ids });
-    return;
-  }
   const document = v1DocumentBody(decided);
   if (!document) {
     logLine("v1_cache_write", { stored: false, reason: "invalid_decision", ...ids });
@@ -1124,15 +1120,29 @@ async function cacheV1Decision(env, ctx, origin, locator, stream, follow) {
 // total elapsed time, which made a missing phase indistinguishable from a
 // stalled run. The Worker owns the request clock, so it can also correlate the
 // frames without asking every scan version to learn a new wire format first.
-function annotatedV1Stream(stream, budget, meta) {
+function annotatedV1Stream(stream, budget, meta, onDecision = null) {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffered = "";
+  let decisionSeen = false;
   const phase = { name: null, startedElapsed: 0, lastElapsed: 0 };
 
   const encodeLine = (line) => {
-    const rows = annotatedV1Lines(line, budget, meta, phase);
-    return rows.map((row) => encoder.encode(`${row}\n`));
+    const annotated = annotatedV1Lines(line, budget, meta, phase);
+    // A decision is terminal by contract. Register its short cache write as
+    // soon as we observe it: callers are entitled to stop reading immediately
+    // after this line and may cancel the stream before an EOF-driven flush.
+    if (annotated.decision && !decisionSeen) {
+      decisionSeen = true;
+      if (onDecision) {
+        try {
+          onDecision(annotated.decision);
+        } catch (err) {
+          logLine("v1_cache_write", { stored: false, reason: "schedule_failed", err: errText(err) });
+        }
+      }
+    }
+    return annotated.lines.map((row) => encoder.encode(`${row}\n`));
   };
 
   return stream.pipeThrough(
@@ -1160,10 +1170,10 @@ function annotatedV1Lines(line, budget, meta, phase) {
   try {
     row = JSON.parse(line);
   } catch {
-    return [line];
+    return { lines: [line], decision: null };
   }
   if (!row || typeof row !== "object" || Array.isArray(row)) {
-    return [budgetedV1Line(line, budget, meta.locator)];
+    return { lines: [budgetedV1Line(line, budget, meta.locator)], decision: null };
   }
 
   const totalElapsed = finiteMs(row.elapsed_ms) ?? phase.lastElapsed;
@@ -1173,10 +1183,15 @@ function annotatedV1Lines(line, budget, meta, phase) {
   // frame so clients never have to infer completion from the decision shape.
   if (Object.prototype.hasOwnProperty.call(row, "decision")) {
     const done = phaseCompletion(meta, phase);
-    return [...(done ? [JSON.stringify(done)] : []), budgetedV1Line(line, budget, meta.locator)];
+    return {
+      lines: [...(done ? [JSON.stringify(done)] : []), budgetedV1Line(line, budget, meta.locator)],
+      decision: line,
+    };
   }
 
-  if (row.state !== "analyzing") return [budgetedV1Line(line, budget, meta.locator)];
+  if (row.state !== "analyzing") {
+    return { lines: [budgetedV1Line(line, budget, meta.locator)], decision: null };
+  }
 
   const name = typeof row.phase === "string" && row.phase.trim() ? row.phase.trim() : "unknown";
   const elapsed = Number.isFinite(totalElapsed) ? totalElapsed : 0;
@@ -1193,7 +1208,7 @@ function annotatedV1Lines(line, budget, meta, phase) {
   } else {
     rows.push(JSON.stringify(phaseFrame(row, meta, phase, "running", elapsed)));
   }
-  return rows;
+  return { lines: rows, decision: null };
 }
 
 function phaseFrame(row, meta, phase, state, elapsed) {
@@ -1238,34 +1253,6 @@ function budgetedV1Line(line, budget, locator) {
   if (!line.includes('"decision"')) return line;
   const body = v1BudgetedBody(line, budget, locator);
   return body || line;
-}
-
-// The last line of an NDJSON stream that carries a decision, or null.
-async function lastDecision(stream) {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffered = "";
-  let found = null;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (value) buffered += decoder.decode(value, { stream: true });
-      // Keep only the tail: progress frames are numerous on a long run and
-      // none of them is the answer.
-      const lines = buffered.split("\n");
-      buffered = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.includes('"decision"')) found = line;
-      }
-      if (done) break;
-    }
-    if (buffered.includes('"decision"')) found = buffered;
-  } catch {
-    return null;
-  } finally {
-    reader.releaseLock();
-  }
-  return found;
 }
 
 // One worker's answer. An empty `bloom` means it could not give one, so the
@@ -2358,12 +2345,13 @@ function storedCopy(res) {
 }
 
 function storedDocument(body, env) {
+  const canonical = v1DocumentBody(body) || body;
   return storedCopy(
-    new Response(body, {
+    new Response(canonical, {
       status: 200,
       headers: {
         "content-type": "application/json",
-        "cache-control": `${cacheScope(env)}, max-age=${v1MaxAge(body)}`,
+        "cache-control": `${cacheScope(env)}, max-age=${v1MaxAge(canonical)}`,
       },
     }),
   );
@@ -2547,6 +2535,7 @@ export const _test = {
   BREAKER_FAILS,
   makeBreaker,
   memoryCache,
+  annotatedV1Stream,
   // Lets a test wait until a caller has actually joined the shared flight,
   // rather than sleeping and hoping. Timing-based waits here were flaky under a
   // loaded event loop, and a flaky test about cancellation is worse than none.
