@@ -264,7 +264,21 @@ async function handleV1Lookup(env, ctx, url) {
 
   const cache = await getCache(env);
   const cacheKey = new Request(`${url.origin}${path}`);
-  const hit = ctx.pin ? null : await cache.match(cacheKey);
+  // `pin` exists to time a specific backend, so it reads no cache at all —
+  // not this policy's, and not a wider one's.
+  const candidates = ctx.pin ? [] : followCandidates(follow.value);
+  let served = follow.value;
+  let hit = null;
+  for (const policy of candidates) {
+    const found = await cache
+      .match(new Request(`${url.origin}${v1CachePath(sha, locators, policy)}`))
+      .catch(() => null);
+    if (found) {
+      served = policy;
+      hit = found;
+      break;
+    }
+  }
   if (hit) {
     // Buffered rather than streamed through, because the answer decides how
     // long the caller may hold it. Decisions are one small object.
@@ -283,17 +297,37 @@ async function handleV1Lookup(env, ctx, url) {
     // TTL exists to prevent.
     res.headers.set("cache-control", clientScope(env, v1MaxAge(document)));
     res.headers.delete("X-Beamline-Worker");
+    if (served !== follow.value) res.headers.set("X-Beamline-Follow", served);
     return res;
   }
 
   if (!ctx.pin) {
-    const document = await kvGet(env, path);
+    let document = null;
+    for (const policy of candidates) {
+      document = await kvGet(env, v1CachePath(sha, locators, policy));
+      if (document) {
+        served = policy;
+        break;
+      }
+    }
     if (document) {
       const body = v1BudgetedBody(document, budget, locator, true);
       if (body) {
         const res = v1Body(env, body, 200, null, v1MaxAge(document));
         res.headers.set("X-Beamline-Source", "kv");
-        waitUntil(ctx, cache.put(cacheKey, storedDocument(document, env)));
+        if (served !== follow.value) res.headers.set("X-Beamline-Follow", served);
+        // Warmed under the policy that produced it, never under the one that
+        // asked. Every key holds the answer to its own question; filing a wide
+        // document at a narrow key would leave the narrow question permanently
+        // answered by evidence it never requested, and no later analysis could
+        // tell the difference.
+        waitUntil(
+          ctx,
+          cache.put(
+            new Request(`${url.origin}${v1CachePath(sha, locators, served)}`),
+            storedDocument(document, env),
+          ),
+        );
         return res;
       }
     }
@@ -650,6 +684,57 @@ function parseFollow(searchParams, kind) {
   return { value: order.filter((target) => selected.has(target)).join(",") };
 }
 
+// Which stored policies may answer this one.
+//
+// `follow` widens monotonically: an answer produced under a wider policy saw
+// every reference a narrower one would have, and more besides. So a wider entry
+// answers a narrower question — and it answers with its own findings. A caller
+// asking `follow=none` about an artifact whose dependency is hostile is told
+// hostile, and `findings[].pkg` names the component that made it so; the
+// alternative is re-running an analysis to be told something we already know.
+//
+// The reverse stays refused. A narrow answer never looked where the wider
+// question points, so serving it there would report clean on evidence nobody
+// gathered — the one direction that turns a cache into a false negative.
+//
+// `dependencies` and `references` are incomparable: neither contains the
+// other, so neither answers the other, and both answer `none`.
+const FOLLOW_KINDS = ["dependencies", "references", "ci-actions"];
+
+// Every canonical spelling parseFollow can produce, narrowest first. `all` and
+// the full triple are one question spelled two ways; both are listed because
+// both can already be sitting in the cache, and equal sets answer each other.
+const FOLLOW_POLICIES = [
+  "none",
+  "dependencies",
+  "references",
+  "dependencies,ci-actions",
+  "dependencies,references",
+  "all",
+  "dependencies,references,ci-actions",
+];
+
+function followSet(policy) {
+  if (policy === "none") return new Set();
+  if (policy === "all") return new Set(FOLLOW_KINDS);
+  return new Set(String(policy).split(",").map((kind) => kind.trim()).filter(Boolean));
+}
+
+// The requested policy first, then every stored policy wide enough to answer
+// it, narrowest first. Nearest-answer-first matters: a caller asking
+// `follow=none` should not be handed `all`'s verdict while a `dependencies`
+// entry — which folded in less that the caller did not ask about — sits beside
+// it.
+function followCandidates(policy) {
+  const want = followSet(policy);
+  const wider = FOLLOW_POLICIES.filter((candidate) => {
+    if (candidate === policy) return false;
+    const kinds = followSet(candidate);
+    return kinds.size >= want.size && [...want].every((kind) => kinds.has(kind));
+  });
+  return [policy, ...wider];
+}
+
 function v1DocumentBody(body) {
   let row;
   try {
@@ -950,11 +1035,36 @@ async function handleV1Analyze(request, env, ctx, url) {
   // send — was the one policy that could never hit a cache in either direction.
   if (locator && !bytes && !ctx.pin) {
     const cache = await getCache(env);
-    const cachePath = v1CachePath(null, [locator], follow.value);
-    const key = new Request(`${url.origin}${cachePath}`);
-    const hit = await cache.match(key).catch(() => null);
-    let document = hit ? await hit.text().catch(() => null) : null;
-    if (!document) document = await kvGet(env, cachePath);
+    // Same ordering the lookup reads under: this policy, then every wider one
+    // that already answers it. An analysis is the most expensive thing this
+    // service does, so a wider answer already in hand is worth far more here
+    // than it is on the lookup.
+    const candidates = followCandidates(follow.value);
+    let served = follow.value;
+    let hit = null;
+    let document = null;
+    for (const policy of candidates) {
+      const found = await cache
+        .match(new Request(`${url.origin}${v1CachePath(null, [locator], policy)}`))
+        .catch(() => null);
+      const text = found ? await found.text().catch(() => null) : null;
+      if (text) {
+        served = policy;
+        hit = found;
+        document = text;
+        break;
+      }
+    }
+    if (!document) {
+      for (const policy of candidates) {
+        const text = await kvGet(env, v1CachePath(null, [locator], policy));
+        if (text) {
+          served = policy;
+          document = text;
+          break;
+        }
+      }
+    }
     const decided = document ? v1CachedVerdict(document) : null;
     if (decided) {
       // Serving from cache used to warm nothing, because this path returns
@@ -963,8 +1073,10 @@ async function handleV1Analyze(request, env, ctx, url) {
       // trip to learn something we were already holding, and answering them
       // never fixed it either.
       const body = v1BudgetedBody(document, budget, locator);
-      waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document, follow.value));
-      logLine("v1_analyze", { src: "cache", status: 200, artifact_status: decided.status, ms: Date.now() - t0, ...ids });
+      // Filed at the digest under the policy that produced it, not the one that
+      // asked, for the reason the lookup warms its own key that way.
+      waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document, served));
+      logLine("v1_analyze", { src: hit ? "cache" : "kv", status: 200, artifact_status: decided.status, follow: served, ms: Date.now() - t0, ...ids });
       // Answered in the shape this route always answers in: one NDJSON line,
       // no progress frames because there was no run to report progress about.
       return new Response(`${body.trimEnd()}\n`, {
@@ -972,7 +1084,8 @@ async function handleV1Analyze(request, env, ctx, url) {
         headers: {
           "content-type": "application/x-ndjson",
           "cache-control": "no-store",
-        "X-Beamline-Source": hit ? "cache" : "kv",
+          "X-Beamline-Source": hit ? "cache" : "kv",
+          ...(served === follow.value ? {} : { "X-Beamline-Follow": served }),
         },
       });
     }
@@ -2802,6 +2915,7 @@ function trimSlash(s) {
 
 export const _test = {
   occupancy,
+  followCandidates,
   predictMs,
   hasHistory,
   jobMix,

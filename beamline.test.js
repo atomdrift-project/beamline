@@ -588,13 +588,16 @@ test("v1 analyze: malformed follow policy is rejected at the edge", async () => 
   }
 });
 
-// Two policies can disagree about one package and both be right — bytes that
-// are clean and an install script that is not. So a policy is part of the key
-// rather than a reason to skip it: neither answer may be served for the other's
-// question, and each is cacheable in its own right. `follow=none` being the
-// policy this service documents most loudly is exactly why it must not be the
-// one policy that can never hit a cache.
-test("v1 analyze: a non-default follow policy is a separate entry, not a bypass", async () => {
+// `follow` widens monotonically, so the policies are ordered rather than merely
+// distinct: an answer produced under a wider policy looked everywhere a
+// narrower one would have and further, so it answers the narrower question —
+// with its own findings, since that is what it measured. A caller asking
+// `follow=none` about an artifact whose dependency is hostile is told hostile,
+// and `findings[].pkg` says which component made it so.
+//
+// The reverse is the direction that would turn this cache into a false
+// negative, and it stays refused.
+test("v1 analyze: a wider policy's answer serves a narrower question", async () => {
   const purl = "pkg:npm/app@1.0.0";
   const scan = await mockBackend({
     analyzeStream: (url) => url.searchParams.get("follow") === "none"
@@ -612,31 +615,192 @@ test("v1 analyze: a non-default follow policy is a separate entry, not a bypass"
     await first.text();
     await firstCtx.flush();
 
+    // The default is `references`, which contains `none`, so the narrower
+    // question is already answered and costs no second analysis.
     const customCtx = waitCtx();
     const custom = await handle(
       new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}&follow=none`, { method: "POST" }),
       env,
       customCtx.ctx,
     );
-    assert.equal(JSON.parse((await custom.text()).trim()).status, "analyzed");
+    const narrow = JSON.parse((await custom.text()).trim());
     await customCtx.flush();
-    assert.equal(scan.hits.analyze, 2, "explicit policy incorrectly used the default policy's entry");
+    assert.equal(narrow.status, "analyzed");
+    assert.equal(scan.hits.analyze, 1, "a narrower question paid for an analysis a wider entry already answered");
+    // Served on the wider policy's evidence, not the narrower policy's. The
+    // mock answers `block` for `follow=none` and `allow` for anything else, so
+    // the `allow` proves which entry answered.
+    assert.equal(narrow.fires_at, -1, "the narrower question was not answered by the wider entry's findings");
+    assert.equal(custom.headers.get("X-Beamline-Follow"), "references", "the answering policy was not named");
 
-    const repeated = await handle(
+    // And the reverse never happens: a `follow=none` entry cannot answer the
+    // default's question, because it never looked where that question points.
+    const noneOnly = testEnv(DEAD, { SCAN_URL: scan.url });
+    const seedCtx = waitCtx();
+    await (await handle(
       new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}&follow=none`, { method: "POST" }),
-      env,
-      waitCtx().ctx,
-    );
-    assert.equal(JSON.parse((await repeated.text()).trim()).status, "analyzed");
-    assert.equal(scan.hits.analyze, 2, "an explicit policy paid for its own analysis twice");
-
-    const cached = await handle(
+      noneOnly,
+      seedCtx.ctx,
+    )).text();
+    await seedCtx.flush();
+    const before = scan.hits.analyze;
+    const wider = await handle(
       new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+      noneOnly,
+      waitCtx().ctx,
+    );
+    assert.equal(JSON.parse((await wider.text()).trim()).status, "analyzed");
+    assert.equal(scan.hits.analyze, before + 1, "a narrow answer was served for the wider question");
+  } finally {
+    await scan.close();
+  }
+});
+
+// The ordering itself, exhaustively, because every cache decision below rests
+// on it. A policy is a set of reference kinds; a stored policy answers a
+// requested one exactly when its set contains the requested set.
+test("follow policies are ordered by containment, narrowest candidate first", () => {
+  const { followCandidates } = _test;
+
+  // Every policy answers itself, and answers it first: the exact entry is
+  // always preferred to a wider one.
+  for (const policy of ["none", "dependencies", "references", "all"]) {
+    assert.equal(followCandidates(policy)[0], policy);
+  }
+
+  // `none` is answered by everything.
+  assert.deepEqual(followCandidates("none"), [
+    "none",
+    "dependencies",
+    "references",
+    "dependencies,ci-actions",
+    "dependencies,references",
+    "all",
+    "dependencies,references,ci-actions",
+  ]);
+
+  // `all` is answered only by itself and by its long spelling. Two names for
+  // one question, and each has to answer the other or a caller's choice of
+  // spelling would decide whether they pay for an analysis.
+  assert.deepEqual(followCandidates("all"), ["all", "dependencies,references,ci-actions"]);
+  assert.deepEqual(followCandidates("dependencies,references,ci-actions"), [
+    "dependencies,references,ci-actions",
+    "all",
+  ]);
+
+  // `dependencies` and `references` are incomparable: neither contains the
+  // other, so neither may answer the other.
+  assert.ok(!followCandidates("dependencies").includes("references"));
+  assert.ok(!followCandidates("references").includes("dependencies"));
+
+  // ci-actions implies dependencies, so its canonical spelling contains
+  // `dependencies` and answers it — but not `references`.
+  assert.ok(followCandidates("dependencies").includes("dependencies,ci-actions"));
+  assert.ok(!followCandidates("references").includes("dependencies,ci-actions"));
+
+  // Nothing answers a question wider than itself.
+  for (const policy of FOLLOW_SPELLINGS) {
+    for (const candidate of followCandidates(policy)) {
+      assert.ok(
+        kindsOf(policy).every((kind) => kindsOf(candidate).includes(kind)),
+        `${candidate} was offered for ${policy} without containing it`,
+      );
+    }
+  }
+});
+
+const FOLLOW_SPELLINGS = [
+  "none",
+  "dependencies",
+  "references",
+  "dependencies,ci-actions",
+  "dependencies,references",
+  "all",
+  "dependencies,references,ci-actions",
+];
+
+function kindsOf(policy) {
+  if (policy === "none") return [];
+  if (policy === "all") return ["dependencies", "references", "ci-actions"];
+  return policy.split(",");
+}
+
+// The same ordering on the free route. A lookup is cheap, but it is the route a
+// proxy calls on every install, so a miss it did not have to take is the one
+// that shows up as fleet load.
+test("v1 lookup: a wider policy's answer serves a narrower question, never the reverse", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  // No `status` field: mockBackend reads that as an HTTP status override.
+  const decided = {
+    decision: "block",
+    purl,
+    sha256: HELLO_SHA,
+    severity: "hostile",
+    fires_at: 3,
+    findings: [{ id: "objectives/c2/backdoor", crit: 5, pkg: "pkg:npm/dep@2.0.0" }],
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  const scan = await mockBackend({ v1: () => decided });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    // Warm the wide entry.
+    const seed = waitCtx();
+    await (await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=all`),
+      env,
+      seed.ctx,
+    )).json();
+    await seed.flush();
+    const warmed = scan.hits.v1;
+
+    // The narrow question is answered from it, on its findings — including the
+    // finding attributed to a dependency, which is the whole point of saying
+    // the wider entry answers with its own evidence.
+    const narrow = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=none`),
       env,
       waitCtx().ctx,
     );
-    assert.equal(JSON.parse((await cached.text()).trim()).status, "analyzed");
-    assert.equal(scan.hits.analyze, 2, "the explicit result replaced the default policy's entry");
+    const body = await narrow.json();
+    assert.equal(scan.hits.v1, warmed, "a narrow lookup reached scan with a wider answer in hand");
+    assert.equal(narrow.headers.get("X-Beamline-Source"), "cache");
+    assert.equal(narrow.headers.get("X-Beamline-Follow"), "all");
+    assert.equal(body.fires_at, 3);
+    assert.equal(body.findings[0].pkg, "pkg:npm/dep@2.0.0");
+
+    // An exact hit names no other policy: the header is only ever there to say
+    // the answer came from a question the caller did not ask.
+    const exact = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=all`),
+      env,
+      waitCtx().ctx,
+    );
+    await exact.json();
+    assert.equal(exact.headers.get("X-Beamline-Follow"), null);
+
+    // `references` is not contained by `dependencies`, and the entry we hold is
+    // `all` — which does contain it — so this must still be served. The sibling
+    // check is below.
+    const sibling = testEnv(DEAD, { SCAN_URL: scan.url });
+    const sibCtx = waitCtx();
+    await (await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=dependencies`),
+      sibling,
+      sibCtx.ctx,
+    )).json();
+    await sibCtx.flush();
+    const afterDeps = scan.hits.v1;
+    await (await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=references`),
+      sibling,
+      waitCtx().ctx,
+    )).json();
+    assert.equal(
+      scan.hits.v1,
+      afterDeps + 1,
+      "an incomparable sibling policy was served from the other's entry",
+    );
   } finally {
     await scan.close();
   }

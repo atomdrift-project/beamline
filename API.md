@@ -401,6 +401,7 @@ There is no `503` for a package we could not reach a worker for. That is a
 | `X-Request-Id` | Send your own to correlate with our logs. |
 | `X-Beamline-Source` | `cache`, `kv`, `scan:bloom`, `scan:analysis`, `scan:replica`, `scan:primary`, `none`. Operators only. |
 | `X-Beamline-Worker` | Which worker answered. For operators. |
+| `X-Beamline-Follow` | The `follow` policy that actually answered, when a wider stored policy served a narrower question. Absent on an exact match. |
 | `Cache-Control` | See below. |
 | `Content-Type` | `application/json`; `x-ndjson` from `/v1/analyze`. |
 
@@ -457,4 +458,23 @@ Three things never answer from the cache:
 A `follow` policy is not on that list: it is part of the cache key rather than
 a reason to skip it. Two policies can reach opposite verdicts about one
 artifact and both be right — bytes that are clean, an install script that is
-not — so each is stored under the question it answers and served only for it.
+not — so each is stored under the question it answers.
+
+The policies are ordered, though, and a stored answer is served for any
+question it contains. Read `follow` as a set of reference kinds: `none` is the
+empty set, `all` is every kind, and an answer produced under one policy
+answers another exactly when its set contains the other's. So an `all` answer
+serves every question, a `none` question is served by any answer at all, and
+`dependencies` and `references` — neither of which contains the other — serve
+only themselves and `none`. `ci-actions` implies `dependencies`, so it serves
+that too.
+
+The answer you get is the one that was measured, not a narrowed copy of it. Ask
+`follow=none` about an artifact whose dependency is hostile, and if we hold an
+`all` verdict you are told hostile — `findings[].pkg` names the component
+responsible. The alternative is re-running an analysis to be told something we
+already know. The reverse never happens: a narrow answer is never served for a
+wider question, because it did not look where that question points.
+
+`X-Beamline-Follow` names the policy that answered whenever it is not the one
+you asked for. Its absence means you got an exact match.
