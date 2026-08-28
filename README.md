@@ -17,6 +17,15 @@ starts and give a fast worker the chance to answer before the next is asked.
 Each worker gets its own circuit breaker, so a sick one drops out of the race
 without taking scanning down with it.
 
+An analysis stream survives losing its worker. A v1 stream is progress frames
+followed by one decision, so until that decision goes out nothing the caller has
+read can be contradicted, and Beamline can hand the run to another worker and
+carry on — announced as a `resumed` frame, with elapsed times kept monotonic. A
+worker that goes silent is treated the same as one that died: silence on a
+stream is a failure the transport cannot report. Whoever dropped the stream is
+charged for it, and the credit for an analysis is issued when a decision
+arrives, not when the worker accepts the request.
+
 The optional Workers KV L1 namespace is titled `beamline` by default. Run
 `make kv-create`, then deploy by passing its returned ID as `KV`:
 

@@ -223,9 +223,10 @@ POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
         <ul class="meanings">
           <li><code>status: "analyzed"</code> means <code>severity</code> was derived from <code>fires_at</code> and the requested budget.</li>
           <li><code>status: "unanalyzed"</code> means nobody has analyzed the artifact; severity is <code>unknown</code>.</li>
-          <li><code>status: "unavailable"</code> means Beamline could not answer; severity is <code>unknown</code>.</li>
+          <li><code>status: "unavailable"</code> means Beamline could not answer; severity is <code>unknown</code>. <code>cause</code> says which outage it was: <code>saturated</code> and <code>mixed</code> are worth retrying with backoff, <code>unreachable</code> and <code>no_workers</code> are not.</li>
         </ul>
         <p>For streaming analysis, only the terminal line containing <code>status</code> is the assessment. Other lines report progress. Retry if the stream ends without one.</p>
+        <p>A <code>{"state":"resumed"}</code> line means the scan worker was lost mid-run and Beamline moved the run to another one. It is progress, not an answer: keep reading. Phases restart after it; elapsed times do not go backwards.</p>
       </section>
 
       <section id="use-cases"><h2><a class="heading-link" href="#use-cases">Use cases</a></h2>
@@ -233,7 +234,7 @@ POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
           <p>Use <code>POST /v1/analyze</code> when a job needs a fresh assessment. Name registry dependencies with <code>purl</code>. Upload local build outputs.</p>
           <p>Wait for the terminal line containing <code>status</code>, then apply your policy to <code>severity</code> and <code>fires_at</code>:</p>
           <table class="endpoint-table" aria-label="CI actions by status"><thead><tr><th>Status</th><th>CI action</th></tr></thead><tbody>
-            <tr><td>analyzed</td><td>Compare <code>fires_at</code> with your budget.</td></tr><tr><td>unanalyzed</td><td>Apply your unknown-artifact policy.</td></tr><tr><td>unavailable</td><td>Retry with backoff or apply your outage policy.</td></tr>
+            <tr><td>analyzed</td><td>Compare <code>fires_at</code> with your budget.</td></tr><tr><td>unanalyzed</td><td>Apply your unknown-artifact policy.</td></tr><tr><td>unavailable</td><td>Retry with backoff when <code>cause</code> is <code>saturated</code> or <code>mixed</code>; otherwise apply your outage policy.</td></tr>
           </tbody></table>
           <p class="muted">A stream that ends before a status is not an answer. Retry it. Keep the returned <code>sha256</code> with the build record.</p>
         </section>

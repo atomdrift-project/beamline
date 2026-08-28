@@ -584,8 +584,11 @@ const SOURCES = new Set([
 // Every key a v1 decision carries, and every key it may carry — the contract is
 // that the shape never moves, so a field appearing or vanishing is a defect
 // rather than a variation.
-const V1_FIELDS = new Set(["status", "purl", "url", "sha256", "severity", "fires_at", "reason", "findings", "engine_version", "analyzed_at"]);
+const V1_FIELDS = new Set(["status", "purl", "url", "sha256", "severity", "fires_at", "reason", "findings", "engine_version", "analyzed_at", "cause"]);
 const V1_STATUSES = new Set(["analyzed", "unanalyzed", "unavailable"]);
+// Why we could not answer. An outage that does not say is one a caller cannot
+// write a retry policy against.
+const V1_CAUSES = new Set(["saturated", "mixed", "unreachable", "no_workers"]);
 const V1_SEVERITIES = new Set(["benign", "suspicious", "hostile", "unknown"]);
 const SHA_RE = /^[0-9a-f]{64}$/;
 const DOC_STATUS = new Set([200, 202, 400, 401, 413, 415, 422, 404, 429, 503, 504, 500]);
@@ -601,7 +604,6 @@ function checkV1(status, body, askedPurl) {
   for (const key of Object.keys(body)) if (!V1_FIELDS.has(key)) issues.push(`v1 unexpected ${key}`);
   if (!("status" in body)) issues.push("v1 missing status");
   if (!("severity" in body)) issues.push("v1 missing severity");
-  if (!("reason" in body)) issues.push("v1 missing reason");
   if (!V1_STATUSES.has(body.status)) issues.push(`v1 status ${JSON.stringify(body.status)}`);
   if (!V1_SEVERITIES.has(body.severity)) {
     issues.push(`v1 severity ${JSON.stringify(body.severity)}`);
@@ -617,8 +619,16 @@ function checkV1(status, body, askedPurl) {
     if (Array.isArray(body.findings) && body.findings.length) {
       issues.push(`${body.status} carried findings`);
     }
-  } else if (body.severity === "hostile" && !body.reason && !(Array.isArray(body.findings) && body.findings.length)) {
-    issues.push("analyzed carried neither a reason nor a finding");
+    // Checked when present rather than required: an outage relayed from a
+    // worker is still an outage, and an older one has no cause to give.
+    if ("cause" in body && !V1_CAUSES.has(body.cause)) {
+      issues.push(`unavailable cause ${JSON.stringify(body.cause)}`);
+    }
+  // Clean results commonly omit a null reason; a severity that asks a caller
+  // to act must explain why it crossed that threshold.
+  } else if (["suspicious", "hostile"].includes(body.severity)
+      && (typeof body.reason !== "string" || !body.reason.trim())) {
+    issues.push(`${body.severity} missing reason`);
   }
   if (askedPurl && body.purl && body.purl !== askedPurl) {
     issues.push(`answered about ${body.purl}, asked about ${askedPurl}`);

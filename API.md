@@ -134,6 +134,14 @@ Beamline emits a completion frame when a phase changes and immediately before
 the assessment. These fields are stream telemetry only; they are not stored in
 the verdict cache.
 
+A `{"state":"resumed","worker":"…"}` frame means the scan worker serving the run
+was lost — taken down, upgraded, or gone silent — and Beamline handed the run to
+another one without interrupting your stream. It carries no `status`, so the
+rule above still holds: keep reading until a line carries one. Expect the phase
+sequence to restart after it, since the replacement worker reports its own
+phases. Elapsed times do not go backwards across a resume; Beamline keeps the
+request clock, not the worker.
+
 For PURL analyses, `purl:registry` identifies registry metadata lookup,
 `purl:payload` identifies fetching the initial package payload, and
 `purl:registry-document` identifies the registry-document fallback. The later
@@ -222,6 +230,19 @@ An `unavailable` status carries `severity: "unknown"`, omits `fires_at`,
 `engine_version`, and `analyzed_at`, and carries an empty `findings` array. It
 is a statement about us, not about the artifact; there is nothing in it to read.
 
+It also carries a `cause`, which says which outage it was — the one thing in the
+row worth acting on:
+
+| `cause` | means | what to do |
+| --- | --- | --- |
+| `saturated` | Every worker was busy. They answered promptly and correctly; they had no free slot. | Retry with backoff. A slot frees shortly. |
+| `mixed` | Some workers were busy, others could not be reached. | Retry with backoff. |
+| `unreachable` | No worker could be reached at all. | Treat as an outage. Retrying adds load to a fleet that is already down. |
+| `no_workers` | Beamline has no scan workers configured. | Configuration, not weather. It will not fix itself. |
+
+`cause` is distinct from `reason`, which explains a verdict about an artifact
+and is absent here — an `unavailable` row carries no verdict to explain.
+
 ## The response object
 
 Fields with no value are omitted to save bandwidth. Unknown severity is
@@ -237,6 +258,7 @@ must therefore be read by presence, not by expecting a `null` placeholder.
 | `severity` | string | `benign`, `suspicious`, `hostile`, or `unknown`; computed from `fires_at` and the requested budget. |
 | `fires_at` | int | Tightest budget at which this grades hostile; omitted when no level applies. |
 | `reason` | string | One sentence, when we have one; omitted otherwise. |
+| `cause` | string | Why we could not answer; present only on `unavailable`. |
 | `findings` | array | At most three, worst first. Empty unless one fired. |
 | `engine_version` | string | Scanner build that produced it; omitted when absent. |
 | `analyzed_at` | string | RFC 3339; omitted when absent. |

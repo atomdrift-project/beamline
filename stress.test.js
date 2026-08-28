@@ -201,8 +201,22 @@ test("v1 check: a well-formed decision passes", () => {
   assert.deepEqual(_test.checkV1(200, ok, "pkg:npm/evil@1.0.0"), []);
 });
 
-test("v1 check: a missing key is a defect, not a variation", () => {
+test("v1 check: a suspicious assessment must explain itself", () => {
   const missing = {
+    status: "analyzed",
+    purl: "pkg:npm/fine@1.0.0",
+    sha256: null,
+    severity: "suspicious",
+    fires_at: -1,
+    findings: [],
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  assert.deepEqual(_test.checkV1(200, missing, "pkg:npm/fine@1.0.0"), ["suspicious missing reason"]);
+});
+
+test("v1 check: a clean assessment may omit its nullable reason", () => {
+  const clean = {
     status: "analyzed",
     purl: "pkg:npm/fine@1.0.0",
     sha256: null,
@@ -212,7 +226,7 @@ test("v1 check: a missing key is a defect, not a variation", () => {
     engine_version: "2.8.0",
     analyzed_at: "2026-08-01T00:00:00Z",
   };
-  assert.deepEqual(_test.checkV1(200, missing, "pkg:npm/fine@1.0.0"), ["v1 missing reason"]);
+  assert.deepEqual(_test.checkV1(200, clean, "pkg:npm/fine@1.0.0"), []);
 });
 
 // An outage must carry nothing about the artifact. A caller that can read a
@@ -238,7 +252,7 @@ test("v1 check: an outage may not carry evidence", () => {
 
 // A block stops somebody's build. If it cannot say why, the developer it
 // stopped has nothing to act on.
-test("v1 check: a block must be able to say why", () => {
+test("v1 check: a hostile assessment must carry a reason", () => {
   const mute = {
     status: "analyzed",
     purl: "pkg:npm/evil@1.0.0",
@@ -251,7 +265,7 @@ test("v1 check: a block must be able to say why", () => {
     analyzed_at: "2026-08-01T00:00:00Z",
   };
   assert.deepEqual(_test.checkV1(200, mute, "pkg:npm/evil@1.0.0"), [
-    "analyzed carried neither a reason nor a finding",
+    "hostile missing reason",
   ]);
 });
 

@@ -2060,6 +2060,8 @@ function testEnv(url, extra = {}) {
     SCAN_RETRIES: extra.SCAN_RETRIES,
     SCAN_RETRY_BASE_MS: extra.SCAN_RETRY_BASE_MS ?? "5",
     SCAN_RACE_DELAY_MS: extra.SCAN_RACE_DELAY_MS,
+    SCAN_STREAM_IDLE_MS: extra.SCAN_STREAM_IDLE_MS,
+    SCAN_STREAM_RESUMES: extra.SCAN_STREAM_RESUMES,
     cache: extra.cache ?? _test.memoryCache(),
   };
 }
@@ -2152,7 +2154,23 @@ function mockBackend(opts) {
         }
         res.writeHead(200, { "content-type": "application/x-ndjson", ...opts.analyzeHeaders });
         const lines = typeof opts.analyzeStream === "function" ? opts.analyzeStream(url) : opts.analyzeStream;
-        for await (const line of lines || []) res.write(`${line}\n`);
+        let written = 0;
+        for await (const line of lines || []) {
+          // A worker that goes away mid-answer: the socket dies with frames
+          // still owed, which is what a node being upgraded does to every
+          // stream it is holding.
+          if (opts.analyzeCut != null && written >= opts.analyzeCut) {
+            // Let the 200 and the frames already written reach the client
+            // before the socket dies. A worker taken away mid-answer had been
+            // answering; without this pause the reset can overtake the headers
+            // and the request never gets past dispatch, which is a different
+            // failure with a different repair.
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            return res.destroy();
+          }
+          res.write(`${line}\n`);
+          written += 1;
+        }
         return res.end();
       }
       if (url.pathname === "/v1/lookup") {
@@ -3040,4 +3058,223 @@ test("v1 analyze: a feed-derived level is not an answer to `analyze`", async () 
   } finally {
     await scan.close();
   }
+});
+
+// A scan worker taken away mid-answer.
+//
+// Everything above this line tests a fleet that fails before it is committed
+// to. These test the window after: beamline has sent 200 and is streaming, so
+// the status is spent and the only repair left is to find another worker
+// without the caller having to know one was lost.
+
+const CUT_FRAME = '{"state":"analyzing","purl":"pkg:npm/cut@1.0.0","elapsed_ms":40,"phase":"unpack"}';
+const CUT_DECISION = '{"decision":"allow","fires_at":-1,"purl":"pkg:npm/cut@1.0.0"}';
+
+// Drives one analyze against `SCAN_URL` and returns the parsed NDJSON frames.
+async function analyzeFrames(env) {
+  const res = await handle(
+    new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fcut%401.0.0", { method: "POST" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(res.status, 200);
+  return (await res.text()).trim().split("\n").filter(Boolean).map(JSON.parse);
+}
+
+test("v1 analyze: a stream cut mid-answer is finished by another worker", async () => {
+  _test.reset();
+  const dying = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION], analyzeCut: 1 });
+  const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+  const env = testEnv(DEAD, { SCAN_URL: `${dying.url},${healthy.url}` });
+  try {
+    const frames = await analyzeFrames(env);
+    assert.equal(frames.at(-1).status, "analyzed", "the caller never got a decision");
+    assert.equal(
+      frames.some((f) => f.state === "resumed"),
+      true,
+      "the handover was not announced to the caller",
+    );
+    assert.equal(healthy.hits.analyze, 1, "the surviving worker was never asked");
+  } finally {
+    await Promise.all([dying.close(), healthy.close()]);
+  }
+});
+
+// A worker shut down politely closes its side rather than dropping it, and the
+// stream ends with every frame well-formed and no answer among them. Told apart
+// by the absence of a decision, not by how the socket died.
+test("v1 analyze: a clean close with no decision is a truncation too", async () => {
+  _test.reset();
+  const quiet = await mockBackend({ analyzeStream: [CUT_FRAME] });
+  const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+  const env = testEnv(DEAD, { SCAN_URL: `${quiet.url},${healthy.url}` });
+  try {
+    const frames = await analyzeFrames(env);
+    assert.equal(frames.at(-1).status, "analyzed", "an EOF without a decision was taken for an answer");
+    assert.equal(healthy.hits.analyze, 1, "the surviving worker was never asked");
+  } finally {
+    await Promise.all([quiet.close(), healthy.close()]);
+  }
+});
+
+// A wedged worker is the failure the transport cannot report: the connection is
+// open and healthy, and nothing is ever going to arrive on it.
+test("v1 analyze: a worker that stops talking is treated as gone", async () => {
+  _test.reset();
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const stalled = await mockBackend({
+    analyzeStream: async function* stall() {
+      yield CUT_FRAME;
+      await held;
+    },
+  });
+  const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+  const env = testEnv(DEAD, {
+    SCAN_URL: `${stalled.url},${healthy.url}`,
+    SCAN_STREAM_IDLE_MS: "50",
+  });
+  try {
+    const frames = await analyzeFrames(env);
+    assert.equal(frames.at(-1).status, "analyzed", "the caller waited out a worker that had stopped talking");
+  } finally {
+    release();
+    await Promise.all([stalled.close(), healthy.close()]);
+  }
+});
+
+// The 200 only ever proved the worker could be reached and routed to. A node
+// being upgraded accepts every request and drops every stream, and crediting
+// each of those as a success kept it at the top of the ranking.
+test("v1 analyze: dropping a stream is charged to the worker's breaker", async () => {
+  _test.reset();
+  const dying = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION], analyzeCut: 1 });
+  const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+  const env = testEnv(DEAD, { SCAN_URL: `${dying.url},${healthy.url}` });
+  try {
+    assert.equal(_test.breakerFor(dying.url).open(), false);
+    for (let i = 0; i < _test.BREAKER_FAILS; i++) {
+      // A fresh cache each time: a cached verdict answers without dispatching,
+      // and the point here is what dispatching costs the worker's record.
+      const frames = await analyzeFrames({ ...env, cache: _test.memoryCache() });
+      assert.equal(frames.at(-1).status, "analyzed");
+    }
+    assert.equal(_test.breakerFor(dying.url).open(), true, "a worker that drops every stream still looks healthy");
+  } finally {
+    await Promise.all([dying.close(), healthy.close()]);
+  }
+});
+
+// A handover must not let the run appear to travel backwards: the replacement
+// worker counts from its own zero, and the caller has already been told a later
+// time than that.
+test("v1 analyze: elapsed time is monotonic across a handover", async () => {
+  _test.reset();
+  const dying = await mockBackend({
+    analyzeStream: ['{"state":"analyzing","purl":"pkg:npm/cut@1.0.0","elapsed_ms":9000,"phase":"unpack"}'],
+  });
+  const healthy = await mockBackend({
+    analyzeStream: ['{"state":"analyzing","purl":"pkg:npm/cut@1.0.0","elapsed_ms":10,"phase":"fetch"}', CUT_DECISION],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: `${dying.url},${healthy.url}` });
+  try {
+    const frames = await analyzeFrames(env);
+    const elapsed = frames.map((f) => f.total_elapsed_ms).filter((ms) => typeof ms === "number");
+    assert.deepEqual(elapsed, [...elapsed].sort((a, b) => a - b), `elapsed went backwards: ${elapsed}`);
+  } finally {
+    await Promise.all([dying.close(), healthy.close()]);
+  }
+});
+
+// One pass over the fleet measures our own bookkeeping, not the fleet: a worker
+// restarting refuses the connection instantly, so a whole pass can fail in
+// milliseconds and answer `unavailable` having spent nothing.
+test("v1 lookup: a fleet that failed fast is asked a second time", async () => {
+  _test.reset();
+  let asked = 0;
+  const flapping = await mockBackend({
+    v1: () => {
+      asked += 1;
+      if (asked === 1) return { status: 503 };
+      return {
+        decision: "allow", purl: "pkg:npm/flap@1.0.0", sha256: null, severity: "benign",
+        fires_at: -1, reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+      };
+    },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: flapping.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fflap%401.0.0"),
+      env,
+      waitCtx().ctx,
+    );
+    const body = await res.json();
+    assert.equal(body.status, "analyzed", "a fleet that failed fast was never asked again");
+    assert.equal(asked, 2);
+  } finally {
+    await flapping.close();
+  }
+});
+
+// "We could not find out" collapses two failures a retry policy has to tell
+// apart: a slot that will free shortly, and an outage.
+test("v1: an outage says whether the fleet was full or unreachable", async () => {
+  _test.reset();
+  const full = await mockBackend({ analyzeStatus: 429 });
+  try {
+    const busy = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fcut%401.0.0", { method: "POST" }),
+      testEnv(DEAD, { SCAN_URL: full.url, SCAN_TIMEOUT_MS: "100", SCAN_RETRIES: "1" }),
+      waitCtx().ctx,
+    );
+    assert.equal(JSON.parse(await busy.text()).cause, "saturated");
+  } finally {
+    await full.close();
+  }
+
+  const gone = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fcut%401.0.0"),
+    testEnv(DEAD, { SCAN_URL: DEAD }),
+    waitCtx().ctx,
+  );
+  assert.equal((await gone.json()).cause, "unreachable");
+});
+
+// Cancelling the reader settles the read the stream is parked on, which looks
+// exactly like an upstream that closed. Telling those apart matters: the second
+// deserves another worker, and the first has nobody left to find one for.
+test("v1 analyze: a caller hanging up is not a reason to find another worker", async () => {
+  _test.reset();
+  let resumes = 0;
+  const encoder = new TextEncoder();
+  const source = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(`${CUT_FRAME}\n`));
+    },
+  });
+  const reader = _test.annotatedV1Stream(
+    source,
+    25,
+    { requestId: "test", locator: { type: "purl", value: "pkg:npm/cut@1.0.0" }, startedAt: Date.now(), ids: {} },
+    null,
+    {
+      base: DEAD,
+      resume: () => {
+        resumes += 1;
+        return null;
+      },
+      idleMs: 0,
+      limit: 3,
+    },
+  ).getReader();
+
+  await reader.read();
+  const parked = reader.read();
+  await new Promise((resolve) => setImmediate(resolve));
+  await reader.cancel();
+  await parked;
+  assert.equal(resumes, 0, "a caller who hung up was given a fresh analysis on another worker");
 });

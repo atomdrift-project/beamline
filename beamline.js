@@ -37,6 +37,31 @@ const SCAN_RETRIES = 5;
 const BUSY_BUDGET_SHARE = 0.5;
 const SCAN_RETRY_BASE_MS = 1_000;
 const SCAN_RETRY_MAX_MS = 30_000;
+// One pass over the fleet is not a measurement of it. A worker restarting
+// refuses the connection in microseconds, so a fleet caught mid-rollout can
+// fail every address in a few milliseconds and answer `unavailable` having
+// spent nothing — the same "measured our own bookkeeping, not the fleet"
+// mistake scanWorkers() guards against, one layer up.
+//
+// Retried only while it is cheap. A pass that failed fast failed on
+// reachability and is worth repeating; one that burned its timeouts is
+// measuring a fleet that genuinely is not answering, and asking again would
+// double a latency the caller is already waiting out. So the retry is gated on
+// how long the first pass took, not on how many workers it tried.
+const LOOKUP_RETRIES = 1;
+const LOOKUP_RETRY_BASE_MS = 100;
+const LOOKUP_RETRY_MAX_MS = 500;
+const LOOKUP_RETRY_DEADLINE_MS = 5_000;
+// How long an analyze stream may go without a frame before its worker is taken
+// for gone. Scan emits progress while it works, so silence is not patience: it
+// is a worker that stopped talking without closing the connection, the one
+// failure the transport cannot report on its own. Set well above scan's
+// progress cadence so a slow phase is never mistaken for a stall.
+const STREAM_IDLE_MS = 120_000;
+// How many times one analyze stream may be handed to another worker. A resume
+// is cheap when the original survived — scan attaches the retry to the run
+// already in progress — but a fleet dying under us has to terminate, not loop.
+const STREAM_RESUMES = 3;
 
 // Per isolate, not global: on Workers each isolate counts its own failures and
 // loses them when it is recycled, so a backend outage costs BREAKER_FAILS
@@ -292,65 +317,79 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
   // invite it to reject the question. What comes back is filed under the policy
   // this request resolved to, which is the question the caller actually asked.
   const askPath = v1CachePath(sha, locators, null);
-  const workers = await lookupOrder(env, ctx, scanWorkers(env), ids);
   const t0 = Date.now();
+  let cause = "unreachable";
 
-  for (const base of workers) {
-    const worker = hostOf(base);
-    try {
-      const answered = await fetchTimeout(
-        `${base}${askPath}`,
-        { method: "GET", headers: scanHeaders(env, ctx) },
-        LOOKUP_TIMEOUT_MS,
-        ctx,
-        async (resp) => {
-          const body = await resp.text();
-          return { status: resp.status, body, source: resp.headers.get("X-Scan-Source") };
-        },
-      );
-      // A 404 is not this request being wrong. This route never answers one
-      // for a well-formed query — an artifact nobody has analyzed is a 200
-      // carrying `unanalyzed` — so a 404 means the worker has no such route, which
-      // is a fact about the worker. Counted against it and tried elsewhere:
-      // during a partial rollout that is what drains traffic off the workers
-      // that cannot serve yet and onto the ones that can. Relaying it instead
-      // told every caller their package did not exist.
-      if (answered.status === 404) {
-        breakerFor(base).fail();
-        logLine("v1_lookup", { src: "scan", status: 404, worker, no_route: true, ...ids });
-        continue;
-      }
-      // Any other 4xx is this request being wrong, which the next worker would
-      // also say. Passed through verbatim so the caller reads scan's own reason.
-      if (answered.status >= 400 && answered.status < 500) {
+  for (let attempt = 0; ; attempt++) {
+    const workers = await lookupOrder(env, ctx, scanWorkers(env), ids);
+    if (!workers.length) {
+      cause = "no_workers";
+      break;
+    }
+
+    for (const base of workers) {
+      const worker = hostOf(base);
+      try {
+        const answered = await fetchTimeout(
+          `${base}${askPath}`,
+          { method: "GET", headers: scanHeaders(env, ctx) },
+          LOOKUP_TIMEOUT_MS,
+          ctx,
+          async (resp) => {
+            const body = await resp.text();
+            return { status: resp.status, body, source: resp.headers.get("X-Scan-Source") };
+          },
+        );
+        // A 404 is not this request being wrong. This route never answers one
+        // for a well-formed query — an artifact nobody has analyzed is a 200
+        // carrying `unanalyzed` — so a 404 means the worker has no such route, which
+        // is a fact about the worker. Counted against it and tried elsewhere:
+        // during a partial rollout that is what drains traffic off the workers
+        // that cannot serve yet and onto the ones that can. Relaying it instead
+        // told every caller their package did not exist.
+        if (answered.status === 404) {
+          breakerFor(base).fail();
+          logLine("v1_lookup", { src: "scan", status: 404, worker, no_route: true, ...ids });
+          continue;
+        }
+        // Any other 4xx is this request being wrong, which the next worker would
+        // also say. Passed through verbatim so the caller reads scan's own reason.
+        if (answered.status >= 400 && answered.status < 500) {
+          breakerFor(base).ok();
+          const source = beamlineSource(answered.source);
+          logLine("v1_lookup", { src: source, status: answered.status, worker, ms: Date.now() - t0, ...ids });
+          return v1Body(env, answered.body, answered.status, worker, 0, source);
+        }
+        if (answered.status !== 200) {
+          breakerFor(base).fail();
+          continue;
+        }
         breakerFor(base).ok();
         const source = beamlineSource(answered.source);
-        logLine("v1_lookup", { src: source, status: answered.status, worker, ms: Date.now() - t0, ...ids });
-        return v1Body(env, answered.body, answered.status, worker, 0, source);
-      }
-      if (answered.status !== 200) {
+        logLine("v1_lookup", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
+        const document = v1DocumentBody(answered.body);
+        const stored = document || answered.body;
+        const body = document ? v1BudgetedBody(document, budget, locator) : (v1BudgetedBody(answered.body, budget, locator) || answered.body);
+        const res = v1Body(env, body, 200, worker, v1MaxAge(stored), source);
+        if (!v1MaxAge(stored)) return res;
+        // The asked-for key and every resolved alias are stored together; the
+        // digest the answer names is
+        // stored here. A lookup by PURL that reached a worker has just learned
+        // the artifact's identity, and the next caller who knows only that
+        // identity should not have to reach a worker to learn the same thing.
+        // Skipped when they are the same key — a sha lookup has nothing to add.
+        waitUntil(ctx, cacheV1Aliases(env, cache, origin, path, locator, stored, follow));
+        return res;
+      } catch (err) {
         breakerFor(base).fail();
-        continue;
+        logLine("v1_lookup", { src: "scan", worker, unreachable: true, err: errText(err), ...ids });
       }
-      breakerFor(base).ok();
-      const source = beamlineSource(answered.source);
-      logLine("v1_lookup", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
-      const document = v1DocumentBody(answered.body);
-      const stored = document || answered.body;
-      const body = document ? v1BudgetedBody(document, budget, locator) : (v1BudgetedBody(answered.body, budget, locator) || answered.body);
-      const res = v1Body(env, body, 200, worker, v1MaxAge(stored), source);
-      if (!v1MaxAge(stored)) return res;
-      // The asked-for key and every resolved alias are stored together; the
-      // digest the answer names is
-      // stored here. A lookup by PURL that reached a worker has just learned
-      // the artifact's identity, and the next caller who knows only that
-      // identity should not have to reach a worker to learn the same thing.
-      // Skipped when they are the same key — a sha lookup has nothing to add.
-      waitUntil(ctx, cacheV1Aliases(env, cache, origin, path, locator, stored, follow));
-      return res;
-    } catch {
-      breakerFor(base).fail();
     }
+
+    if (attempt >= LOOKUP_RETRIES || Date.now() - t0 >= LOOKUP_RETRY_DEADLINE_MS) break;
+    const wait = backoff(LOOKUP_RETRY_BASE_MS, attempt, LOOKUP_RETRY_MAX_MS);
+    logLine("v1_lookup_retry", { attempt: attempt + 1, wait_ms: Math.round(wait), ...ids });
+    await sleep(wait, ctx);
   }
 
   // Nobody could answer. Not a 5xx: the caller asked what we know about some
@@ -358,18 +397,27 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
   // one their policy is entitled to treat differently from "nobody has analyzed
   // this". A 503 here collapses those two, and a client that catches errors and
   // proceeds fails open on both.
-  logLine("v1_lookup", { src: "none", status: 200, unavailable: true, ms: Date.now() - t0, ...ids });
+  logLine("v1_lookup", { src: "none", status: 200, unavailable: true, cause, ms: Date.now() - t0, ...ids });
   const rows = [];
-  if (sha && !locators.length) rows.push(v1Unavailable(sha, null));
-  for (const item of locators) rows.push(v1Unavailable(locators.length === 1 && sha ? sha : null, item));
+  if (sha && !locators.length) rows.push(v1Unavailable(sha, null, cause));
+  for (const item of locators) rows.push(v1Unavailable(locators.length === 1 && sha ? sha : null, item, cause));
   return v1Body(env, JSON.stringify(rows.length === 1 ? rows[0] : rows), 200, null, 0);
 }
 
 // A decision we could not reach a worker to make. Carries nothing about the
 // artifact: it is a statement about us.
-function v1Unavailable(sha, locator) {
+//
+// `cause` says which statement. "We could not find out" collapses two failures
+// a caller's retry policy has to tell apart: a saturated fleet has the capacity
+// and is using it, so a slot frees shortly and asking again is right, while an
+// unreachable one is an outage and asking again just adds load to it. We
+// already compute the difference on the way here and used to discard it.
+// Distinct from `reason`, which explains a verdict about the artifact and stays
+// null on a row that carries no verdict at all.
+function v1Unavailable(sha, locator, cause = null) {
   const row = {
     status: "unavailable",
+    cause,
     purl: locator?.type === "purl" ? locator.value : null,
     sha256: sha || null,
     severity: "unknown",
@@ -959,8 +1007,10 @@ async function handleV1Analyze(request, env, ctx, url) {
   // against the same clock the analysis itself is promised, and a broken one
   // keeps the short budget.
   const busyDeadline = t0 + numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS) * BUSY_BUDGET_SHARE;
+  let last = null;
   for (let attempt = 0; ; attempt++) {
     const pass = { busy: 0, broken: 0 };
+    last = pass;
     const cacheFollow = locator && !bytes ? follow.value : null;
     const answered = await v1Dispatch(
       env,
@@ -988,11 +1038,21 @@ async function handleV1Analyze(request, env, ctx, url) {
   // /v1/lookup gives one: the caller asked about a package, and "we could not
   // find out" is an answer about it that their policy may treat differently
   // from "nobody has analyzed this".
-  logLine("v1_analyze", { src: "none", status: 200, unavailable: true, ms: Date.now() - t0, ...ids });
-  return new Response(`${JSON.stringify(v1Unavailable(null, locator))}\n`, {
+  const cause = v1UnavailableCause(env, last);
+  logLine("v1_analyze", { src: "none", status: 200, unavailable: true, cause, ms: Date.now() - t0, ...ids });
+  return new Response(`${JSON.stringify(v1Unavailable(null, locator, cause))}\n`, {
     status: 200,
     headers: { "content-type": "application/x-ndjson", "cache-control": "no-store" },
   });
+}
+
+// Which failure the fleet just had, in the terms a caller's retry policy needs.
+// The tallies are already kept to decide whether another pass is worth making;
+// this only stops them being thrown away once it is not.
+function v1UnavailableCause(env, pass) {
+  if (!scanWorkers(env).length) return "no_workers";
+  if (!pass || !pass.busy) return "unreachable";
+  return pass.broken ? "mixed" : "saturated";
 }
 
 // One pass over the fleet. Returns the response, or null when every worker
@@ -1053,14 +1113,21 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
       logLine("v1_analyze", { src: "scan", status: 404, worker, no_route: true, ...ids });
       continue;
     }
-    breakerFor(base).ok();
     if (upstream.status !== 200) {
+      // A refusal delivered promptly is a worker working correctly.
+      breakerFor(base).ok();
       logLine("v1_analyze", { src: "scan", status: upstream.status, worker, ms: Date.now() - t0, ...ids });
       return new Response(upstream.body, {
         status: upstream.status,
         headers: { "content-type": "application/json", "cache-control": "no-store" },
       });
     }
+    // Deliberately not credited here. A 200 on an analyze proves only that the
+    // worker took the request; everything it promised is still ahead of it, and
+    // a node being upgraded takes every request and finishes none. Crediting
+    // the acceptance zeroed the failure count on each of those, so a worker
+    // that dropped every stream could never trip its own breaker. The credit is
+    // issued when a decision actually arrives, to whichever worker produced it.
 
     const source = beamlineSource(upstream.headers.get("X-Scan-Source"));
     logLine("v1_analyze", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
@@ -1074,11 +1141,21 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
         }
       : null;
     return new Response(
-      annotatedV1Stream(upstream.body, budget, {
-        requestId: ctx.rid,
-        locator,
-        startedAt: t0,
-      }, cacheDecision),
+      annotatedV1Stream(
+        upstream.body,
+        budget,
+        { requestId: ctx.rid, locator, startedAt: t0, ids },
+        cacheDecision,
+        // Only the analyze path resumes. It is the only one that holds a stream
+        // long enough for its worker to be taken away mid-answer — a lookup is
+        // over in milliseconds, and a failed one is simply retried.
+        {
+          base,
+          resume: (dead) => v1Resume(env, ctx, path, bytes, ids, locator, dead),
+          idleMs: numEnv(env, "SCAN_STREAM_IDLE_MS", STREAM_IDLE_MS),
+          limit: numEnv(env, "SCAN_STREAM_RESUMES", STREAM_RESUMES),
+        },
+      ),
       {
       status: 200,
       headers: {
@@ -1091,6 +1168,71 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
     );
   }
 
+  return null;
+}
+
+// A replacement upstream for an analyze stream that lost its worker before the
+// decision arrived.
+//
+// Asked in the same order a first dispatch would use, with two departures. The
+// worker already running this key goes first: when the original merely blipped
+// it is still analyzing, and scan attaches the retry to the run in progress
+// rather than starting a second one, so the handover costs an index request
+// instead of an analysis. And the worker that just dropped us goes last, since
+// it now has a failure against it and nothing in its favour — last rather than
+// excluded, because one worker that stumbled still beats no worker at all,
+// which is the rule scanWorkers() already follows for the fleet.
+//
+// A 429 here is not worth waiting on. The caller is mid-stream and holding a
+// budget the queueing logic upstream never got to reason about, so a full
+// worker is simply skipped in favour of one with room.
+async function v1Resume(env, ctx, path, bytes, ids, locator, dead) {
+  // An aborted request has nobody left to finish the analysis for, and every
+  // fetch below would be made with a signal that is already tripped.
+  if (clientAborted(ctx)) return null;
+  const workers = scanWorkers(env);
+  if (!workers.length) return null;
+  const hint = locator?.type === "purl" ? { purl: locator.value } : {};
+  const ranked = (await rankWorkers(env, ctx, workers, ids, hint)).workers;
+  const busy = locator ? await runningWorker(env, ctx, locator, ids) : null;
+  const order = [
+    ...ranked.filter((base) => busy && hostOf(base) === busy),
+    ...ranked.filter((base) => (!busy || hostOf(base) !== busy) && base !== dead),
+    ...ranked.filter((base) => (!busy || hostOf(base) !== busy) && base === dead),
+  ];
+
+  for (const base of order) {
+    const worker = hostOf(base);
+    let upstream;
+    try {
+      upstream = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers: scanHeaders(env, ctx),
+        body: bytes,
+        signal: ctx.signal,
+      });
+    } catch (err) {
+      breakerFor(base).fail();
+      logLine("v1_analyze_resume", { src: "scan", worker, unreachable: true, err: errText(err), ...ids });
+      continue;
+    }
+    if (upstream.status !== 200 || !upstream.body) {
+      if (upstream.status >= 500 || upstream.status === 404) breakerFor(base).fail();
+      await drain(upstream);
+      logLine("v1_analyze_resume", { src: "scan", status: upstream.status, worker, ...ids });
+      continue;
+    }
+    breakerFor(base).ok();
+    logLine("v1_analyze_resume", {
+      src: "scan",
+      status: 200,
+      worker,
+      attached: worker === busy || undefined,
+      ...ids,
+    });
+    return { body: upstream.body, base };
+  }
+  logLine("v1_analyze_resume", { src: "none", unavailable: true, ...ids });
   return null;
 }
 
@@ -1120,12 +1262,24 @@ async function cacheV1Decision(env, ctx, origin, locator, decided, follow) {
 // total elapsed time, which made a missing phase indistinguishable from a
 // stalled run. The Worker owns the request clock, so it can also correlate the
 // frames without asking every scan version to learn a new wire format first.
-function annotatedV1Stream(stream, budget, meta, onDecision = null) {
-  const decoder = new TextDecoder();
+//
+// `resume` makes the stream survive losing its worker. It carries the base URL
+// currently serving it, how long silence may last before that worker is taken
+// for gone, how many handovers are allowed, and a callback that produces a
+// replacement body. Omitted, the stream behaves as it always did.
+function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = null) {
   const encoder = new TextEncoder();
+  let decoder = new TextDecoder();
+  let reader = stream.getReader();
   let buffered = "";
   let decisionSeen = false;
-  const phase = { name: null, startedElapsed: 0, lastElapsed: 0 };
+  let finished = false;
+  let handovers = 0;
+  const queued = [];
+  // `floor` keeps elapsed times monotonic across a handover: a replacement
+  // worker counts from its own zero, and the caller must never watch the run
+  // travel backwards.
+  const phase = { name: null, startedElapsed: 0, lastElapsed: 0, floor: 0 };
 
   const encodeLine = (line) => {
     const annotated = annotatedV1Lines(line, budget, meta, phase);
@@ -1134,6 +1288,9 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null) {
     // after this line and may cancel the stream before an EOF-driven flush.
     if (annotated.decision && !decisionSeen) {
       decisionSeen = true;
+      // The worker finished what it took on. Charged to whoever is serving the
+      // stream now, which after a handover is not who started it.
+      if (resume) breakerFor(resume.base).ok();
       if (onDecision) {
         try {
           onDecision(annotated.decision);
@@ -1145,24 +1302,148 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null) {
     return annotated.lines.map((row) => encoder.encode(`${row}\n`));
   };
 
-  return stream.pipeThrough(
-    new TransformStream({
-      transform(chunk, controller) {
-        buffered += decoder.decode(chunk, { stream: true });
+  const push = (line) => {
+    for (const encoded of encodeLine(line)) queued.push(encoded);
+  };
+
+  // One chunk, or a rejection when the worker stops talking.
+  //
+  // Silence needs its own clock. A worker that wedges holds the connection open
+  // and sends nothing, which the transport reports as a healthy stream with a
+  // very patient peer — so without a deadline here the caller waits out a
+  // worker that is never going to answer.
+  const readChunk = async () => {
+    const pending = reader.read();
+    if (!resume?.idleMs) return pending;
+    // The loser of this race stays pending. Give it a handler now: once the
+    // idle clock has won we stop awaiting the read, and a stream that errors
+    // after that would otherwise surface only as an unhandled rejection.
+    pending.catch(() => {});
+    let timer;
+    try {
+      return await Promise.race([
+        pending,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("idle")), resume.idleMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // Hand the caller to another worker, mid-stream. False when nobody took it,
+  // and the stream then ends exactly as it would have without this.
+  //
+  // Safe because a v1 stream is progress frames followed by one terminal
+  // decision: until that decision goes out the caller has consumed nothing a
+  // different worker could contradict, so the answer is still owed and can
+  // still be gone and got. After it, there is nothing left to resume.
+  const handover = async (why) => {
+    if (decisionSeen || !resume) return false;
+    // The worker took the request and did not finish it. Charged here rather
+    // than at the 200, which only ever proved we could reach it and route to
+    // it: a node being upgraded accepts every request and drops every stream,
+    // and crediting each of those as a success kept it top of the ranking while
+    // it failed every caller.
+    breakerFor(resume.base).fail();
+    const spent = handovers >= resume.limit;
+    logLine("v1_analyze_stream", {
+      worker: hostOf(resume.base),
+      why,
+      handover: spent ? undefined : handovers + 1,
+      exhausted: spent || undefined,
+      ...meta.ids,
+    });
+    if (spent) return false;
+    handovers += 1;
+    try {
+      await reader.cancel();
+    } catch {
+      // Already dead: cancelling is a courtesy to a live worker, not a step.
+    }
+    const next = await resume.resume(resume.base);
+    if (!next) return false;
+    reader = next.body.getReader();
+    resume.base = next.base;
+    // The dead worker's trailing bytes are half a frame, not a frame, and its
+    // clock is not the replacement's.
+    decoder = new TextDecoder();
+    buffered = "";
+    phase.floor = phase.lastElapsed;
+    phase.name = null;
+    // Announced rather than papered over: the phase sequence restarts here, and
+    // a caller watching progress is owed the reason. No `status` field, so a
+    // reader looking for the terminal frame passes over it like any other
+    // progress line.
+    push(
+      JSON.stringify({
+        state: "resumed",
+        worker: hostOf(next.base),
+        elapsed_ms: phase.lastElapsed,
+        total_elapsed_ms: phase.lastElapsed,
+        request_id: meta.requestId,
+        ...(meta.locator?.type === "purl" ? { purl: meta.locator.value } : {}),
+        ...(meta.locator?.type === "url" ? { url: meta.locator.value } : {}),
+      }),
+    );
+    return true;
+  };
+
+  return new ReadableStream({
+    async pull(controller) {
+      for (;;) {
+        if (queued.length) {
+          controller.enqueue(queued.shift());
+          return;
+        }
+        if (finished) {
+          controller.close();
+          return;
+        }
+        let result;
+        try {
+          result = await readChunk();
+        } catch (err) {
+          // The caller hung up: cancel() settles the read we were parked on, and
+          // there is no longer anyone to hand over to.
+          if (finished) return;
+          // Nothing more is coming from this worker. If nobody else will take
+          // it the stream ends undecided — which is what the caller has to be
+          // allowed to see, since erroring here would be indistinguishable from
+          // the truncation we just failed to repair.
+          if (await handover(err?.message === "idle" ? "idle" : "error")) continue;
+          finished = true;
+          continue;
+        }
+        if (finished) return;
+        if (result.done) {
+          // A clean close with no decision is a truncation too: a worker taken
+          // down between frames shuts its side politely and says nothing.
+          if (!decisionSeen && (await handover("eof"))) continue;
+          buffered += decoder.decode();
+          if (buffered) {
+            push(buffered);
+            buffered = "";
+          }
+          finished = true;
+          continue;
+        }
+        buffered += decoder.decode(result.value, { stream: true });
         const lines = buffered.split("\n");
         buffered = lines.pop() ?? "";
-        for (const line of lines) {
-          for (const encoded of encodeLine(line)) controller.enqueue(encoded);
-        }
-      },
-      flush(controller) {
-        buffered += decoder.decode();
-        if (buffered) {
-          for (const encoded of encodeLine(buffered)) controller.enqueue(encoded);
-        }
-      },
-    }),
-  );
+        for (const line of lines) push(line);
+      }
+    },
+    async cancel(reason) {
+      finished = true;
+      try {
+        await reader.cancel(reason);
+      } catch {
+        // The caller hung up on a worker that had already gone.
+      }
+    },
+  });
 }
 
 function annotatedV1Lines(line, budget, meta, phase) {
@@ -1176,7 +1457,8 @@ function annotatedV1Lines(line, budget, meta, phase) {
     return { lines: [budgetedV1Line(line, budget, meta.locator)], decision: null };
   }
 
-  const totalElapsed = finiteMs(row.elapsed_ms) ?? phase.lastElapsed;
+  const reported = finiteMs(row.elapsed_ms);
+  const totalElapsed = reported == null ? phase.lastElapsed : reported + phase.floor;
   if (Number.isFinite(totalElapsed)) phase.lastElapsed = totalElapsed;
 
   // A decision is the terminal event. Close the last reported phase in its own
