@@ -3278,3 +3278,44 @@ test("v1 analyze: a caller hanging up is not a reason to find another worker", a
   await parked;
   assert.equal(resumes, 0, "a caller who hung up was given a fresh analysis on another worker");
 });
+
+// The last line of a stream usually has no trailing newline, so at EOF the
+// decision can still be sitting in the buffer. Judging the stream truncated
+// before flushing it threw away a worker's answer, charged that worker a
+// failure for having answered, and paid for the same analysis twice.
+test("v1 analyze: a decision without a trailing newline is an answer, not a truncation", async () => {
+  _test.reset();
+  let resumes = 0;
+  const encoder = new TextEncoder();
+  const source = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(CUT_DECISION));
+      controller.close();
+    },
+  });
+  const reader = _test.annotatedV1Stream(
+    source,
+    25,
+    { requestId: "test", locator: { type: "purl", value: "pkg:npm/cut@1.0.0" }, startedAt: Date.now(), ids: {} },
+    null,
+    {
+      base: DEAD,
+      resume: () => {
+        resumes += 1;
+        return null;
+      },
+      idleMs: 0,
+      limit: 3,
+    },
+  ).getReader();
+
+  const frames = [];
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    frames.push(JSON.parse(new TextDecoder().decode(value)));
+  }
+  assert.equal(resumes, 0, "a worker that answered was treated as having vanished");
+  assert.equal(frames.at(-1).status, "analyzed");
+  assert.equal(_test.breakerFor(DEAD).open(), false);
+});

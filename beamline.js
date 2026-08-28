@@ -1418,14 +1418,20 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
         }
         if (finished) return;
         if (result.done) {
-          // A clean close with no decision is a truncation too: a worker taken
-          // down between frames shuts its side politely and says nothing.
-          if (!decisionSeen && (await handover("eof"))) continue;
+          // Flush before judging. A stream's last line often arrives without a
+          // trailing newline, so at EOF the remainder is a whole frame still
+          // sitting in the buffer — and when that frame is the decision,
+          // deciding first threw the answer away and re-ran the analysis
+          // somewhere else. Only a stream that died mid-line leaves a partial
+          // frame here, and that path discards the buffer on its own.
           buffered += decoder.decode();
           if (buffered) {
             push(buffered);
             buffered = "";
           }
+          // A clean close with no decision is a truncation too: a worker taken
+          // down between frames shuts its side politely and says nothing.
+          if (!decisionSeen && (await handover("eof"))) continue;
           finished = true;
           continue;
         }
