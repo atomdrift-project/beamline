@@ -38,6 +38,12 @@ const popular = process.env.POPULAR === "1";
 const analyzeMisses = process.env.ANALYZE_MISSES === "1";
 const stressRoute = (process.env.STRESS_ROUTE || "combined").trim().toLowerCase();
 const repeat = Math.max(1, Number(process.env.REPEAT) || 1);
+// Analyses are asked at the widest policy; lookups are left on their own
+// default. That pairing is the point: `all` contains every narrower
+// question, so a lookup afterwards must be served from the analysis rather
+// than reaching a worker again. A run where those lookups still say
+// `scan:` is a run where the ordering is not doing its job.
+const ANALYZE_FOLLOW = (process.env.ANALYZE_FOLLOW || "all").trim();
 const timeoutMs = Number(process.env.SCAN_TIMEOUT_MS) || 1_800_000;
 
 // Five very widely used packages per ecosystem, pinned to the versions that
@@ -371,7 +377,7 @@ async function submitLookup(item) {
 
 async function submitAnalyze(item) {
   if (api === "v1") {
-    return askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}`);
+    return askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}&follow=${ANALYZE_FOLLOW}`);
   }
   return ask(item, `${beamlineUrl}/analyze?purl=${encodeURIComponent(item.purl)}`, "POST");
 }
@@ -395,7 +401,7 @@ async function submitV1(item) {
   // answer would skip the analysis and report an outage as a cache hit.
   const known = looked.artifactStatus === "analyzed";
   if (!analyzeMisses || known) return { ...looked, both: await bothProbeV1(item, looked) };
-  const analyzed = await askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}`);
+  const analyzed = await askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}&follow=${ANALYZE_FOLLOW}`);
   return { ...analyzed, analyzed: true, lookupMs: looked.ms, both: await bothProbeV1(item, analyzed) };
 }
 
