@@ -806,6 +806,106 @@ test("v1 lookup: a wider policy's answer serves a narrower question, never the r
   }
 });
 
+// An analysis outlives the request that asked for it. Scan detaches the run
+// from the connection that started it, so a caller who gives up at their own
+// timeout leaves a verdict that is still coming and that nothing else will
+// observe: the cache write fires from the decision line, and the decision line
+// is only parsed while somebody is pulling the stream. Left alone, every
+// abandoned analysis is bought twice — once by the caller who walked away, and
+// again by whoever asks next.
+test("v1 analyze: a caller that hangs up still leaves the verdict cached", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  let release = () => {};
+  const decided = new Promise((resolve) => {
+    release = resolve;
+  });
+  const scan = await mockBackend({
+    // A progress frame, then the decision — with the caller's departure in
+    // between, which is the whole point of the test.
+    analyzeStream: () =>
+      (async function* stream() {
+        yield `{"state":"analyzing","purl":"${purl}","elapsed_ms":10,"phase":"unpack"}`;
+        await decided;
+        yield `{"decision":"allow","fires_at":-1,"purl":"${purl}","engine_version":"test"}`;
+      })(),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const hungUp = waitCtx();
+  try {
+    const res = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+      env,
+      hungUp.ctx,
+    );
+    const reader = res.body.getReader();
+    const first = await reader.read();
+    assert.match(new TextDecoder().decode(first.value), /"state":"analyzing"/);
+    // The caller times out. No decision has been sent.
+    await reader.cancel();
+    // Scan finishes the run it was always going to finish.
+    release();
+    await hungUp.flush();
+
+    const before = scan.hits.analyze;
+    const next = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    const body = JSON.parse((await next.text()).trim());
+    assert.equal(body.status, "analyzed");
+    assert.equal(body.fires_at, -1);
+    assert.equal(
+      scan.hits.analyze,
+      before,
+      "the abandoned analysis was not filed; the next caller paid for it again",
+    );
+    assert.equal(next.headers.get("X-Beamline-Source"), "cache");
+  } finally {
+    release();
+    await scan.close();
+  }
+});
+
+// An upload has no locator to file an answer under, so there is nothing to
+// salvage and no reason to hold the worker's stream open for a caller who has
+// gone. The reader is dropped, as it always was.
+test("v1 analyze: an abandoned upload is dropped rather than drained", async () => {
+  let released = false;
+  let release = () => {};
+  const decided = new Promise((resolve) => {
+    release = () => {
+      released = true;
+      resolve();
+    };
+  });
+  const scan = await mockBackend({
+    analyzeStream: () =>
+      (async function* stream() {
+        yield '{"state":"analyzing","sha256":"' + HELLO_SHA + '","elapsed_ms":10,"phase":"unpack"}';
+        await decided;
+        yield '{"decision":"allow","fires_at":-1,"engine_version":"test"}';
+      })(),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze", { method: "POST", body: "hello" }),
+      env,
+      ctx.ctx,
+    );
+    const reader = res.body.getReader();
+    await reader.read();
+    await reader.cancel();
+    await ctx.flush();
+    assert.equal(released, false, "an upload's stream was drained with nothing to file it under");
+  } finally {
+    release();
+    await scan.close();
+  }
+});
+
 // The body is passed through untouched. Buffering it to hand back one tidy
 // object would put the silence back on the hop between us and the caller —
 // the hop with a proxy we do not control on it, and the one this whole design

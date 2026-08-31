@@ -62,6 +62,14 @@ const STREAM_IDLE_MS = 120_000;
 // is cheap when the original survived — scan attaches the retry to the run
 // already in progress — but a fleet dying under us has to terminate, not loop.
 const STREAM_RESUMES = 3;
+// How long beamline keeps reading an analysis whose caller has gone.
+//
+// The run is already paid for and already happening: scan detaches the
+// analysis from the request that started it, so the verdict is coming whether
+// or not anyone is still listening. Reading it out is the difference between
+// filing it once and making the next caller buy it again. Bounded because a
+// stream nobody is waiting for must not outlive the analysis it is watching.
+const ORPHAN_BUDGET_MS = 600_000;
 
 // Per isolate, not global: on Workers each isolate counts its own failures and
 // loses them when it is recycled, so a backend outage costs BREAKER_FAILS
@@ -1188,11 +1196,15 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
       // that names one carries no body at all. Nothing here declares a content
       // type: which is meant is decided by what arrives, and a header saying so
       // could only ever disagree with it.
+      // Deliberately not `ctx.signal`. Tying this fetch to the caller means a
+      // caller who hangs up takes the answer down with them: scan keeps
+      // analysing either way, and the verdict is the one thing that stops the
+      // next caller paying for the same run. The stream below reads it out on
+      // its own clock; `ORPHAN_BUDGET_MS` is what bounds it.
       upstream = await fetch(`${base}${path}`, {
         method: "POST",
         headers: scanHeaders(env, ctx),
         body: bytes,
-        signal: ctx.signal,
       });
     } catch {
       if (pass) pass.broken += 1;
@@ -1268,6 +1280,15 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
           idleMs: numEnv(env, "SCAN_STREAM_IDLE_MS", STREAM_IDLE_MS),
           limit: numEnv(env, "SCAN_STREAM_RESUMES", STREAM_RESUMES),
         },
+        // Only where there is something to file. An upload has no locator to
+        // file an answer under, so reading out a stream nobody is holding
+        // would cost the same and keep nothing.
+        cacheFollow
+          ? {
+              register: (promise) => waitUntil(ctx, promise),
+              budgetMs: numEnv(env, "SCAN_ORPHAN_MS", ORPHAN_BUDGET_MS),
+            }
+          : null,
       ),
       {
       status: 200,
@@ -1380,7 +1401,7 @@ async function cacheV1Decision(env, ctx, origin, locator, decided, follow) {
 // currently serving it, how long silence may last before that worker is taken
 // for gone, how many handovers are allowed, and a callback that produces a
 // replacement body. Omitted, the stream behaves as it always did.
-function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = null) {
+function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = null, orphan = null) {
   const encoder = new TextEncoder();
   let decoder = new TextDecoder();
   let reader = stream.getReader();
@@ -1503,6 +1524,48 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     return true;
   };
 
+  // Read what is left of an abandoned stream, for the decision alone.
+  //
+  // Feeds `encodeLine` rather than `push`: the annotated lines are discarded
+  // — there is no one to hand them to — and the only thing wanted is the
+  // `onDecision` call it makes on the way past. No handover is attempted; a
+  // worker that dies with nobody waiting takes its run with it, and asking a
+  // second worker to redo it would spend a slot on an answer nobody is owed.
+  const drainToDecision = async () => {
+    const deadline = Date.now() + (orphan?.budgetMs || ORPHAN_BUDGET_MS);
+    try {
+      while (!decisionSeen && Date.now() < deadline) {
+        const result = await readChunk();
+        if (result.done) {
+          // Same trailing-line flush the read loop does: the decision is
+          // routinely the last line and routinely arrives without a newline.
+          buffered += decoder.decode();
+          if (buffered) {
+            encodeLine(buffered);
+            buffered = "";
+          }
+          break;
+        }
+        buffered += decoder.decode(result.value, { stream: true });
+        const lines = buffered.split("\n");
+        buffered = lines.pop() ?? "";
+        for (const line of lines) {
+          encodeLine(line);
+          if (decisionSeen) break;
+        }
+      }
+    } catch {
+      // The worker stopped talking to a request nobody was reading. There is
+      // nothing to file and nobody to tell.
+    }
+    try {
+      await reader.cancel();
+    } catch {
+      // Already gone.
+    }
+    logLine("v1_analyze_orphan", { decided: decisionSeen || undefined, ...meta.ids });
+  };
+
   return new ReadableStream({
     async pull(controller) {
       for (;;) {
@@ -1554,8 +1617,21 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
         for (const line of lines) push(line);
       }
     },
+    // The caller stopped reading.
+    //
+    // After the decision that is simply the end of the stream. Before it, the
+    // caller has walked away from a run that is still going and whose answer
+    // nothing else will observe — `onDecision` fires from `encodeLine`, and
+    // `encodeLine` only runs while somebody pulls. Dropping the reader here is
+    // what made an abandoned analysis cost a full re-run for whoever asked
+    // next. So finish reading it ourselves, on time the caller is no longer
+    // waiting on, and let the decision land in the cache as it would have.
     async cancel(reason) {
       finished = true;
+      if (!decisionSeen && orphan) {
+        orphan.register(drainToDecision());
+        return;
+      }
       try {
         await reader.cancel(reason);
       } catch {
