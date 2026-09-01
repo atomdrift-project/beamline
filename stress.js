@@ -743,7 +743,11 @@ function repeatJobs(jobs, times) {
 }
 
 function row(item, extra) {
-  const out = { eco: item.eco, purl: item.purl, ...extra };
+  // Completion wall-clock. Durations alone cannot be lined up against fleet
+  // state sampled beside the run, and the load a request actually met is the
+  // half of a latency measurement the row would otherwise be missing.
+  // The start is `at - ms`.
+  const out = { eco: item.eco, purl: item.purl, at: Date.now(), ...extra };
   out.kind = classify(out);
   logRow(out);
   return out;
@@ -1012,7 +1016,14 @@ function parseGoIndex(text) {
     } catch {
       continue;
     }
-    if (e.Path && e.Version) out.push({ name: e.Path, version: e.Version });
+    // A single-segment module path — `monks.co`, `allwright.dev` — has no
+    // namespace to put in a PURL, and `pkg:golang/` requires one, so scan
+    // answers 400 invalid_purl and is right to. Minting them here only files
+    // the harness's own bad input as a fleet defect: stress.js classes every
+    // 400 as a bug. About 0.1% of the index. The artifacts are still analyzable
+    // when wanted, by URL rather than coordinate:
+    //   https://proxy.golang.org/<path>/@v/<version>.zip
+    if (e.Path && e.Version && e.Path.includes("/")) out.push({ name: e.Path, version: e.Version });
   }
   return out;
 }

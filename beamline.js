@@ -57,7 +57,24 @@ const LOOKUP_RETRY_DEADLINE_MS = 5_000;
 // is a worker that stopped talking without closing the connection, the one
 // failure the transport cannot report on its own. Set well above scan's
 // progress cadence so a slow phase is never mistaken for a stall.
-const STREAM_IDLE_MS = 120_000;
+//
+// Scan tickers every 5s, so 120s was already 24 missed frames — and it still
+// fired on healthy workers. Measured: four golang analyses died as
+// `terminated` with no decision, on artifacts from 2.7MB to 95.6MB, while
+// 133MB and 137MB ones on the same fleet finished. Size and duration explain
+// none of it; what the survivors had in common is that they stayed chatty
+// (170-242 frames), and what the casualties had in common is a quiet stretch.
+// The ticker is a tokio task and the analysis saturates a rayon pool sized to
+// every core, so under load the frames stop arriving because nothing is
+// scheduling them — not because the worker is gone. Three handovers later the
+// caller is dropped and a healthy worker wears three breaker failures.
+//
+// 300s buys the starved ticker room to land a frame. It is a floor under a
+// scheduling artifact, not a judgement about how long an analysis may run:
+// a worker that is genuinely gone still costs a caller this long, which is why
+// the real repair is on scan's side, keeping the ticker off the pool that
+// starves it.
+const STREAM_IDLE_MS = 300_000;
 // How many times one analyze stream may be handed to another worker. A resume
 // is cheap when the original survived — scan attaches the retry to the run
 // already in progress — but a fleet dying under us has to terminate, not loop.
@@ -414,6 +431,10 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
   const askPath = v1CachePath(sha, locators, null);
   const t0 = Date.now();
   let cause = "unreachable";
+  // The last worker that answered `unavailable`. Held rather than returned so
+  // the fleet is exhausted first, and relayed only if nobody could do better -
+  // scan's own reason for the outage beats one this service invented.
+  let outage = null;
 
   for (let attempt = 0; ; attempt++) {
     const workers = await lookupOrder(env, ctx, scanWorkers(env), ids);
@@ -461,6 +482,27 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
         }
         breakerFor(base).ok();
         const source = beamlineSource(answered.source);
+        // An outage is not an answer, and this is the one 200 that is not one.
+        //
+        // `unavailable` says this worker could not reach the corpus just now -
+        // not that the artifact is unknown, which is `unanalyzed` and is an
+        // answer. Relaying the first one ends the search at the worker least
+        // able to serve it while the rest of the fleet is still willing, and the
+        // whole point of asking workers in turn is that they do not all fail
+        // together. Measured: one worker lost its corpus while three others
+        // still had a reachable replica, and every lookup in a run came back
+        // `unavailable` because the favourite answered first.
+        //
+        // The breaker is deliberately not charged. The worker answered, and
+        // promptly; it is the corpus behind it that is missing, and the same
+        // worker will still analyze perfectly well. Opening its breaker over
+        // this would take a healthy analyzer out of the fleet to punish an
+        // outage somewhere else.
+        if (v1OutageBody(answered.body)) {
+          logLine("v1_lookup", { src: source, status: 200, worker, unavailable: true, ms: Date.now() - t0, ...ids });
+          outage = { body: answered.body, worker, source };
+          continue;
+        }
         logLine("v1_lookup", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
         const document = v1DocumentBody(answered.body);
         const stored = document || answered.body;
@@ -492,6 +534,19 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
   // one their policy is entitled to treat differently from "nobody has analyzed
   // this". A 503 here collapses those two, and a client that catches errors and
   // proceeds fails open on both.
+  // A worker did answer, and what it said was that it could not find out.
+  // Its account beats one invented here: it knows which corpus address failed
+  // and this service does not, and the caller reading `cause` is reading the
+  // reason rather than our guess at it.
+  if (outage) {
+    logLine("v1_lookup", { src: outage.source, status: 200, worker: outage.worker, unavailable: true, relayed: true, ms: Date.now() - t0, ...ids });
+    // Normalized like any other answer. Only the reason is scan's; the shape is
+    // this service's to keep, and a caller should not have to read one spelling
+    // on an outage and another on a verdict.
+    const document = v1DocumentBody(outage.body);
+    const body = (document && v1BudgetedBody(document, budget, locator)) || document || outage.body;
+    return v1Body(env, body, 200, outage.worker, 0, outage.source);
+  }
   logLine("v1_lookup", { src: "none", status: 200, unavailable: true, cause, ms: Date.now() - t0, ...ids });
   const rows = [];
   if (sha && !locators.length) rows.push(v1Unavailable(sha, null, cause));
@@ -604,9 +659,20 @@ async function backfillDigestKey(env, cache, origin, body, follow) {
 // across policies would file a shallow answer where a caller asking the deeper
 // question reads, which is the same mistake as filing under a PURL nobody
 // typed — one name, two questions.
-function v1CacheAliasPaths(origin, requestedPath, locator, body, follow) {
+function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl) {
   const paths = new Set([requestedPath]);
   if (locator) paths.add(v1CachePath(null, [locator], follow));
+  // The normalized spelling of the coordinate that was asked, as scan
+  // reported it. Not a PURL somebody else chose - the same one, written the
+  // one way the normalizer writes it, which is the only spelling every other
+  // spelling can agree on.
+  //
+  // Without this a cache keyed on the caller's text holds one entry per way
+  // of writing a coordinate. Measured: `@v4.4.0+incompatible` and
+  // `@v4.4.0%2Bincompatible` are one artifact by sha and were two entries
+  // here, so the second spelling to arrive bought an analysis the first had
+  // already paid for. Go pseudo-versions make that spelling common.
+  if (canonicalPurl) paths.add(v1CachePath(null, [{ type: "purl", value: canonicalPurl }], follow));
   const sha = v1DecisionSha(body);
   if (sha) paths.add(v1CachePath(sha, [], follow));
   let row;
@@ -626,8 +692,8 @@ function v1CacheAliasPaths(origin, requestedPath, locator, body, follow) {
   return [...paths].map((path) => new Request(`${origin}${path}`));
 }
 
-async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, follow) {
-  const keys = v1CacheAliasPaths(origin, requestedPath, locator, body, follow);
+async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, follow, canonicalPurl) {
+  const keys = v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl);
   await Promise.all(
     keys.map(async (key) => {
       try {
@@ -984,6 +1050,20 @@ function v1CachedVerdict(body) {
 //
 // A pre-engine_version verdict lands in the short bucket too. That costs a
 // little more traffic and is never wrong, which is the right side to err on.
+// Whether a 200 body is an outage rather than an answer. Same shapes
+// `v1MaxAge` reads, for the same reason: one locator or several, and any one
+// of them unreachable makes the whole reply one this service should not rest
+// on - to cache, or to stop asking on.
+function v1OutageBody(body) {
+  try {
+    const row = JSON.parse(body);
+    const rows = Array.isArray(row) ? row : [row];
+    return rows.some((item) => item?.status === "unavailable" || item?.decision === "unavailable");
+  } catch {
+    return false;
+  }
+}
+
 function v1MaxAge(body) {
   try {
     const row = JSON.parse(body);
@@ -1394,6 +1474,14 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
     if (cacheFollow && reported && reported !== cacheFollow) {
       logLine("v1_analyze_follow", { asked: cacheFollow, applied: reported, known: known || undefined, worker, ...ids });
     }
+    // How scan spells the coordinate we asked about. Only scan knows: it is
+    // the side that runs the normalizer, and it answers in the caller's words
+    // by design. Used for filing, never for answering - the body keeps the
+    // spelling the caller used, because that is the question they asked.
+    const canonicalPurl = locator?.type === "purl" ? cleanPurl(upstream.headers.get("X-Scan-Purl")) : null;
+    if (canonicalPurl && canonicalPurl !== locator.value) {
+      logLine("v1_purl_canonical", { asked: locator.value, canonical: canonicalPurl, ...ids });
+    }
     logLine("v1_analyze", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
     // The caller's stream is also the cache observer. Keeping one pipeline
     // means a minutes-long analysis is request work, not a minutes-long
@@ -1401,7 +1489,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
     // bounded Cache API / KV writes to waitUntil.
     const cacheDecision = cacheFollow
       ? (decided) => {
-          waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, decided, storedFollow));
+          waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, decided, storedFollow, canonicalPurl));
         }
       : null;
     const streamed = new Headers({
@@ -1513,7 +1601,7 @@ async function v1Resume(env, ctx, path, bytes, ids, locator, dead) {
 // Store a completed stream's decision where the cheap route will find it.
 // This function starts only after the decision arrives, so waitUntil covers
 // bounded cache writes rather than the analysis that produced them.
-async function cacheV1Decision(env, ctx, origin, locator, decided, follow) {
+async function cacheV1Decision(env, ctx, origin, locator, decided, follow, canonicalPurl) {
   const ids = v1LocatorIds(ctx.rid, null, locator ? [locator] : []);
   const document = v1DocumentBody(decided);
   if (!document) {
@@ -1527,8 +1615,8 @@ async function cacheV1Decision(env, ctx, origin, locator, decided, follow) {
   }
   const cache = await getCache(env);
   const requestedPath = v1CachePath(null, locator ? [locator] : [], follow);
-  await cacheV1Aliases(env, cache, origin, requestedPath, locator, document, follow);
-  logLine("v1_cache_write", { stored: true, follow, max_age: maxAge, keys: v1CacheAliasPaths(origin, requestedPath, locator, document, follow).length, ...ids });
+  await cacheV1Aliases(env, cache, origin, requestedPath, locator, document, follow, canonicalPurl);
+  logLine("v1_cache_write", { stored: true, follow, max_age: maxAge, keys: v1CacheAliasPaths(origin, requestedPath, locator, document, follow, canonicalPurl).length, ...ids });
 }
 
 // Add phase telemetry to the progress stream without changing the cached
@@ -2172,10 +2260,38 @@ function classMs(stats, hint) {
   // The cheap-source race asks the index, not the analyzer. Predicting it from
   // an analysis average would be wrong by a factor of a thousand.
   if (hint.lookup) return lookupMsOf(stats);
-  const bucket =
-    hint.bytes != null
-      ? stats.avg_job_ms_by_size?.[sizeBucket(hint.bytes)]
-      : stats.avg_job_ms_by_type?.[purlType(hint.purl)];
+  if (hint.bytes == null) return bucketMs(stats.avg_job_ms_by_type?.[purlType(hint.purl)]);
+  const name = sizeBucket(hint.bytes);
+  // What this worker charged for this size under real load, and failing that,
+  // what it took on the same size on its own time.
+  //
+  // A worker is only measured on work it was sent, and what it was sent is
+  // this router's own doing - so a worker ranked slow is asked for nothing,
+  // reports nothing, and stays ranked slow on the evidence of never having
+  // been tried. Measured: a 128-slot worker sat at zero jobs for a whole
+  // session while a 4-slot one took the whales, and the fleet's fastest
+  // server on small work was ranked last on seven archives it happened to be
+  // handed once.
+  //
+  // The idle series is the way out and costs nothing to collect: every worker
+  // analyses hopper queue work on capacity it is not selling, drawn from the
+  // same queue as every other worker and chosen by nobody's routing. The
+  // worker with no traffic produces the most of it, which is exactly backwards
+  // from the starvation above.
+  //
+  // Second rather than first: idle work runs uncontended, so it flatters a
+  // busy server. Where this worker has really served this size, that is the
+  // better answer; the idle figure is for the case there is no answer at all.
+  // An older worker publishes no idle series, and then this is what it was.
+  return (
+    bucketMs(stats.avg_job_ms_by_size?.[name]) ?? bucketMs(stats.avg_job_ms_by_size_idle?.[name])
+  );
+}
+
+// One bucket's figure: the window if it is settled, else the lifetime mean.
+// Both floor themselves at MIN_CLASS_SAMPLES, so a thin bucket reads as no
+// answer rather than a confident wrong one.
+function bucketMs(bucket) {
   if (!bucket) return null;
   return recentMs(bucket.recent) ?? meanMs(bucket);
 }
@@ -2618,6 +2734,18 @@ function backendHeaders(token, ctx) {
   const headers = { "x-request-id": ctx.rid };
   if (tok) headers.authorization = `Bearer ${tok}`;
   return headers;
+}
+
+// A PURL from a backend header, bounded before it can become a cache key.
+// Length-capped and ASCII-only: a key is a URL we build, and an unbounded or
+// unspellable one is either a request we cannot make or an entry nothing can
+// read back. Must look like a PURL, so a confused worker cannot file an
+// answer under something that is not a coordinate at all.
+function cleanPurl(raw) {
+  const value = String(raw || "").trim();
+  if (!value || value.length > 512) return null;
+  if (!/^pkg:[a-zA-Z0-9.+-]+\/[\x21-\x7e]*$/.test(value)) return null;
+  return value;
 }
 
 function tokenList(raw) {
@@ -3089,6 +3217,9 @@ export const _test = {
   annotatedV1Stream,
   tokenEq,
   tokenList,
+  classMs,
+  cleanPurl,
+  v1CacheAliasPaths,
   numEnv,
   reset() {
     scanBreakers.clear();

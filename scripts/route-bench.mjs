@@ -53,13 +53,22 @@ async function routes() {
 // One timed analysis. `pin` null lets the router choose.
 async function trial(purl, pin) {
   const t0 = Date.now();
-  const res = await fetch(`${BEAMLINE}/analyze?purl=${encodeURIComponent(purl)}`, {
+  const res = await fetch(`${BEAMLINE}/v1/analyze?purl=${encodeURIComponent(purl)}`, {
     method: "POST",
     headers: pin ? { ...headers, "x-beamline-pin": pin } : headers,
   });
   const ms = Date.now() - t0;
-  const body = await res.json().catch(() => ({}));
-  return { ms, status: res.status, source: res.headers.get("x-beamline-source"), lvl: body.lvl };
+  // v1 answers NDJSON: progress frames then one decision line. The decision is
+  // the last non-empty line; anything before it is progress and carries no verdict.
+  const text = await res.text();
+  const last = text.trimEnd().split("\n").filter(Boolean).pop() || "";
+  let body = {};
+  try {
+    body = JSON.parse(last);
+  } catch {
+    body = {};
+  }
+  return { ms, status: res.status, source: res.headers.get("x-beamline-source"), lvl: body.lvl ?? body.fires_at };
 }
 
 const plan = await routes();
@@ -89,7 +98,7 @@ for (const purl of purls) {
 
 // --- scoring -------------------------------------------------------------
 // A trial counts only if every arm was genuinely analyzed by a worker.
-const scored = rows.filter((r) => [...r.timings.values()].every((v) => v.source === "scan" && v.status === 200));
+const scored = rows.filter((r) => [...r.timings.values()].every((v) => v.source === "scan:analysis" && v.status === 200));
 console.log(`${scored.length}/${rows.length} trials scan-served and scored\n`);
 if (!scored.length) {
   console.log("Nothing to score: every trial was answered from cache or hopper.");

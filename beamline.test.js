@@ -19,6 +19,49 @@ afterEach(() => {
   _test.reset();
 });
 
+test("a worker with no request history for a size is ranked on its idle work", () => {
+  const thin = { jobs: 1, avg_ms: 900, recent: { samples: 1, p80_ms: 900, mean_ms: 900 } };
+  const settled = (ms) => ({ jobs: 40, avg_ms: ms, recent: { samples: 40, p80_ms: ms, mean_ms: ms } });
+  const hint = { bytes: 512 * 1024 };
+  // Nothing to go on but idle work: the starved worker still gets a number,
+  // which is the whole point - otherwise it is never tried and never measured.
+  assert.equal(
+    _test.classMs({ avg_job_ms_by_size: { le_1mb: thin }, avg_job_ms_by_size_idle: { le_1mb: settled(4200) } }, hint),
+    4200,
+  );
+  // Real load beats idle where both are settled: idle work runs uncontended.
+  assert.equal(
+    _test.classMs({ avg_job_ms_by_size: { le_1mb: settled(7000) }, avg_job_ms_by_size_idle: { le_1mb: settled(4200) } }, hint),
+    7000,
+  );
+  // A worker too old to publish an idle series behaves exactly as before.
+  assert.equal(_test.classMs({ avg_job_ms_by_size: { le_1mb: settled(7000) } }, hint), 7000);
+  assert.equal(_test.classMs({ avg_job_ms_by_size: { le_1mb: thin } }, hint), null);
+});
+test("a decision is filed under scan's canonical spelling as well as the caller's", () => {
+  const body = JSON.stringify({ purl: "pkg:golang/github.com/gofrs/uuid@v4.4.0+incompatible", sha256: "a".repeat(64), status: "analyzed", severity: "benign", fires_at: -1 });
+  const locator = { type: "purl", value: "pkg:golang/github.com/gofrs/uuid@v4.4.0+incompatible" };
+  const requested = _test.v1CacheAliasPaths("https://b.example", "/v1/lookup?purl=x", locator, body, "all");
+  const canonical = _test.v1CacheAliasPaths("https://b.example", "/v1/lookup?purl=x", locator, body, "all", "pkg:golang/github.com/gofrs/uuid@v4.4.0%2Bincompatible");
+  const urls = (keys) => keys.map((k) => k.url);
+  // The two spellings are one artifact. Without the canonical key the second
+  // spelling to arrive buys an analysis the first already paid for.
+  const added = urls(canonical).filter((u) => !urls(requested).includes(u));
+  assert.equal(added.length, 1);
+  assert.match(added[0], /v4\.4\.0%252Bincompatible/);
+});
+
+test("a canonical purl that is not a purl is not made into a cache key", () => {
+  const body = JSON.stringify({ sha256: "b".repeat(64), status: "analyzed", severity: "benign", fires_at: -1 });
+  const locator = { type: "purl", value: "pkg:npm/left-pad@1.3.0" };
+  const base = _test.v1CacheAliasPaths("https://b.example", "/v1/lookup?purl=x", locator, body, "all");
+  for (const bad of ["", "   ", "not-a-purl", "https://evil.example/x", "pkg:" + "a".repeat(600)]) {
+    assert.equal(_test.cleanPurl(bad), null, `rejects ${JSON.stringify(bad)}`);
+    const got = _test.v1CacheAliasPaths("https://b.example", "/v1/lookup?purl=x", locator, body, "all", _test.cleanPurl(bad));
+    assert.deepEqual(got.map((k) => k.url), base.map((k) => k.url));
+  }
+  assert.equal(_test.cleanPurl("pkg:golang/x.io/y@v1%2Bz"), "pkg:golang/x.io/y@v1%2Bz");
+});
 test("scan timeout default is 1800s", () => {
   assert.equal(_test.DEFAULT_SCAN_TIMEOUT_MS, 1_800_000);
 });
@@ -444,6 +487,53 @@ test("numEnv keeps a bad knob from becoming a bad default", () => {
 // Affinity is a preference, not a pin. A run we cannot reach is not worth
 // waiting for, so a worker whose breaker is open must not capture the request.
 
+// A worker whose corpus is unreachable answers 200 `unavailable`. That is an
+// outage, not an answer, and the fleet exists so that one of them failing is
+// not all of them failing.
+test("v1 lookup: an unavailable worker does not end the search", async () => {
+  const outage = await mockBackend({
+    // `decision`, not `status`: mockBackend reads a `status` field as an HTTP
+    // status override. Both spellings mark an outage to the code under test.
+    v1: { decision: "unavailable", cause: "corpus_unreachable", purl: "pkg:npm/app@1.0.0", severity: "unknown", fires_at: null, findings: [] },
+  });
+  const healthy = await mockBackend({
+    // Same reason as above: `decision` is the field a worker answers with, and
+    // normalizeV1Row turns allow/block into the `status` the caller reads.
+    v1: { decision: "allow", purl: "pkg:npm/app@1.0.0", sha256: "a".repeat(64), severity: "benign", fires_at: -1, findings: [], engine_version: "2.8.0", analyzed_at: "2026-09-01T00:00:00Z" },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: `${outage.url},${healthy.url}` });
+  try {
+    const res = await handle(new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fapp%401.0.0"), env, waitCtx().ctx);
+    assert.equal(res.status, 200);
+    const body = JSON.parse(await res.text());
+    assert.equal(body.status, "analyzed", "the second worker's answer is the one relayed");
+    assert.equal(outage.hits.v1, 1, "the unavailable worker was asked first");
+    assert.ok(healthy.hits.v1 >= 1, "and the search carried on past it");
+  } finally {
+    await outage.close();
+    await healthy.close();
+  }
+});
+
+// When nobody can find out, scan's own account of the outage is better than
+// one invented here: it names the address that failed.
+test("v1 lookup: an outage is relayed once the fleet is exhausted", async () => {
+  const outage = await mockBackend({
+    // `decision`, not `status`: mockBackend reads a `status` field as an HTTP
+    // status override. Both spellings mark an outage to the code under test.
+    v1: { decision: "unavailable", cause: "corpus_unreachable", purl: "pkg:npm/app@1.0.0", severity: "unknown", fires_at: null, findings: [] },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: outage.url });
+  try {
+    const res = await handle(new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fapp%401.0.0"), env, waitCtx().ctx);
+    assert.equal(res.status, 200);
+    const body = JSON.parse(await res.text());
+    assert.equal(body.status, "unavailable");
+    assert.equal(body.cause, "corpus_unreachable", "scan's reason, not ours");
+  } finally {
+    await outage.close();
+  }
+});
 // --- /v1/analyze --------------------------------------------------------
 
 test("v1 analyze: follow is normalized and forwarded", async () => {

@@ -48,6 +48,19 @@ test("go index is NDJSON Path/Version", () => {
   ]);
 });
 
+test("go index skips module paths a PURL cannot express", () => {
+  const text = [
+    '{"Path":"github.com/foo/bar","Version":"v1.0.0"}',
+    // No namespace segment: pkg:golang/ requires one, so scan rejects these
+    // with 400 invalid_purl. Asking about them measures our own bad input.
+    '{"Path":"monks.co","Version":"v0.0.0-20260901164343-bb69f3e524b7"}',
+    '{"Path":"allwright.dev","Version":"v0.1.0"}',
+  ].join("\n");
+  assert.deepEqual(_test.parseGoIndex(text), [
+    { name: "github.com/foo/bar", version: "v1.0.0" },
+  ]);
+});
+
 test("crates index commit subjects match forager", () => {
   const cases = [
     ["Update crate `serde`", "serde", true],
