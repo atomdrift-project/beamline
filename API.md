@@ -399,17 +399,41 @@ There is no `503` for a package we could not reach a worker for. That is a
 | header | |
 | --- | --- |
 | `X-Request-Id` | Send your own to correlate with our logs. |
-| `X-Beamline-Source` | `cache`, `kv`, `scan:bloom`, `scan:analysis`, `scan:replica`, `scan:primary`, `none`. Operators only. |
+| `X-Beamline-Source` | `cache`, `kv`, `scan:index`, `scan:cached`, `scan:bloom`, `scan:replica`, `scan:primary`, `scan:analysis`, `none`. Operators only. |
+| `X-Cache-Layer` | How deep the answer came from, `0`–`6`. Absent when nothing answered. Operators only. |
 | `X-Beamline-Worker` | Which worker answered. For operators. |
 | `X-Beamline-Follow` | The `follow` policy that actually answered, when a wider stored policy served a narrower question. Absent on an exact match. |
 | `Cache-Control` | See below. |
 | `Content-Type` | `application/json`; `x-ndjson` from `/v1/analyze`. |
 
-`scan:bloom` means the scan server answered from Bloom-derived knowledge;
-`scan:analysis` means it answered from a locally held or newly produced
-analysis; and `scan:replica` / `scan:primary` mean it obtained the answer from
-Hopper's replica or primary. `cache` and `kv` identify Beamline's own edge
-layers. `none` means no backend produced an answer.
+`scan:index` means the scan server answered from a verdict it already held and
+`scan:cached` from an analysis it had already run — neither spent a slot.
+`scan:bloom` means it answered from Bloom-derived knowledge, and
+`scan:replica` / `scan:primary` mean it reached Hopper. `scan:analysis` means no
+layer held the answer and a worker produced it. `cache` and `kv` identify
+Beamline's own edge layers, and `none` means no backend produced an answer.
+
+`scan:index` and `scan:analysis` were one value until they were separated. They
+are the two ends of the same route — a held verdict and a fresh run — and while
+they shared a name every miss was counted as a hit.
+
+`X-Cache-Layer` numbers those on one scale, deepest last, so it can be averaged:
+
+| layer | | source |
+| --- | --- | --- |
+| `0` | Workers Cache | `cache` |
+| `1` | Workers KV | `kv` |
+| `2` | the worker | `scan:index`, `scan:cached` |
+| `3` | Bloom | `scan:bloom` |
+| `4` | Hopper replica | `scan:replica` |
+| `5` | Hopper primary | `scan:primary` |
+| `6` | uncached work | `scan:analysis` |
+
+Work is numbered rather than left off the scale, because an average is only a
+cost proxy if the most expensive outcome is also the largest number. `none` is
+not a depth and carries no header: it is a failure to reach any layer, and
+counting it as one would pull the average toward cheap exactly when the fleet
+is unreachable.
 
 ## Caching
 

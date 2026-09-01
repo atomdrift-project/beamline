@@ -70,7 +70,7 @@ for (const w of workers) if (!predicted.has(w)) predicted.set(w, null);
 console.log(`beamline ${BEAMLINE}`);
 console.log(`workers  ${workers.join(", ")}`);
 console.log(`predicted (unsized): ${[...predicted].map(([w, e]) => `${w}=${e ?? "?"}ms`).join("  ")}`);
-console.log(`hedge ${plan.routes[0].hedge_ms}ms  informed=${plan.routes[0].informed}\n`);
+console.log(`informed=${plan.routes[0].informed}\n`);
 
 const rows = [];
 for (const purl of purls) {

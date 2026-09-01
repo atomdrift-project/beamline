@@ -5,6 +5,22 @@ compatibility_date = "2026-08-19"
 # 200s are stored in caches.default (Cloudflare Cache API) by beamline.js.
 # SCAN_URL is not stored here; make deploy-cf passes it from the environment.
 
+# Per-request telemetry, aggregated by the SQL API rather than scraped.
+#
+# A Worker has no /metrics to scrape: it is stateless and runs in every colo, so
+# a scrape would report one isolate in one city. Analytics Engine is the shape
+# that fits. The dataset is created on first write and needs no account-specific
+# id, so unlike the KV namespace it lives here rather than in the config the
+# deploy generates.
+#
+# One point per v1 request: blobs are route, source, answering follow policy,
+# worker, ecosystem and status; doubles are the cache layer and time-to-response.
+# No index — the only high-cardinality field would be the caller's PURL, and that
+# is their dependency list.
+[[analytics_engine_datasets]]
+binding = "BEAMLINE_AE"
+dataset = "beamline_requests"
+
 # logLine emits one object per lookup carrying `src`, which names the layer
 # that answered — cache, kv, or scan. Workers Logs
 # indexes those fields, so the cache hit rate is a query rather than a guess.

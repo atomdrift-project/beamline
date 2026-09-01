@@ -8,14 +8,18 @@ One JavaScript file, no npm packages. It runs as `node local.js` or as a
 Cloudflare Worker. Hopper and scan sit behind Cloudflare Tunnels and their
 URLs come from the environment; the tree does not name a host.
 
-`SCAN_URL` may be a comma-separated list of interchangeable scan workers.
-Bloom and analysis are both raced across every healthy one; the first answer wins and the
-losing connections are dropped, which cancels their analyses and frees their
-slots, so only the winner's result reaches hopper. A flat race costs one
-analysis slot per worker per sample — set `SCAN_RACE_DELAY_MS` to stagger the
-starts and give a fast worker the chance to answer before the next is asked.
-Each worker gets its own circuit breaker, so a sick one drops out of the race
-without taking scanning down with it.
+`SCAN_URL` may be a comma-separated list of interchangeable scan workers. One
+is asked at a time, favourite first, and the next is reached only when the one
+before it refuses or fails — so a sample costs one analysis slot however many
+workers are configured. The order is measured rather than configured: each
+worker publishes its own timings and beamline ranks on them per size and
+package type. `GET /_/routes` shows the order it would use right now.
+
+Beamline raced every healthy worker once and does not any more: a losing arm
+cannot be called off across a Worker abort, the Cloudflare edge, and a tunnel,
+so it was measured still analysing 77 seconds after it lost. Each worker has
+its own circuit breaker, so a sick one leaves the order without taking scanning
+down with it.
 
 An analysis stream survives losing its worker. A v1 stream is progress frames
 followed by one decision, so until that decision goes out nothing the caller has

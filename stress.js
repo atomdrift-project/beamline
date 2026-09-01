@@ -121,9 +121,7 @@ async function main() {
     const baseJobs = mixJobs(popularJobs(), samples || Infinity);
     const jobs = repeatJobs(baseJobs, repeat);
     process.stderr.write(`submitting ${jobs.length} popular PURLs\n`);
-    const before = await raceSnapshot();
     const result = await runRoutes(jobs, []);
-    printRace(raceDelta(before, await raceSnapshot()));
     if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, ...result, contract });
     process.exit(result.bugs.length || contract.length ? 1 : 0);
   }
@@ -151,9 +149,7 @@ async function main() {
   }
 
   process.stderr.write(`submitting ${jobs.length} PURLs\n`);
-  const before = await raceSnapshot();
   const result = await runRoutes(jobs, feedErrors);
-  printRace(raceDelta(before, await raceSnapshot()));
   if (outPath) await writeOut(outPath, { scanUrl, hopperUrl, beamlineUrl, ...result, contract });
   process.exit(result.bugs.length || contract.length ? 1 : 0);
 }
@@ -788,76 +784,6 @@ function logRow(r) {
   if (r.sha) extra += ` sha=${String(r.sha).slice(0, 12)}`;
   if (r.issues && r.issues.length) extra += ` [${r.issues.join("; ")}]`;
   process.stderr.write(`${tag} ${ms}ms ${src} ${eco} ${r.purl}  ${extra}${how}\n`);
-}
-
-// beamline's per-worker race tallies. Null when the endpoint is absent (an
-// older deployment) — reported as unavailable rather than as zero, because
-// "no work was cancelled" and "nobody counted" look identical otherwise.
-async function raceSnapshot() {
-  if (!beamlineUrl) return null;
-  try {
-    const resp = await get(`${beamlineUrl}/_/routes?size=none`, META_TIMEOUT_MS, token ? { authorization: `Bearer ${token}` } : {});
-    if (!resp.ok) return null;
-    const body = await readJson(resp);
-    const out = new Map();
-    for (const w of body?.workers || []) if (w.race) out.set(w.worker, w.race);
-    return out;
-  } catch {
-    return null;
-  }
-}
-
-// after - before, per worker. An isolate recycled mid-run restarts its counters,
-// which shows up as a smaller "after"; treat that worker's window as starting
-// from zero and say so, rather than reporting a negative count.
-function raceDelta(before, after) {
-  if (!after) return null;
-  const keys = ["started", "won", "never_started", "dropped", "failed"];
-  const rows = [];
-  let recycled = false;
-  for (const [worker, a] of after) {
-    const b = (before && before.get(worker)) || null;
-    const reset = b && keys.some((k) => (a[k] || 0) < (b[k] || 0));
-    if (reset) recycled = true;
-    const d = { worker };
-    for (const k of keys) d[k] = (a[k] || 0) - (reset || !b ? 0 : b[k] || 0);
-    rows.push(d);
-  }
-  return { rows, recycled };
-}
-
-function printRace(delta) {
-  if (!delta) {
-    process.stdout.write("\nrace     unavailable (beamline has no /_/routes, or it declined)\n");
-    return;
-  }
-  const tot = delta.rows.reduce(
-    (a, r) => ({
-      started: a.started + r.started,
-      won: a.won + r.won,
-      never_started: a.never_started + r.never_started,
-      dropped: a.dropped + r.dropped,
-    }),
-    { started: 0, won: 0, never_started: 0, dropped: 0 },
-  );
-  // Every arm beamline created: the ones it ran, plus the ones the hedge
-  // spared. That total is the denominator for "what fraction was wasted".
-  const arms = tot.started + tot.never_started;
-  const pct = (x) => (arms ? `${((x / arms) * 100).toFixed(1)}%` : "-");
-  process.stdout.write(`\nrace     ${arms} arms for ${tot.won} verdicts\n`);
-  process.stdout.write(`  spared by hedge  ${tot.never_started} (${pct(tot.never_started)})  never dispatched\n`);
-  process.stdout.write(`  cancelled        ${tot.dropped} (${pct(tot.dropped)})  work started, then beaten\n`);
-  if (delta.recycled) {
-    process.stdout.write("  note: an isolate was recycled mid-run; these undercount\n");
-  }
-  process.stdout.write("\nby worker\n");
-  for (const r of delta.rows.sort((a, b) => b.won - a.won)) {
-    process.stdout.write(
-      `  ${r.worker.padEnd(34)} won ${String(r.won).padStart(4)}  ran ${String(r.started).padStart(4)}` +
-        `  spared ${String(r.never_started).padStart(4)}  cancelled ${String(r.dropped).padStart(4)}` +
-        `  failed ${String(r.failed).padStart(3)}\n`,
-    );
-  }
 }
 
 function summarize(rows) {

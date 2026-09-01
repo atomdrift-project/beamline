@@ -29,7 +29,6 @@ SCAN_TOKEN ?=
 export BEAMLINE_TOKEN
 export HOPPER_TOKEN
 export SCAN_TOKEN
-SCAN_RACE_DELAY_MS ?=
 SCAN_RETRIES ?=
 KV_NAMESPACE ?= beamline
 
@@ -64,7 +63,7 @@ stress-test:
 	    echo "starting beamline on :$(PORT)"; \
 	    SCAN_URL="$(SCAN_URL)" PORT="$(PORT)" BEAMLINE_TOKEN="$(BEAMLINE_TOKEN)" \
 	      SCAN_TOKEN="$(SCAN_TOKEN)" \
-	      SCAN_RACE_DELAY_MS="$(SCAN_RACE_DELAY_MS)" SCAN_RETRIES="$(SCAN_RETRIES)" \
+	      SCAN_RETRIES="$(SCAN_RETRIES)" \
 	      node local.js & started=$$!; \
 	    i=0; \
 	    while [ $$i -lt 25 ]; do \
@@ -116,7 +115,8 @@ kv-create:
 # answer goes to a scan worker, and a worker that does not know asks the corpus
 # itself. Passing one here would configure a service this Worker cannot reach
 # and does not need a credential for.
-# SCAN_URL may list several workers, comma-separated, to race them:
+# SCAN_URL may list several workers, comma-separated. One is asked at a time,
+# favourite first, so extra workers are fallbacks rather than parallel capacity:
 #   SCAN_URL=https://scan-a.example,https://scan-b.example make deploy-cf
 # Backend credentials are uploaded as Worker secrets after the deploy:
 #   SCAN_TOKEN       # beamline -> scan

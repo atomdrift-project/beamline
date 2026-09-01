@@ -806,6 +806,166 @@ test("v1 lookup: a wider policy's answer serves a narrower question, never the r
   }
 });
 
+// A miss is cached too, and it is not an answer about a policy — it is a
+// statement about the artifact, true only until something analyzes it. This is
+// the production failure the ordering above was missing: poppy looks up a
+// release nobody holds, which files `unanalyzed` under the default policy, and
+// then analyzes it under `follow=all`, which files the verdict under `all`. For
+// the 60s the miss stayed cached, every caller asking the default question was
+// told the artifact was unanalyzed — a minute after it had been analyzed, and
+// with the verdict sitting one candidate further along the same walk. Measured
+// against the fleet before this test existed: 60.3s, 60.1s, 22.5s, 13.8s.
+test("v1 lookup: a cached miss does not hide a wider policy's verdict", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const decided = {
+    decision: "allow",
+    purl,
+    sha256: HELLO_SHA,
+    severity: "benign",
+    fires_at: -1,
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  // Nothing is held until the analysis runs, which is what files the miss.
+  let analyzed = false;
+  const scan = await mockBackend({
+    v1: () => (analyzed ? decided : { decision: "unanalyzed", purl, sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    analyzeStream: () => {
+      analyzed = true;
+      return [JSON.stringify(decided)];
+    },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    // The miss, filed under the policy poppy's lookups name: none at all.
+    const miss = waitCtx();
+    const missed = await (await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      miss.ctx,
+    )).json();
+    await miss.flush();
+    assert.equal(missed.status, "unanalyzed");
+
+    // The analysis, under the wider policy the precache pass asks for.
+    const run = waitCtx();
+    const res = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}&follow=all`, { method: "POST" }),
+      env,
+      run.ctx,
+    );
+    assert.equal(res.status, 200);
+    await res.text();
+    await run.flush();
+
+    // The same bare question again. The miss is a minute from expiring and the
+    // verdict is two candidates past it; the verdict is the answer.
+    const after = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      waitCtx().ctx,
+    );
+    const body = await after.json();
+    assert.equal(body.status, "analyzed", "a cached miss outranked the verdict that answered it");
+    assert.equal(after.headers.get("X-Beamline-Source"), "cache");
+    assert.equal(after.headers.get("X-Beamline-Follow"), "all");
+  } finally {
+    await scan.close();
+  }
+});
+
+// The fallback the rule above must not cost us. An artifact nobody holds is
+// still answered from the cached miss rather than from the fleet: that entry is
+// why misses are cached at all, and a lookup is the route a proxy calls on
+// every install.
+test("v1 lookup: a cached miss still answers when nothing wider holds a verdict", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const scan = await mockBackend({
+    v1: () => ({ decision: "unanalyzed", purl, sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const seed = waitCtx();
+    await (await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      seed.ctx,
+    )).json();
+    await seed.flush();
+    const asked = scan.hits.v1;
+
+    const again = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      waitCtx().ctx,
+    );
+    const body = await again.json();
+    assert.equal(body.status, "unanalyzed");
+    assert.equal(again.headers.get("X-Beamline-Source"), "cache");
+    // Its own question answered it, so no other policy is named.
+    assert.equal(again.headers.get("X-Beamline-Follow"), null);
+    assert.equal(scan.hits.v1, asked, "a cached miss stopped being served and the fleet paid for it");
+  } finally {
+    await scan.close();
+  }
+});
+
+// The same rule on the expensive route. A miss filed under the narrow policy
+// used to end the walk here too, and ending it here does not merely answer
+// wrongly — it sends us off to spend the most expensive thing this service
+// does on a verdict a wider entry was already holding.
+test("v1 analyze: a cached miss does not buy an analysis a wider entry already answers", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const decided = {
+    decision: "allow",
+    purl,
+    sha256: HELLO_SHA,
+    severity: "benign",
+    fires_at: -1,
+    engine_version: "2.8.0",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  const scan = await mockBackend({
+    v1: () => ({ decision: "unanalyzed", purl, sha256: null, severity: null, fires_at: null, reason: null, findings: [], engine_version: null, analyzed_at: null }),
+    analyzeStream: [JSON.stringify(decided)],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    // A miss under `none`, then a verdict under `all`.
+    const miss = waitCtx();
+    await (await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=none`),
+      env,
+      miss.ctx,
+    )).json();
+    await miss.flush();
+
+    const run = waitCtx();
+    await (await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}&follow=all`, { method: "POST" }),
+      env,
+      run.ctx,
+    )).text();
+    await run.flush();
+    const ran = scan.hits.analyze;
+
+    // Asking to analyze under the narrow policy is answered from the wider
+    // entry, without a second run.
+    const res = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}&follow=none`, { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    const body = JSON.parse((await res.text()).trim());
+    assert.equal(body.severity, "benign");
+    assert.equal(res.headers.get("X-Beamline-Source"), "cache");
+    assert.equal(res.headers.get("X-Beamline-Follow"), "all");
+    assert.equal(scan.hits.analyze, ran, "a cached miss bought an analysis we were already holding");
+  } finally {
+    await scan.close();
+  }
+});
+
 // An analysis outlives the request that asked for it. Scan detaches the run
 // from the connection that started it, so a caller who gives up at their own
 // timeout leaves a verdict that is still coming and that nothing else will
@@ -904,6 +1064,325 @@ test("v1 analyze: an abandoned upload is dropped rather than drained", async () 
     release();
     await scan.close();
   }
+});
+
+// Scan applies the requested selection on top of its own configuration, so the
+// policy that produced an answer is scan's to report. Filing under what we
+// asked for rather than what it ran is how a fleet ends up with two services
+// each holding a defensible default, disagreeing by one reference kind, and
+// silently keeping nothing.
+test("v1 analyze: the verdict is filed under the policy scan reports it applied", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const verdict = {
+    decision: "allow",
+    purl,
+    sha256: HELLO_SHA,
+    severity: "benign",
+    fires_at: -1,
+    findings: [],
+    engine_version: "test",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  const scan = await mockBackend({
+    analyzeStream: [`{"decision":"allow","fires_at":-1,"purl":"${purl}","engine_version":"test"}`],
+    analyzeHeaders: { "x-scan-follow": "all" },
+    v1: () => verdict,
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ctx = waitCtx();
+  try {
+    // Asked at the PURL default, which is `references`.
+    await (
+      await handle(
+        new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+        env,
+        ctx.ctx,
+      )
+    ).text();
+    await ctx.flush();
+
+    // Scan said it ran `all`, so `all` is the question this answer answers —
+    // and asking it must not reach a worker. Filed under `references` instead,
+    // this lookup would miss: `references` does not contain `all`.
+    const before = scan.hits.v1;
+    const wide = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=all`),
+      env,
+      waitCtx().ctx,
+    );
+    await wide.json();
+    assert.equal(wide.headers.get("X-Beamline-Source"), "cache");
+    assert.equal(
+      scan.hits.v1,
+      before,
+      "an answer scan produced at follow=all was filed under the policy we asked for",
+    );
+  } finally {
+    await scan.close();
+  }
+});
+
+// A worker too old to report its policy, and one that reports something this
+// service cannot spell, are the same case: we know only what we resolved, so
+// that is what the answer is filed under. An unparseable name is worse than an
+// absent one — filed under it, the answer is unreachable by every later
+// question — so it is ignored rather than trusted.
+test("v1 analyze: an absent or unspellable reported policy falls back to our own", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const verdict = {
+    decision: "allow",
+    purl,
+    sha256: HELLO_SHA,
+    severity: "benign",
+    fires_at: -1,
+    findings: [],
+    engine_version: "test",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  for (const reported of [null, "sideways", "references,nonsense"]) {
+    const scan = await mockBackend({
+      analyzeStream: [`{"decision":"allow","fires_at":-1,"purl":"${purl}","engine_version":"test"}`],
+      analyzeHeaders: reported ? { "x-scan-follow": reported } : undefined,
+      v1: () => verdict,
+    });
+    const env = testEnv(DEAD, { SCAN_URL: scan.url });
+    const ctx = waitCtx();
+    try {
+      await (
+        await handle(
+          new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+          env,
+          ctx.ctx,
+        )
+      ).text();
+      await ctx.flush();
+
+      // Filed under `references`, which we resolved ourselves. It answers the
+      // question we asked...
+      const narrow = await handle(
+        new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+        env,
+        waitCtx().ctx,
+      );
+      await narrow.json();
+      assert.equal(
+        narrow.headers.get("X-Beamline-Source"),
+        "cache",
+        `reported=${reported}: the answer was not filed under the policy we resolved`,
+      );
+
+      // ...and not the wider one nobody claimed to have run.
+      const before = scan.hits.v1;
+      await (
+        await handle(
+          new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=all`),
+          env,
+          waitCtx().ctx,
+        )
+      ).json();
+      assert.equal(
+        scan.hits.v1,
+        before + 1,
+        `reported=${reported}: an unclaimed wider policy was answered from cache`,
+      );
+    } finally {
+      await scan.close();
+    }
+  }
+});
+
+// Every answer says how deep it had to go, on one scale, so a dashboard can
+// average it and mean something by the number. Work is the largest value rather
+// than a value outside the scale: the average is only a cost proxy if the most
+// expensive outcome is also the deepest.
+test("v1: every source reports the layer that served it", async () => {
+  const { CACHE_LAYERS, beamlineSource } = _test;
+  const cacheLayer = (source) => CACHE_LAYERS.get(source);
+  assert.deepEqual(
+    ["cache", "kv", "scan:index", "scan:cached", "scan:bloom", "scan:replica", "scan:primary", "scan:analysis"]
+      .map(cacheLayer),
+    [0, 1, 2, 2, 3, 4, 5, 6],
+  );
+
+  // Nothing answered is not a depth. Numbering it would pull the average
+  // toward "cheap" exactly when the fleet cannot be reached.
+  assert.equal(cacheLayer("none"), undefined);
+
+  // A worker's index hit and a fresh run are the same route and used to be the
+  // same value. They are the two ends of the scale.
+  assert.notEqual(cacheLayer(beamlineSource("scan:index")), cacheLayer(beamlineSource("scan:analysis")));
+
+  // An unrecognised source from a half-rolled deployment counts as work. It
+  // overstates the bill rather than the hit rate, which is the direction that
+  // gets looked at.
+  assert.equal(cacheLayer(beamlineSource("something-new")), 6);
+  // ...and the pre-split spelling of a held verdict still reads as one.
+  assert.equal(cacheLayer(beamlineSource("index")), 2);
+});
+
+// The two headers are one fact. Four routes report a source — two lookup
+// layers, the analyze cache hit, and the streamed answer — and a depth missing
+// from any of them is a hole in the metric exactly where the traffic is.
+test("v1: the layer travels with the source on every route that reports one", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const verdict = {
+    decision: "allow",
+    purl,
+    sha256: HELLO_SHA,
+    severity: "benign",
+    fires_at: -1,
+    findings: [],
+    engine_version: "test",
+    analyzed_at: "2026-08-01T00:00:00Z",
+  };
+  const scan = await mockBackend({
+    v1: () => verdict,
+    v1Headers: { "x-scan-source": "scan:index" },
+    analyzeStream: [`{"decision":"allow","fires_at":-1,"purl":"${purl}","engine_version":"test"}`],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    // Straight from a worker: the source scan reported, at its own depth.
+    const fromWorker = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      waitCtx().ctx,
+    );
+    await fromWorker.json();
+    assert.equal(fromWorker.headers.get("X-Beamline-Source"), "scan:index");
+    assert.equal(fromWorker.headers.get("X-Cache-Layer"), "2");
+
+    // The same answer a moment later, now held at the edge.
+    const warm = waitCtx();
+    await (
+      await handle(
+        new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+        env,
+        warm.ctx,
+      )
+    ).json();
+    await warm.flush();
+    const fromCache = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      waitCtx().ctx,
+    );
+    await fromCache.json();
+    assert.equal(fromCache.headers.get("X-Beamline-Source"), "cache");
+    assert.equal(fromCache.headers.get("X-Cache-Layer"), "0");
+
+    // And on analyze, which is the route where a layer is worth real money.
+    const analyzed = await handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    await analyzed.text();
+    assert.equal(
+      analyzed.headers.get("X-Cache-Layer"),
+      String(_test.CACHE_LAYERS.get(analyzed.headers.get("X-Beamline-Source"))),
+      "the analyze route reported a source without its depth",
+    );
+  } finally {
+    await scan.close();
+  }
+});
+
+// A Worker cannot be scraped, so the metric is written rather than exposed.
+// What matters is that the point and the reply cannot disagree: the datapoint is
+// read back off the response, so a caller told one thing and a dashboard told
+// another is not a state this can reach.
+test("v1: every request writes one datapoint carrying what the caller was told", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const points = [];
+  const scan = await mockBackend({
+    v1: () => ({
+      decision: "allow",
+      purl,
+      sha256: HELLO_SHA,
+      severity: "benign",
+      fires_at: -1,
+      findings: [],
+      engine_version: "test",
+      analyzed_at: "2026-08-01T00:00:00Z",
+    }),
+    v1Headers: { "x-scan-source": "scan:index" },
+  });
+  const env = {
+    ...testEnv(DEAD, { SCAN_URL: scan.url }),
+    BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
+  };
+  try {
+    const res = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`),
+      env,
+      waitCtx().ctx,
+    );
+    await res.json();
+
+    assert.equal(points.length, 1, "a request wrote no datapoint, or wrote more than one");
+    const [route, source, follow, worker, eco, status] = points[0].blobs;
+    const [layer, ms] = points[0].doubles;
+    assert.equal(route, "lookup");
+    // The point says exactly what the reply said. Not what the code that
+    // produced the answer believed — what went out.
+    assert.equal(source, res.headers.get("X-Beamline-Source"));
+    assert.equal(String(layer), res.headers.get("X-Cache-Layer"));
+    assert.equal(worker, res.headers.get("X-Beamline-Worker") || "");
+    assert.equal(follow, res.headers.get("X-Beamline-Follow") || "");
+    assert.equal(eco, "npm");
+    assert.equal(status, "200");
+    assert.ok(ms >= 0 && Number.isFinite(ms), `ms was ${ms}`);
+
+    // No index: the only high-cardinality field would be the caller's PURL, and
+    // an analytics dataset is not where a customer's dependency list belongs.
+    assert.equal(points[0].indexes, undefined);
+    assert.ok(
+      !JSON.stringify(points[0]).includes("app@1.0.0"),
+      "the datapoint named the caller's package",
+    );
+  } finally {
+    await scan.close();
+  }
+});
+
+// Nothing answered is not a cheap answer. Recorded as -1 so an average over the
+// layer is not dragged toward the edge exactly when the fleet is unreachable.
+test("v1: a request nothing answered records no layer rather than a shallow one", async () => {
+  const points = [];
+  const env = {
+    ...testEnv(DEAD, { SCAN_URL: DEAD }),
+    BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
+  };
+  const res = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fapp%401.0.0"),
+    env,
+    waitCtx().ctx,
+  );
+  await res.json();
+  assert.equal(points.length, 1);
+  assert.equal(res.headers.get("X-Beamline-Source"), "none");
+  assert.equal(res.headers.get("X-Cache-Layer"), null, "`none` is not a depth");
+  assert.equal(points[0].doubles[0], -1);
+});
+
+// The binding is absent under `node local.js` and in most tests. A telemetry
+// call that throws there would take the request with it.
+test("v1: a deployment without the dataset serves requests unchanged", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  assert.equal(env.BEAMLINE_AE, undefined);
+  const res = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fapp%401.0.0"),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(res.status, 200);
+  // And a binding that is present but not callable is ignored the same way.
+  const broken = { ...env, BEAMLINE_AE: {} };
+  assert.equal(
+    (await handle(new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fapp%401.0.0"), broken, waitCtx().ctx)).status,
+    200,
+  );
 });
 
 // The body is passed through untouched. Buffering it to hand back one tidy
@@ -2336,7 +2815,7 @@ function noopCtx() {
 
 // Headers a cached answer is allowed to differ on: each describes this
 // delivery rather than the verdict being delivered.
-const DELIVERY_HEADERS = new Set(["x-beamline-source", "x-beamline-worker", "server-timing", "age", "date"]);
+const DELIVERY_HEADERS = new Set(["x-beamline-source", "x-cache-layer", "x-beamline-worker", "server-timing", "age", "date"]);
 
 // Runs one request twice and asserts the cached answer is the same answer.
 //
@@ -2604,11 +3083,8 @@ test("/_/routes dry-runs the real ranking, per size bucket", async () => {
     const small = body.routes.find((r) => r.class === "le_1mb");
     assert.equal(small.dispatch[0].worker, hostOf(specialist.url));
     assert.equal(small.dispatch[0].est_ms, 200);
-    assert.equal(small.dispatch[0].delay_ms, 0, "the favourite must go immediately");
-    assert.equal(small.dispatch[1].delay_ms, small.hedge_ms, "arm 1 waits one stagger");
-    // 3x the favourite's own estimate: the hedge is a stall detector now, so
-    // it sits well above the expected time rather than just below it.
-    assert.equal(small.hedge_ms, 600);
+    // A queue, not a set of arms: the plan is the order workers are tried in.
+    assert.ok(small.dispatch.length > 1, "the plan must name the fallbacks too");
 
     // Same fleet, same instant, opposite order — which is the whole point.
     const large = body.routes.find((r) => r.class === "le_128mb");
@@ -2738,8 +3214,6 @@ test("a worker that answers /_/stats with no history is not evidence", async () 
     const res = await handle(new Request("http://beamline/_/routes?size=none"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(route.informed, false, "a null average is a default, not knowledge");
-    assert.equal(route.hedge_ms, 0, "hedging on a made-up estimate serializes a cold fleet");
-    assert.equal(route.dispatch[1].delay_ms, 0);
   } finally {
     await Promise.all([hopper.close(), cold.close(), also.close()]);
   }
@@ -2886,15 +3360,11 @@ test("the estimate prefers a worker's windowed p80 over its lifetime mean", asyn
       },
     }),
   });
-  // A generous timeout so the ceiling does not clamp: this case is about the
-  // 3x rule, and the clamp has its own test below.
   const env = testEnv(hopper.url, { SCAN_URL: w.url, SCAN_TIMEOUT_MS: "600000" });
   try {
     const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(route.dispatch[0].est_ms, 9000, "the lifetime mean should not win over a live window");
-    // A stall detector, not a race: 3x the estimate, not a fraction of it.
-    assert.equal(route.hedge_ms, 27000);
   } finally {
     await Promise.all([hopper.close(), w.close()]);
   }
@@ -2938,27 +3408,6 @@ test("a worker publishing no window still routes on its mean", async () => {
   }
 });
 
-test("the hedge ceiling scales with the scan timeout, not a fixed 20s", async () => {
-  const hopper = await mockBackend({ bloom: "unknown" });
-  // A very slow class: 3x its p80 is far past any fixed ceiling, so the clamp
-  // is what decides. Tied to SCAN_TIMEOUT_MS it stays in scale with the work.
-  const slow = await mockBackend({
-    stats: statsFor({
-      ms: 400000,
-      bySize: {},
-      avg_job_ms_by_type: { golang: { jobs: 40, avg_ms: 400000, recent: { samples: 40, p80_ms: 400000 } } },
-    }),
-  });
-  const env = testEnv(hopper.url, { SCAN_URL: slow.url, SCAN_TIMEOUT_MS: "600000" });
-  try {
-    const res = await handle(new Request("http://beamline/_/routes?type=golang"), env, waitCtx().ctx);
-    const [route] = (await res.json()).routes;
-    // 3 * 400000 = 1.2M, clamped to half the 600s timeout.
-    assert.equal(route.hedge_ms, 300000);
-  } finally {
-    await Promise.all([hopper.close(), slow.close()]);
-  }
-});
 
 test("beamline reads the exact shape scan publishes", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });

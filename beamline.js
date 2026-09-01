@@ -73,12 +73,17 @@ const ORPHAN_BUDGET_MS = 600_000;
 
 // Per isolate, not global: on Workers each isolate counts its own failures and
 // loses them when it is recycled, so a backend outage costs BREAKER_FAILS
-// requests per live isolate, not five in total. Same for inflight — it collapses
-// duplicate work within one isolate; the cache does it across them.
+// requests per live isolate, not five in total.
+//
+// Duplicate concurrent work is collapsed by scan, which keys a flight per
+// artifact and attaches the second caller to the run already going. Beamline
+// does not also try: it ran two isolates deep on the same request often enough
+// that a per-isolate map caught almost nothing, and the cache is what actually
+// removes the repeat.
+//
 // One breaker per scan worker, keyed by base URL. A single shared breaker would
 // let one sick worker disable scanning altogether.
 const scanBreakers = new Map();
-const inflight = new Map();
 
 export default {
   fetch(request, env, ctx) {
@@ -91,9 +96,64 @@ export default {
 // when the client asked for gzip, and gzipped with no `Content-Encoding` at all
 // when it asked for identity. `node local.js` has no edge in front of it, so it
 // does its own compression.
-export function handle(request, env, ctx) {
-  return dispatch(request, env, ctx);
+export async function handle(request, env, ctx) {
+  const started = Date.now();
+  const response = await dispatch(request, env, ctx);
+  recordRequest(env, request, response, Date.now() - started);
+  return response;
 }
+
+// One datapoint per request, written from the response the caller actually got.
+//
+// A Worker cannot be scraped: it is stateless and spread across every colo, so
+// a /metrics route would report one isolate's counters in one city and change
+// on every request. Analytics Engine is the shape that fits — the Worker writes
+// points, and the SQL API aggregates them where a dashboard can reach them.
+//
+// Read back off the response rather than threaded down from where the answer
+// was decided. The headers are what the caller was told, and a metric that can
+// disagree with what the caller saw is worse than no metric: it is the one that
+// gets believed. This also means every route is covered by construction —
+// there is no second place to remember.
+function recordRequest(env, request, response, ms) {
+  // Absent locally (`node local.js`) and in tests, and `writeDataPoint` is
+  // fire-and-forget: it returns void, never throws, and must not be awaited.
+  const ae = env?.BEAMLINE_AE;
+  if (typeof ae?.writeDataPoint !== "function" || !response) return;
+  const url = new URL(request.url);
+  const source = response.headers.get("X-Beamline-Source") || "";
+  // Named, not derived from the path: a 404 on /v1/anything would otherwise
+  // become a label of its own, and a metric dimension the caller chooses is
+  // unbounded by definition.
+  const route =
+    url.pathname === "/v1/lookup" || url.pathname === "/v1/analyze" ? url.pathname.slice("/v1/".length) : "other";
+  // Deliberately no `indexes`. The only high-cardinality field here is the
+  // artifact, and a PURL is the caller's dependency list — the same knowledge
+  // `cacheScope` marks private on an authenticated deployment. It does not
+  // belong in an analytics dataset by default; the ecosystem is enough to tell
+  // npm from crates without naming anyone's packages.
+  ae.writeDataPoint({
+    blobs: [
+      route,
+      source,
+      response.headers.get("X-Beamline-Follow") || "",
+      response.headers.get("X-Beamline-Worker") || "",
+      purlType(url.searchParams.get("purl") || ""),
+      String(response.status),
+    ],
+    // `layer` carries -1 when nothing answered, matching what poppy records: a
+    // request that reached no layer is not a shallow one, and averaging it as
+    // zero would report the fleet at its cheapest exactly when it is down.
+    //
+    // `ms` is time to the response, not to the decision. On a streamed analysis
+    // the headers go out first and the verdict arrives later, so this measures
+    // what the caller waited before hearing anything — which is the number that
+    // decides whether a proxy cuts the connection, and not the cost of the run.
+    // `source = scan:analysis` is what separates the two.
+    doubles: [CACHE_LAYERS.get(source) ?? -1, ms],
+  });
+}
+
 
 async function dispatch(request, env, ctx) {
   // One id for the whole request, logged on every line and sent to scan, so a
@@ -275,25 +335,21 @@ async function handleV1Lookup(env, ctx, url) {
   // `pin` exists to time a specific backend, so it reads no cache at all —
   // not this policy's, and not a wider one's.
   const candidates = ctx.pin ? [] : followCandidates(follow.value);
-  let served = follow.value;
-  let hit = null;
-  for (const policy of candidates) {
+  const hit = await nearestAnswer(candidates, async (policy) => {
     const found = await cache
       .match(new Request(`${url.origin}${v1CachePath(sha, locators, policy)}`))
       .catch(() => null);
-    if (found) {
-      served = policy;
-      hit = found;
-      break;
-    }
-  }
+    // Buffered rather than streamed through, because the answer decides both
+    // how long the caller may hold it and whether it may answer for another
+    // policy at all. Decisions are one small object.
+    const document = found ? await found.text().catch(() => null) : null;
+    return document ? { document, response: found } : null;
+  });
   if (hit) {
-    // Buffered rather than streamed through, because the answer decides how
-    // long the caller may hold it. Decisions are one small object.
-    const document = await hit.text();
+    const { document, policy: served } = hit;
     const body = v1BudgetedBody(document, budget, locator, true);
-    const res = new Response(body, hit);
-    res.headers.set("X-Beamline-Source", "cache");
+    const res = new Response(body, hit.response);
+    setSource(res.headers, "cache");
     // Derived from the answer, never read back from the cache.
     //
     // What comes back is whatever the platform decided to store the directive
@@ -310,19 +366,16 @@ async function handleV1Lookup(env, ctx, url) {
   }
 
   if (!ctx.pin) {
-    let document = null;
-    for (const policy of candidates) {
-      document = await kvGet(env, v1CachePath(sha, locators, policy));
-      if (document) {
-        served = policy;
-        break;
-      }
-    }
-    if (document) {
+    const stored = await nearestAnswer(candidates, async (policy) => {
+      const document = await kvGet(env, v1CachePath(sha, locators, policy));
+      return document ? { document } : null;
+    });
+    if (stored) {
+      const { document, policy: served } = stored;
       const body = v1BudgetedBody(document, budget, locator, true);
       if (body) {
         const res = v1Body(env, body, 200, null, v1MaxAge(document));
-        res.headers.set("X-Beamline-Source", "kv");
+        setSource(res.headers, "kv");
         if (served !== follow.value) res.headers.set("X-Beamline-Follow", served);
         // Warmed under the policy that produced it, never under the one that
         // asked. Every key holds the answer to its own question; filing a wide
@@ -525,7 +578,12 @@ async function backfillDigestKey(env, cache, origin, body, follow) {
   if (!maxAge) return;
   const path = v1CachePath(sha, [], follow);
   const key = new Request(`${origin}${path}`);
-  if (await cache.match(key).catch(() => null)) return;
+  const existing = await cache.match(key).catch(() => null);
+  // Only a decision is worth leaving alone. A miss cached under this digest is
+  // the exact thing this write answers, and skipping the write on account of
+  // one leaves the digest key saying "nobody has analyzed this" while the
+  // locator key beside it holds the verdict.
+  if (existing && v1CachedVerdict(await existing.text().catch(() => null))) return;
   await cache.put(
     key,
     storedDocument(body, env),
@@ -743,6 +801,43 @@ function followCandidates(policy) {
   return [policy, ...wider];
 }
 
+// The nearest candidate policy holding an answer, walked narrowest first.
+//
+// Only a decision may answer for a policy other than the one asked about. A
+// stored "we hold nothing" is not evidence a wider walk gathered — it is a
+// statement about the artifact at the moment it was written, and a decision
+// filed under a wider policy contradicts it, because nothing that has been
+// analyzed becomes unanalyzed again.
+//
+// Letting one end the walk is how a miss hid the analysis that answered it.
+// Measured against the fleet: a caller looks up a package nobody holds, which
+// files `unanalyzed` under the policy they asked; the precache pass then
+// analyzes it under `follow=all`, which files the verdict under `all` and
+// leaves that miss standing; and for the whole 60s the miss remains cached,
+// every caller asking the default question is told the artifact is unanalyzed
+// — 60s after it was analyzed. Under a policy that happened to match, the
+// analysis overwrote the miss and none of this was visible.
+//
+// The miss is still worth keeping at the policy that asked. That entry is what
+// spares the fleet a round trip for an artifact nobody has analyzed, which is
+// the reason misses are cached at all — so it is held as a fallback and served
+// once every wider candidate has come up empty.
+//
+// load answers with {document, ...} for one policy, or null. Whatever else it
+// carries comes back untouched, alongside the policy that answered.
+async function nearestAnswer(candidates, load) {
+  let fallback = null;
+  for (const [index, policy] of candidates.entries()) {
+    const found = await load(policy);
+    if (!found) continue;
+    if (v1CachedVerdict(found.document)) return { ...found, policy };
+    // Narrowest first, so index 0 is the policy the caller named. A
+    // non-decision at any later candidate answers a question nobody asked.
+    if (index === 0) fallback = { ...found, policy };
+  }
+  return fallback;
+}
+
 function v1DocumentBody(body) {
   let row;
   try {
@@ -908,6 +1003,8 @@ function beamlineSource(source) {
     case "none":
       return source;
     case "scan:bloom":
+    case "scan:index":
+    case "scan:cached":
     case "scan:analysis":
     case "scan:replica":
     case "scan:primary":
@@ -919,20 +1016,55 @@ function beamlineSource(source) {
       return "scan:replica";
     case "primary":
       return "scan:primary";
-    case "scan":
     case "index":
+      return "scan:index";
+    // Anything unrecognised is counted as work, which is the safe direction:
+    // an unknown value from a half-rolled deployment inflates the bill rather
+    // than the hit rate, and a metric that overstates what a fleet spends gets
+    // investigated where one that understates it does not.
+    case "scan":
     default:
       return "scan:analysis";
   }
 }
 
+// How deep a request had to go before something answered it.
+//
+// Ordered by what it costs to be answered there, which is why work sits below
+// every cache rather than outside the scale: an average over these levels is
+// only meaningful if the most expensive outcome is also the largest number.
+// `none` is absent rather than numbered — nothing answered, which is a failure
+// to reach any layer and not a depth. Counting it as one would pull the average
+// toward "cheap" exactly when the fleet is unreachable.
+const CACHE_LAYERS = new Map([
+  ["cache", 0],          // L0  Workers Cache, this Worker's own edge
+  ["kv", 1],             // L1  Workers KV
+  ["scan:index", 2],     // L2  the worker's verdict index
+  ["scan:cached", 2],    // L2  the worker's analysis cache: same depth, no work
+  ["scan:bloom", 3],     // L3  Bloom-derived knowledge
+  ["scan:replica", 4],   // L4  hopper's replica
+  ["scan:primary", 5],   // L5  hopper's primary
+  ["scan:analysis", 6],  // no layer held it; a worker did the work
+]);
+
+// Report where an answer came from, and how deep that is.
+//
+// Set together, always, because they are one fact. Three routes used to set the
+// source by hand and a fourth derived it, which is how a header ends up present
+// on the paths nobody graphs and missing on the ones they do.
+function setSource(headers, source) {
+  headers.set("X-Beamline-Source", source);
+  const layer = CACHE_LAYERS.get(source);
+  if (layer !== undefined) headers.set("X-Cache-Layer", String(layer));
+}
+
 function v1Body(env, body, status, worker, maxAge, source) {
-  const headers = { "content-type": "application/json" };
-  headers["cache-control"] = maxAge
-    ? `${cacheScope(env)}, max-age=${maxAge}`
-    : "no-store";
-  if (worker) headers["X-Beamline-Worker"] = worker;
-  headers["X-Beamline-Source"] = worker ? beamlineSource(source) : "none";
+  const headers = new Headers({
+    "content-type": "application/json",
+    "cache-control": clientScope(env, maxAge),
+  });
+  if (worker) headers.set("X-Beamline-Worker", worker);
+  setSource(headers, worker ? beamlineSource(source) : "none");
   return new Response(body, { status, headers });
 }
 
@@ -1048,31 +1180,25 @@ async function handleV1Analyze(request, env, ctx, url) {
     // service does, so a wider answer already in hand is worth far more here
     // than it is on the lookup.
     const candidates = followCandidates(follow.value);
-    let served = follow.value;
-    let hit = null;
-    let document = null;
-    for (const policy of candidates) {
+    // A cached miss must not end this walk either, and here it is the most
+    // expensive place it could: a miss filed under the narrow policy would send
+    // us off to spend an analysis slot on a verdict a wider entry is already
+    // holding.
+    let hit = await nearestAnswer(candidates, async (policy) => {
       const found = await cache
         .match(new Request(`${url.origin}${v1CachePath(null, [locator], policy)}`))
         .catch(() => null);
       const text = found ? await found.text().catch(() => null) : null;
-      if (text) {
-        served = policy;
-        hit = found;
-        document = text;
-        break;
-      }
-    }
-    if (!document) {
-      for (const policy of candidates) {
+      return text ? { document: text, fromCache: true } : null;
+    });
+    if (!hit) {
+      hit = await nearestAnswer(candidates, async (policy) => {
         const text = await kvGet(env, v1CachePath(null, [locator], policy));
-        if (text) {
-          served = policy;
-          document = text;
-          break;
-        }
-      }
+        return text ? { document: text, fromCache: false } : null;
+      });
     }
+    const document = hit ? hit.document : null;
+    const served = hit ? hit.policy : follow.value;
     const decided = document ? v1CachedVerdict(document) : null;
     if (decided) {
       // Serving from cache used to warm nothing, because this path returns
@@ -1084,18 +1210,16 @@ async function handleV1Analyze(request, env, ctx, url) {
       // Filed at the digest under the policy that produced it, not the one that
       // asked, for the reason the lookup warms its own key that way.
       waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document, served));
-      logLine("v1_analyze", { src: hit ? "cache" : "kv", status: 200, artifact_status: decided.status, follow: served, ms: Date.now() - t0, ...ids });
+      logLine("v1_analyze", { src: hit.fromCache ? "cache" : "kv", status: 200, artifact_status: decided.status, follow: served, ms: Date.now() - t0, ...ids });
       // Answered in the shape this route always answers in: one NDJSON line,
       // no progress frames because there was no run to report progress about.
-      return new Response(`${body.trimEnd()}\n`, {
-        status: 200,
-        headers: {
-          "content-type": "application/x-ndjson",
-          "cache-control": "no-store",
-          "X-Beamline-Source": hit ? "cache" : "kv",
-          ...(served === follow.value ? {} : { "X-Beamline-Follow": served }),
-        },
+      const answered = new Headers({
+        "content-type": "application/x-ndjson",
+        "cache-control": "no-store",
       });
+      if (served !== follow.value) answered.set("X-Beamline-Follow", served);
+      setSource(answered, hit.fromCache ? "cache" : "kv");
+      return new Response(`${body.trimEnd()}\n`, { status: 200, headers: answered });
     }
     // Why we are about to spend an analysis slot. Without this a cache that
     // never hits and a cache that is never consulted look identical in the
@@ -1181,7 +1305,7 @@ function v1UnavailableCause(env, pass) {
 async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheFollow) {
   const workers = scanWorkers(env);
   const hint = locator?.type === "purl" ? { purl: locator.value } : {};
-  let ranked = workers.length ? (await rankWorkers(env, ctx, workers, ids, hint)).workers : [];
+  let ranked = workers.length ? await rankWorkers(env, ctx, workers, ids, hint) : [];
   if (busy) {
     // A preference, not a pin: a worker whose breaker is open is not in the
     // pool at all, and a run we cannot reach is not worth waiting for.
@@ -1255,6 +1379,21 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
     // issued when a decision actually arrives, to whichever worker produced it.
 
     const source = beamlineSource(upstream.headers.get("X-Scan-Source"));
+    // Which policy actually produced this answer.
+    //
+    // Scan applies the requested selection on top of its own configuration, so
+    // what it ran is its to report and not ours to assume — and the two have
+    // disagreed before. The answer is filed under what was measured; the
+    // policy we resolved is only the fallback for a worker too old to say.
+    // A name we cannot spell is a name we could never read back: an answer
+    // filed under it would be unreachable by every later question, so an
+    // unrecognised value is ignored and the policy we resolved stands.
+    const reported = upstream.headers.get("X-Scan-Follow");
+    const known = FOLLOW_POLICIES.includes(reported);
+    const storedFollow = cacheFollow && known ? reported : cacheFollow;
+    if (cacheFollow && reported && reported !== cacheFollow) {
+      logLine("v1_analyze_follow", { asked: cacheFollow, applied: reported, known: known || undefined, worker, ...ids });
+    }
     logLine("v1_analyze", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
     // The caller's stream is also the cache observer. Keeping one pipeline
     // means a minutes-long analysis is request work, not a minutes-long
@@ -1262,9 +1401,15 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
     // bounded Cache API / KV writes to waitUntil.
     const cacheDecision = cacheFollow
       ? (decided) => {
-          waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, decided, cacheFollow));
+          waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, decided, storedFollow));
         }
       : null;
+    const streamed = new Headers({
+      "content-type": "application/x-ndjson",
+      "cache-control": "no-store",
+      "X-Beamline-Worker": worker,
+    });
+    setSource(streamed, source);
     return new Response(
       annotatedV1Stream(
         upstream.body,
@@ -1292,12 +1437,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
       ),
       {
       status: 200,
-      headers: {
-        "content-type": "application/x-ndjson",
-        "cache-control": "no-store",
-        "X-Beamline-Worker": worker,
-        "X-Beamline-Source": source,
-      },
+      headers: streamed,
       },
     );
   }
@@ -1327,7 +1467,7 @@ async function v1Resume(env, ctx, path, bytes, ids, locator, dead) {
   const workers = scanWorkers(env);
   if (!workers.length) return null;
   const hint = locator?.type === "purl" ? { purl: locator.value } : {};
-  const ranked = (await rankWorkers(env, ctx, workers, ids, hint)).workers;
+  const ranked = await rankWorkers(env, ctx, workers, ids, hint);
   const busy = locator ? await runningWorker(env, ctx, locator, ids) : null;
   const order = [
     ...ranked.filter((base) => busy && hostOf(base) === busy),
@@ -1788,43 +1928,27 @@ async function statusAsk(env, ctx, path, base) {
 // answers, and a moment later they may not hold. A rejection is an answer
 // (bad bytes, unsupported type), so repeating it would only burn a slot.
 //
-// Only one of these loops runs per sample. `lookup` collapses concurrent
-// identical requests into a single flight before this is ever reached, and
-// scan de-duplicates by sha and purl across isolates, so a retry joins the
-// analysis already running rather than starting a second one — which is what
-// makes retrying an edge timeout worth doing at all.
-// Every healthy worker gets the same sample and the first real verdict wins.
-// The losers are aborted the moment it lands. That abort reliably stops an arm
-// that has not dispatched yet; it does NOT reliably stop one already running,
-// because the signal has to cross a Worker abort, the Cloudflare edge, and a
-// tunnel before scan sees a disconnect, and measurement says it does not arrive
-// — a dropped loser was observed analysing for a further 77s and returning 200.
-//
-// So the saving comes from the stagger, not the abort: an arm still waiting out
-// its delay is aborted before it ever asks, and costs its worker nothing. The
-// delay is set per request from the favourite's own predicted latency (see
-// rankWorkers), and SCAN_RACE_DELAY_MS overrides it — 0 restores the old flat
-// race, which costs one analysis slot per worker per sample.
+// Retrying is safe because scan de-duplicates by sha and purl across isolates:
+// a retry joins the analysis already running rather than starting a second one,
+// which is what makes retrying an edge timeout worth doing at all.
 // ---------------------------------------------------------------- routing ---
 //
-// Which scan worker should go first?
+// Which scan worker should go first — and only that. One worker is asked at a
+// time, and the next is reached only when the one before it refuses or fails.
 //
-// The old answer was "all of them, at once": SCAN_RACE_DELAY_MS defaulted to 0,
-// so every arm dispatched immediately and every worker analysed every sample.
+// It used to race: every healthy worker got every sample and the first verdict
+// won. That cost a full duplicate analysis per extra worker on a fleet whose
+// scarce resource is analysis slots, and the losers could not be called off.
 // Measured on one request, galadriel answered pkg:pypi/idna@2.5 in 12.5s while
-// interserver kept working on it for another 77s — a full duplicate analysis
-// per extra worker, on a fleet whose scarce resource is analysis slots.
+// interserver kept working on it for another 77s and returned 200. Cancelling
+// has to cross a Worker abort, the Cloudflare edge, and a tunnel before scan
+// sees a disconnect, and the evidence is that it does not arrive — so a loser
+// costs a slot whatever we do about it once it has started.
 //
-// The fix is not to cancel the losers. Cancellation has to cross a Worker
-// abort, the Cloudflare edge, and a tunnel before scan sees a disconnect, and
-// the evidence is that it does not arrive. What works regardless of transport
-// is to not start the work: `scanArm` aborts during its stagger and reports
-// `never_started`, which costs a worker nothing at all.
-//
-// So the job here is to put the *most likely to finish first* worker in the
-// zero-delay slot, and hold the rest behind a delay long enough that they only
-// fire when the favourite is genuinely slow. That is a hedged request, and the
-// arm machinery already implements it.
+// The remedy that survived is not to start the work: ask the worker most likely
+// to finish first, and ask a second one only when the first says no. That makes
+// the ranking below the whole of the strategy, which is why it is measured
+// rather than configured.
 
 // How long a cached /_/stats reading stays usable. Short enough to follow a
 // worker filling up, long enough that routing costs one poll per worker per
@@ -1903,41 +2027,6 @@ function hostPressure(stats) {
   if (!Number.isFinite(load) || load <= 0) return 0;
   return load / cpus;
 }
-// The hedge is a stall detector, not a latency optimizer.
-//
-// It used to be the latter, and the distinction is the whole design. Racing
-// every worker at once wasted a full analysis per request; hedging below the
-// expected time fired on roughly half of them, because the estimate is a
-// central tendency and half of all jobs exceed it. Neither is what a second
-// arm is for now: routing picks the favourite on measured p80, and a refusal
-// promotes the next worker immediately, so the only failure a hedge still
-// covers is a worker that *accepted* the work and then went quiet — which now
-// includes one that accepted it into a queue, since a queued job looks exactly
-// like a slow one from here.
-//
-// So it fires late and rarely. A worker past this multiple of its own p80 is
-// not slow, it is stuck — and the alternative is waiting out SCAN_TIMEOUT_MS,
-// which is thirty minutes.
-const HEDGE_FRACTION = 3;
-// Ceiling on the hedge delay, as a fraction of the scan timeout rather than a
-// bare number. The previous fixed 20s was set when a job took ~5s; once fresh
-// analyses reached 100-380s it clamped every hedge to 20s and turned the whole
-// mechanism back into the flat race it replaced. Tying it to the timeout keeps
-// it in scale with whatever the work actually costs.
-const HEDGE_TIMEOUT_SHARE = 0.5;
-
-// Race outcomes per worker, for /_/routes.
-//
-// Per-isolate and therefore partial: Workers recycles isolates freely, so these
-// count one isolate's view since `raceSince`, not the fleet's since boot. That
-// is honest for a stress run — which lands on few isolates and reads them right
-// after — and useless as a long-run metric. The durable version of these
-// numbers is the scan_arm/scan_race log stream.
-const raceTally = new Map();
-// Stamped on first use, not at module scope: Workers runs global initialization
-// with the clock pinned before any I/O, so Date.now() there is not a wall time
-// and the window came out as the entire Unix epoch.
-let raceSince = null;
 // Per-isolate stats cache. Isolates are recycled often, which is exactly why
 // scan publishes its own history rather than beamline accumulating one: a cold
 // isolate gets a warm estimate from the first poll instead of routing blind
@@ -2378,10 +2467,6 @@ async function rankPool(env, ctx, workers, hint) {
     if (a.known && b.known) return a.r - b.r;
     return a.i - b.i;
   });
-  // Holding an arm back is a bet that the favourite is genuinely the fastest.
-  // With no stats to bet on, the ranking is arbitrary and the bet is a coin
-  // toss with a long delay attached — strictly worse than asking everyone. So
-  // evidence buys the hedge: no evidence, flat race, as before.
   // No exploration here on purpose. A previous revision promoted a random
   // non-favourite on 10% of requests, to stop a worker being trapped by a
   // reputation its own starved sample set could never repair. The measurement
@@ -2391,10 +2476,10 @@ async function rankPool(env, ctx, workers, hint) {
   // problem never shown to exist. If per-worker averages do turn out to be
   // biased by the routing itself, the honest repair is to make the samples
   // comparable, not to dilute the ranking that reads them.
-  const informed = pool[0].known;
-  const ceiling = Math.round(numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS) * HEDGE_TIMEOUT_SHARE);
-  const hedge = informed ? Math.min(ceiling, Math.round(pool[0].est * HEDGE_FRACTION)) : 0;
-  return { pool, excluded: usable.length ? scored.filter((w) => w.why != null) : [], hedge, informed };
+  // `informed` says the favourite was chosen on measurement rather than on the
+  // configured order, which is the difference between a plan worth reading and
+  // a coin toss.
+  return { pool, excluded: usable.length ? scored.filter((w) => w.why != null) : [], informed: pool[0].known };
 }
 
 async function rankWorkers(env, ctx, workers, ids, hint) {
@@ -2403,17 +2488,12 @@ async function rankWorkers(env, ctx, workers, ids, hint) {
     order: ranked.pool.map((w) => hostOf(w.base)).join(","),
     est_ms: ranked.pool.map((w) => Math.round(w.est)).join(","),
     excluded: ranked.excluded.length || undefined,
-    hedge_ms: ranked.hedge,
     informed: ranked.informed || undefined,
     size: hint?.bytes ?? undefined,
     type: hint?.purl ? purlType(hint.purl) : undefined,
     ...ids,
   });
-  return {
-    workers: ranked.pool.map((w) => w.base),
-    hedge: ranked.hedge,
-    est: new Map(ranked.pool.map((w) => [w.base, Math.round(w.est)])),
-  };
+  return ranked.pool.map((w) => w.base);
 }
 
 // GET /_/routes[?size=<bytes|10mb>] — what the router would do right now.
@@ -2474,20 +2554,17 @@ async function handleRoutes(env, ctx, url) {
       continue;
     }
     const ranked = await rankPool(env, ctx, live, c.hint);
-    const stagger = numEnv(env, "SCAN_RACE_DELAY_MS", ranked.hedge);
     routes.push({
       class: c.name,
       kind: c.kind,
       size_bytes: c.bytes,
       informed: ranked.informed,
-      hedge_ms: ranked.hedge,
-      // The delay each arm would actually wait. Arm i waits i*stagger, so a
-      // third worker is held twice as long as the second — the number an
-      // operator wants is this one, not the hedge it was derived from.
-      dispatch: ranked.pool.map((w, i) => ({
+      // The order a dispatch would try, favourite first. One worker is asked at
+      // a time and the next is reached only when the one before it refuses or
+      // fails, so this is a queue rather than a set of arms.
+      dispatch: ranked.pool.map((w) => ({
         worker: hostOf(w.base),
         est_ms: Math.round(w.est),
-        delay_ms: i * stagger,
       })),
       excluded: ranked.excluded.map((w) => ({ worker: hostOf(w.base), reason: w.why })),
     });
@@ -2500,25 +2577,11 @@ async function handleRoutes(env, ctx, url) {
   return json(
     {
       stats_ttl_ms: STATS_TTL_MS,
-      // A stagger that is not the hedge means SCAN_RACE_DELAY_MS is pinning it,
-      // which is otherwise invisible and explains a plan that looks wrong.
-      scan_race_delay_ms: numEnv(env, "SCAN_RACE_DELAY_MS", null) ?? undefined,
-      // Window these cover. Short relative to the run means the isolate was
-      // recycled mid-flight and the tallies below undercount.
-      race_window_ms: raceSince == null ? undefined : now - raceSince,
       workers: all.map((base) => {
         const hit = statsCache.get(base);
-        const t = raceTally.get(base);
         return {
           worker: hostOf(base),
           breaker: breakerFor(base).open() ? "open" : "closed",
-          // What this worker was actually asked to do, and how that ended.
-          // `never_started` is work the hedge saved; `dropped` is work already
-          // running that a faster worker made redundant — the number that says
-          // whether racing is costing real capacity.
-          race: t
-            ? { ...t, avg_ms: t.timed ? Math.round(t.ms_total / t.timed) : undefined, ms_total: undefined, timed: undefined }
-            : undefined,
           stats_age_ms: hit ? now - hit.at : undefined,
           // null means polled and unanswered, which is not the same as never
           // polled — one is a worker in trouble, the other is a cold isolate.
@@ -2619,8 +2682,16 @@ function envelopeResponse(env, envelope, sha, source, maxAge, totalMs, purl) {
 // Authenticated answers are private to everything between us and the client.
 // Our own cache is a different matter. The scope a client's copy carries is
 // restored independently from the copy stored in the edge cache.
+// What a v1 answer tells the caller about holding it.
+//
+// One rule, because it was two: this said `public` with no max-age for an
+// uncacheable answer while `v1Body` said `no-store` for the same thing, and a
+// bare `public` lets a shared cache keep — on its own heuristics — the one
+// answer we meant nobody to keep. Unreachable today, since only a document that
+// earned a TTL is ever in the cache to be re-served, which is exactly how two
+// spellings of one rule survive long enough to diverge.
 function clientScope(env, maxAge) {
-  return maxAge ? `${cacheScope(env)}, max-age=${maxAge}` : cacheScope(env);
+  return maxAge ? `${cacheScope(env)}, max-age=${maxAge}` : "no-store";
 }
 
 function cacheScope(env) {
@@ -2991,6 +3062,8 @@ function trimSlash(s) {
 
 export const _test = {
   occupancy,
+  CACHE_LAYERS,
+  beamlineSource,
   followCandidates,
   predictMs,
   hasHistory,
@@ -3014,16 +3087,11 @@ export const _test = {
   makeBreaker,
   memoryCache,
   annotatedV1Stream,
-  // Lets a test wait until a caller has actually joined the shared flight,
-  // rather than sleeping and hoping. Timing-based waits here were flaky under a
-  // loaded event loop, and a flaky test about cancellation is worse than none.
-  flightCount: () => inflight.size,
   tokenEq,
   tokenList,
   numEnv,
   reset() {
     scanBreakers.clear();
-    inflight.clear();
     getCache.memory = null;
     logLine.mute = false;
   },

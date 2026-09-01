@@ -25,7 +25,6 @@ const TUNABLES = [
   "SCAN_TOKEN",
   "SCAN_RETRIES",
   "SCAN_RETRY_BASE_MS",
-  "SCAN_RACE_DELAY_MS",
 ];
 
 const env = Object.fromEntries(TUNABLES.map((k) => [k, process.env[k] || ""]));
