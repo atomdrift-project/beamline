@@ -409,6 +409,27 @@ test("a fleet of tripped workers is still a fleet", () => {
   );
 });
 
+// A pin selects, or the header is decoration.
+//
+// It used to be decoration: `pin` bypassed the caches and nothing filtered the
+// pool, so a pinned request was routed like any other. Two benchmarks were
+// built on it and both silently measured the router against itself — the
+// failure is invisible from outside, because a pinned request still returns a
+// perfectly good verdict from the wrong worker.
+test("a pin selects one worker and nothing else", () => {
+  const env = { SCAN_URL: "https://a.test,https://b.test,https://c.test" };
+  assert.deepEqual(_test.scanWorkers(env, "b.test"), ["https://b.test"]);
+
+  // A tripped breaker does not override an explicit choice: timing a worker
+  // that is currently failing is a reason to pin, not a reason to refuse.
+  for (let i = 0; i < _test.BREAKER_FAILS; i++) _test.breakerFor("https://b.test").fail();
+  assert.deepEqual(_test.scanWorkers(env, "b.test"), ["https://b.test"]);
+
+  // A name the fleet does not have selects nobody, so the caller is told it
+  // asked for something that does not exist rather than served by a stranger.
+  assert.deepEqual(_test.scanWorkers(env, "nope.test"), []);
+});
+
 
 
 // The budget has to exceed the longest a healthy worker can legitimately take,
@@ -3478,6 +3499,43 @@ test("a window with too few samples falls back to the mean", async () => {
     assert.equal(route.dispatch[0].est_ms, 4000, "two samples are not a distribution");
   } finally {
     await Promise.all([hopper.close(), w.close()]);
+  }
+});
+
+// The trap this fallback used to set, measured on the fleet 2026-09-02.
+//
+// scan-rdu2 published an empty window and a lifetime mean carrying an old
+// contended spell. Ranked on that mean it could not outrank a fleet publishing
+// 50-57s p80s, so it was asked for nothing, so its window stayed empty, so the
+// mean stayed its estimate. Forcing 23 analyses onto it broke the cycle and its
+// window came back at 59.7s p80 — an ordinary worker, ruled out for an hour by
+// a statistic nobody else was judged by.
+test("an empty window is unknown, not slow", async () => {
+  const hopper = await mockBackend({ bloom: "unknown" });
+  const idle = await mockBackend({
+    stats: statsFor({
+      ms: 347000,
+      bySize: {},
+      // Empty at both levels, the way rdu2 published it: nothing in the last
+      // hour per type, and nothing overall either.
+      recent: { samples: 0, p80_ms: null, mean_ms: null },
+      avg_job_ms_by_type: {
+        npm: { jobs: 36, avg_ms: 347000, recent: { samples: 0, p80_ms: null, mean_ms: null } },
+      },
+    }),
+  });
+  const env = testEnv(hopper.url, { SCAN_URL: idle.url });
+  try {
+    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const [route] = (await res.json()).routes;
+    assert.equal(
+      route.dispatch[0].est_ms,
+      _test.UNKNOWN_JOB_MS,
+      "a worker with nothing to say ranks as unknown, and is asked, and can then say something",
+    );
+    assert.equal(route.informed, false, "an estimate resting on nothing is not an informed one");
+  } finally {
+    await Promise.all([hopper.close(), idle.close()]);
   }
 });
 

@@ -221,6 +221,14 @@ async function dispatch(request, env, ctx) {
     }
   }
 
+  // Named after the token gate, because a pin spends a scan slot on demand.
+  // Reported here rather than as an outage further down: an unservable pin is
+  // a typo in the caller's request, and "no_workers" would send whoever wrote
+  // it looking at the fleet.
+  if (ctx.pin && !scanWorkers(env, ctx.pin).length) {
+    return v1Error(400, "unknown_pin", "X-Beamline-Pin names no configured worker.");
+  }
+
   try {
     if (url.pathname === "/v1/analyze") {
       if (request.method !== "POST") return methodNotAllowed("POST");
@@ -437,7 +445,7 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
   let outage = null;
 
   for (let attempt = 0; ; attempt++) {
-    const workers = await lookupOrder(env, ctx, scanWorkers(env), ids);
+    const workers = await lookupOrder(env, ctx, scanWorkers(env, ctx.pin), ids);
     if (!workers.length) {
       cause = "no_workers";
       break;
@@ -1353,7 +1361,7 @@ async function handleV1Analyze(request, env, ctx, url) {
     );
     if (answered) return answered;
     const stillWorthOffering = pass.busy > 0 && Date.now() < busyDeadline;
-    if ((attempt >= tries && !stillWorthOffering) || !scanWorkers(env).length) break;
+    if ((attempt >= tries && !stillWorthOffering) || !scanWorkers(env, ctx.pin).length) break;
     const wait = backoff(backoffBase, attempt, SCAN_RETRY_MAX_MS);
     logLine("v1_analyze_retry", { attempt: attempt + 1, of: tries, wait_ms: Math.round(wait), ...ids });
     await sleep(wait, ctx);
@@ -1363,7 +1371,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   // /v1/lookup gives one: the caller asked about a package, and "we could not
   // find out" is an answer about it that their policy may treat differently
   // from "nobody has analyzed this".
-  const cause = v1UnavailableCause(env, last);
+  const cause = v1UnavailableCause(env, ctx, last);
   logLine("v1_analyze", { src: "none", status: 200, unavailable: true, cause, ms: Date.now() - t0, ...ids });
   return new Response(`${JSON.stringify(v1Unavailable(null, locator, cause))}\n`, {
     status: 200,
@@ -1374,8 +1382,8 @@ async function handleV1Analyze(request, env, ctx, url) {
 // Which failure the fleet just had, in the terms a caller's retry policy needs.
 // The tallies are already kept to decide whether another pass is worth making;
 // this only stops them being thrown away once it is not.
-function v1UnavailableCause(env, pass) {
-  if (!scanWorkers(env).length) return "no_workers";
+function v1UnavailableCause(env, ctx, pass) {
+  if (!scanWorkers(env, ctx.pin).length) return "no_workers";
   if (!pass || !pass.busy) return "unreachable";
   return pass.broken ? "mixed" : "saturated";
 }
@@ -1383,7 +1391,7 @@ function v1UnavailableCause(env, pass) {
 // One pass over the fleet. Returns the response, or null when every worker
 // refused and the pass is worth making again.
 async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheFollow) {
-  const workers = scanWorkers(env);
+  const workers = scanWorkers(env, ctx.pin);
   const hint = locator?.type === "purl" ? { purl: locator.value } : {};
   let ranked = workers.length ? await rankWorkers(env, ctx, workers, ids, hint) : [];
   if (busy) {
@@ -1552,7 +1560,7 @@ async function v1Resume(env, ctx, path, bytes, ids, locator, dead) {
   // An aborted request has nobody left to finish the analysis for, and every
   // fetch below would be made with a signal that is already tripped.
   if (clientAborted(ctx)) return null;
-  const workers = scanWorkers(env);
+  const workers = scanWorkers(env, ctx.pin);
   if (!workers.length) return null;
   const hint = locator?.type === "purl" ? { purl: locator.value } : {};
   const ranked = await rankWorkers(env, ctx, workers, ids, hint);
@@ -1975,7 +1983,7 @@ function budgetedV1Line(line, budget, locator) {
 // path that is about to spend orders of magnitude more than that. A worker that
 // cannot answer is simply not the one running it.
 async function runningWorker(env, ctx, input, ids) {
-  const workers = scanWorkers(env);
+  const workers = scanWorkers(env, ctx.pin);
   const keys = [];
   if (input.sha) keys.push(`sha256=${input.sha}`);
   if (input.type && input.value) keys.push(`${input.type}=${encodeURIComponent(input.value)}`);
@@ -2291,10 +2299,46 @@ function classMs(stats, hint) {
 // One bucket's figure: the window if it is settled, else the lifetime mean.
 // Both floor themselves at MIN_CLASS_SAMPLES, so a thin bucket reads as no
 // answer rather than a confident wrong one.
+//
+// An *empty* window is the exception, and only an empty one. A thin window is
+// a worker doing this work right now that has not done five yet, and its mean
+// still describes something live — two samples are not a distribution, so the
+// mean is the better of two current answers. An empty window says the worker
+// has done none of this in the last hour, which is not a slow measurement but
+// an absent one, and its mean is the stale figure the window exists to
+// replace. emptyWindow() says what that distinction cost.
 function bucketMs(bucket) {
   if (!bucket) return null;
-  return recentMs(bucket.recent) ?? meanMs(bucket);
+  const windowed = recentMs(bucket.recent);
+  if (windowed != null) return windowed;
+  return emptyWindow(bucket.recent) ? null : meanMs(bucket);
 }
+
+// A worker that publishes a window and has nothing in it. Distinct from one
+// that publishes no window at all — an older scan build, whose mean is the only
+// evidence there is and stays routable on it.
+function emptyWindow(recent) {
+  return !!recent && recent.samples === 0;
+}
+
+// Why an empty window is not worth falling back on, measured 2026-09-02.
+//
+// scan-rdu2 published no recent samples and a lifetime mean carrying an old
+// contended spell: 264-652s per type, against a fleet publishing 50-57s p80s.
+// Nothing could outrank that, so it was asked for nothing, so its window stayed
+// empty, so the mean stayed its estimate — the exact trap classMs() warns about
+// below, entered through this fallback rather than through a missing sample.
+// Forcing 23 analyses onto it broke the cycle and its window came back at 59.7s
+// p80: an ordinary worker the router had ruled out for an hour on the strength
+// of a statistic nobody else was being judged by.
+//
+// Unknown ranks at UNKNOWN_JOB_MS, well under any real analysis, so a worker in
+// this state goes to the front and fills its window in MIN_CLASS_SAMPLES jobs.
+// That is the probe, and it is self-limiting. hasHistory() still reads false
+// for it, so it ranks without earning the jitter kept for workers we trust. A
+// worker that is quiet because it is slow buys a few slow jobs an hour by this
+// route; a worker that is quiet because it is new or was passed over gets the
+// only thing that can correct the record, which is work.
 
 // The windowed p80 a worker publishes for this class: what the work usually
 // costs, over the last hour, including a bad day.
@@ -2324,6 +2368,9 @@ function meanMs(bucket) {
 function blendedMs(stats) {
   const windowed = recentMs(stats.recent);
   if (windowed != null) return windowed;
+  // Same rule as bucketMs, and for the same reason: guarding only the per-class
+  // path would leave the stale mean to arrive here instead, one line later.
+  if (emptyWindow(stats.recent)) return null;
   if (stats.avg_job_ms == null) return null;
   if (stats.avg_job_samples != null && stats.avg_job_samples < MIN_CLASS_SAMPLES) return null;
   return stats.avg_job_ms;
@@ -3102,8 +3149,19 @@ function urlList(raw) {
 // answered `unavailable` in 25ms each without a single outbound fetch. The
 // fleet was healthy throughout. Same rule scan's own corpus reader follows for
 // the same reason — an address believed to be failing still beats no address.
-function scanWorkers(env) {
+function scanWorkers(env, pin) {
   const all = urlList(env.SCAN_URL);
+  // A pin names one worker and means it. Falling back to another would answer
+  // a question nobody asked: the header exists so an experiment can time a
+  // chosen backend, and a silent substitution reports that backend's timing for
+  // someone else's work. Measured live before this existed — every pinned
+  // request went wherever the router liked, and two benchmarks scored the
+  // router against itself without either of them noticing.
+  //
+  // The breaker is deliberately not consulted: a caller naming one worker has
+  // already made the choice this filter exists to make for it, and timing a
+  // worker that is currently failing is a legitimate thing to want.
+  if (pin) return all.filter((base) => hostOf(base) === pin);
   const live = all.filter((base) => !breakerFor(base).open());
   return live.length ? live : all;
 }

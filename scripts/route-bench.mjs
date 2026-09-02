@@ -15,6 +15,23 @@
 // Only trials scan actually served are scored: a verdict answered from
 // beamline's cache or hopper's index timed the index, not the worker, and
 // counting it would make every worker look identically fast.
+//
+// Scored 0 of every N trials until 2026-09-02, for two reasons worth keeping.
+//
+// `pin` did not select a worker. It bypassed beamline's caches and nothing
+// filtered the pool, so all five "arms" went wherever the router chose and this
+// scored the router against itself. Fixed in beamline.js; scanWorkers() now
+// honours the header and an unknown name is a 400.
+//
+// The second reason survives that fix: `pin` bypasses beamline's layers, not
+// the scan worker's. Whichever arm runs first analyses and publishes, and the
+// arms after it read that verdict back in 200-900ms as scan:index or
+// scan:primary, so a trial can never be all scan:analysis. Freshness of the
+// corpus does not help — the first arm of each trial is what spoils it — so the
+// "pick releases this fleet has not analyzed yet" advice below is not the
+// answer either. Finishing this needs a scan-side flag to ignore index and
+// primary on a pinned request. Until then, route-ab.mjs asks the same question
+// without a paired counterfactual, by analysing each PURL exactly once.
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
