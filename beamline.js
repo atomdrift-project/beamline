@@ -2298,15 +2298,8 @@ function classMs(stats, hint) {
 
 // One bucket's figure: the window if it is settled, else the lifetime mean.
 // Both floor themselves at MIN_CLASS_SAMPLES, so a thin bucket reads as no
-// answer rather than a confident wrong one.
-//
-// An *empty* window is the exception, and only an empty one. A thin window is
-// a worker doing this work right now that has not done five yet, and its mean
-// still describes something live — two samples are not a distribution, so the
-// mean is the better of two current answers. An empty window says the worker
-// has done none of this in the last hour, which is not a slow measurement but
-// an absent one, and its mean is the stale figure the window exists to
-// replace. emptyWindow() says what that distinction cost.
+// answer rather than a confident wrong one — except an empty one, which reads
+// as no answer at all.
 function bucketMs(bucket) {
   if (!bucket) return null;
   const windowed = recentMs(bucket.recent);
@@ -2314,31 +2307,26 @@ function bucketMs(bucket) {
   return emptyWindow(bucket.recent) ? null : meanMs(bucket);
 }
 
-// A worker that publishes a window and has nothing in it. Distinct from one
-// that publishes no window at all — an older scan build, whose mean is the only
-// evidence there is and stays routable on it.
+// A worker that publishes a window and has nothing in it — distinct from one
+// publishing no window at all, an older build whose mean is the only evidence
+// there is. A thin window still describes work happening now, so two samples
+// fall back to the mean; an empty one describes an hour of not being asked, and
+// its mean is the stale figure the window exists to replace.
+//
+// Measured 2026-09-02: scan-rdu2 published an empty window over a mean carrying
+// an old contended spell — 264-652s per type against a fleet publishing 50-57s.
+// Nothing could outrank that, so it was asked for nothing, so its window stayed
+// empty and the mean stayed its estimate. That is the trap classMs() warns
+// about below, entered through a stale number rather than a missing one.
+// Forcing 23 analyses onto it broke the cycle and the window came back at 59.7s.
+//
+// Unknown ranks at UNKNOWN_JOB_MS, under any real analysis, so such a worker
+// goes to the front and fills its window in MIN_CLASS_SAMPLES jobs. That is the
+// probe, and it is self-limiting: hasHistory() still reads false, so it ranks
+// without earning the jitter kept for workers we trust.
 function emptyWindow(recent) {
   return !!recent && recent.samples === 0;
 }
-
-// Why an empty window is not worth falling back on, measured 2026-09-02.
-//
-// scan-rdu2 published no recent samples and a lifetime mean carrying an old
-// contended spell: 264-652s per type, against a fleet publishing 50-57s p80s.
-// Nothing could outrank that, so it was asked for nothing, so its window stayed
-// empty, so the mean stayed its estimate — the exact trap classMs() warns about
-// below, entered through this fallback rather than through a missing sample.
-// Forcing 23 analyses onto it broke the cycle and its window came back at 59.7s
-// p80: an ordinary worker the router had ruled out for an hour on the strength
-// of a statistic nobody else was being judged by.
-//
-// Unknown ranks at UNKNOWN_JOB_MS, well under any real analysis, so a worker in
-// this state goes to the front and fills its window in MIN_CLASS_SAMPLES jobs.
-// That is the probe, and it is self-limiting. hasHistory() still reads false
-// for it, so it ranks without earning the jitter kept for workers we trust. A
-// worker that is quiet because it is slow buys a few slow jobs an hour by this
-// route; a worker that is quiet because it is new or was passed over gets the
-// only thing that can correct the record, which is work.
 
 // The windowed p80 a worker publishes for this class: what the work usually
 // costs, over the last hour, including a bad day.

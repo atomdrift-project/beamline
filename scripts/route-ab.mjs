@@ -129,6 +129,13 @@ function percentile(sorted, p) {
   return sorted[i];
 }
 
+// How a set of rows was answered, as `key=count` pairs, or "-" for none.
+function tally(rows, key) {
+  const counts = {};
+  for (const r of rows) counts[key(r)] = (counts[key(r)] || 0) + 1;
+  return Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(" ") || "-";
+}
+
 function stats(rows) {
   const ms = rows.map((r) => r.ms).sort((a, b) => a - b);
   return {
@@ -177,16 +184,17 @@ if (strayed.length) {
 for (const arm of ["routed", "random"]) {
   const mine = rows.filter((r) => r.arm === arm);
   const refused = mine.filter((r) => r.unavailable || r.status === 0);
-  const why = {};
-  for (const r of refused) why[r.cause || `status:${r.status}`] = (why[r.cause || `status:${r.status}`] || 0) + 1;
-  console.log(`${arm.padEnd(6)} refused ${refused.length}/${mine.length}  ${Object.entries(why).map(([k, v]) => `${k}=${v}`).join(" ") || "-"}`);
+  const why = tally(refused, (r) => r.cause || `status:${r.status}`);
+  console.log(`${arm.padEnd(6)} refused ${refused.length}/${mine.length}  ${why}`);
 }
 
-const scored = rows.filter((r) => r.status === 200 && r.source === "scan:analysis");
+// An outage answers in a second or two and says so inside a 200, wearing the
+// same scan:analysis source as a real verdict. Timing one as an analysis is the
+// contamination this whole script exists to avoid, so refusals are counted
+// above and excluded here.
+const scored = rows.filter((r) => r.status === 200 && r.source === "scan:analysis" && !r.unavailable);
 console.log(`\n${scored.length}/${rows.length} analyses scan-served and scored`);
-const bySource = {};
-for (const r of rows) bySource[r.source || `status:${r.status}`] = (bySource[r.source || `status:${r.status}`] || 0) + 1;
-console.log(`sources ${Object.entries(bySource).map(([k, v]) => `${k}=${v}`).join(" ")}\n`);
+console.log(`sources ${tally(rows, (r) => r.source || `status:${r.status}`)}\n`);
 if (!scored.length) {
   console.log("Nothing to score: nothing reached a worker. Feed it newer releases.");
   process.exit(0);
@@ -194,7 +202,10 @@ if (!scored.length) {
 
 const routed = stats(scored.filter((r) => r.arm === "routed"));
 const control = stats(scored.filter((r) => r.arm === "random"));
-const show = (label, s) => console.log(`${label.padEnd(8)} n=${String(s.n).padStart(3)}  p50 ${s.p50}ms  p90 ${s.p90}ms  mean ${s.mean}ms`);
+const show = (label, s) =>
+  console.log(
+    s.n ? `${label.padEnd(8)} n=${String(s.n).padStart(3)}  p50 ${s.p50}ms  p90 ${s.p90}ms  mean ${s.mean}ms` : `${label.padEnd(8)} nothing scored`,
+  );
 show("routed", routed);
 show("random", control);
 if (routed.n && control.n) {
