@@ -38,12 +38,13 @@ const popular = process.env.POPULAR === "1";
 const analyzeMisses = process.env.ANALYZE_MISSES === "1";
 const stressRoute = (process.env.STRESS_ROUTE || "combined").trim().toLowerCase();
 const repeat = Math.max(1, Number(process.env.REPEAT) || 1);
-// Analyses are asked at the widest policy; lookups are left on their own
-// default. That pairing is the point: `all` contains every narrower
-// question, so a lookup afterwards must be served from the analysis rather
-// than reaching a worker again. A run where those lookups still say
-// `scan:` is a run where the ordering is not doing its job.
-const ANALYZE_FOLLOW = (process.env.ANALYZE_FOLLOW || "all").trim();
+// Analyses and lookups both ride the API's own default policy unless
+// ANALYZE_FOLLOW names one. Named the same way, the two resolve to the same
+// entry, so a lookup after an analysis must be served from it rather than
+// reaching a worker again. A run where those lookups still say `scan:` is a
+// run where the ordering is not doing its job.
+const ANALYZE_FOLLOW = (process.env.ANALYZE_FOLLOW || "").trim();
+const followParam = ANALYZE_FOLLOW ? `&follow=${encodeURIComponent(ANALYZE_FOLLOW)}` : "";
 const timeoutMs = Number(process.env.SCAN_TIMEOUT_MS) || 1_800_000;
 
 // Five very widely used packages per ecosystem, pinned to the versions that
@@ -373,7 +374,7 @@ async function submitLookup(item) {
 
 async function submitAnalyze(item) {
   if (api === "v1") {
-    return askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}&follow=${ANALYZE_FOLLOW}`);
+    return askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}${followParam}`);
   }
   return ask(item, `${beamlineUrl}/analyze?purl=${encodeURIComponent(item.purl)}`, "POST");
 }
@@ -397,7 +398,7 @@ async function submitV1(item) {
   // answer would skip the analysis and report an outage as a cache hit.
   const known = looked.artifactStatus === "analyzed";
   if (!analyzeMisses || known) return { ...looked, both: await bothProbeV1(item, looked) };
-  const analyzed = await askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}&follow=${ANALYZE_FOLLOW}`);
+  const analyzed = await askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}${followParam}`);
   return { ...analyzed, analyzed: true, lookupMs: looked.ms, both: await bothProbeV1(item, analyzed) };
 }
 
@@ -449,6 +450,7 @@ async function ask(item, url, method) {
       state: body && body.state,
       lvl: body && (body.lvl ?? body.fires_at),
       eng: body && (body.eng || body.engine_version),
+      why: Boolean(body && (body.why || body.reason)),
       hits: body && (body.hits || body.findings) ? (body.hits || body.findings).length : 0,
       issues,
     });
@@ -543,6 +545,7 @@ async function askStream(item, url) {
       sha: assessment.sha256 || "",
       lvl: assessment.fires_at,
       eng: assessment.engine_version,
+      why: Boolean(assessment.reason),
       hits: assessment.findings ? assessment.findings.length : 0,
       issues: checkV1(200, assessment, item.purl),
     });
@@ -792,7 +795,7 @@ function logRow(r) {
   const src = (r.source || "-").padEnd(6);
   const eco = r.eco.padEnd(6);
   const ms = String(r.ms).padStart(6);
-  let extra = r.status === 200 ? `lvl=${r.lvl}` : `${r.status} ${r.error || r.state || ""}`;
+  let extra = r.status === 200 ? `lvl=${r.lvl}${r.why ? " why" : ""}` : `${r.status} ${r.error || r.state || ""}`;
   if (r.artifactStatus) extra = `${r.artifactStatus} ${extra}`;
   if (r.frames !== undefined) extra += ` frames=${r.frames}${r.firstMs ? ` first=${r.firstMs}ms` : ""}`;
   if (r.requestId) extra += ` request_id=${r.requestId}`;
@@ -825,6 +828,18 @@ function summarize(rows) {
     const lats = served.filter((r) => r.worker === w).map((r) => r.ms).sort((a, b) => a - b);
     workerLatency[w] = { n: lats.length, p50: percentile(lats, 50), p95: percentile(lats, 95), max: lats[lats.length - 1] };
   }
+  // How many verdicts arrived with an interpretation (`why` on the legacy
+  // route, `reason` on v1). Only rows carrying a level are verdicts: an
+  // `unanalyzed` answer has nothing to explain and would only dilute the rate.
+  const verdicts = ok.filter((r) => r.lvl != null);
+  const why = {
+    n: verdicts.length,
+    with: verdicts.filter((r) => r.why).length,
+    bySource: {},
+  };
+  for (const [src, n] of Object.entries(countBy(verdicts, (r) => r.source || "unknown"))) {
+    why.bySource[src] = { n, with: verdicts.filter((r) => (r.source || "unknown") === src && r.why).length };
+  }
   const byEco = countBy(rows, (r) => r.eco);
   const byKind = countBy(rows, (r) => r.kind);
   return {
@@ -838,6 +853,7 @@ function summarize(rows) {
     byWorker,
     workerLatency,
     served: served.length,
+    why,
     byEco,
     byKind,
     latency: {
@@ -862,6 +878,11 @@ function printReport(rows, summary, feedErrors) {
   process.stdout.write(`latency  p50=${fmtMs(L.p50)} p95=${fmtMs(L.p95)} p99=${fmtMs(L.p99)} max=${fmtMs(L.max)}  (ok n=${L.n})\n`);
   process.stdout.write(`source   ${fmtMap(summary.bySource)}\n`);
   process.stdout.write(`eco      ${fmtMap(summary.byEco)}\n`);
+  const w = summary.why;
+  if (w && w.n) {
+    const per = Object.entries(w.bySource).map(([k, v]) => `${k}=${v.with}/${v.n}`).join(" ");
+    process.stdout.write(`why      ${w.with} of ${w.n} verdicts (${Math.round((w.with / w.n) * 100)}%)  ${per}\n`);
+  }
   const b = summary.bothStats;
   if (b && b.n) {
     process.stdout.write(`\nboth-keys ${b.n} probed  ${b.hit} answered  p50 ${b.both}ms (single key p50 ${b.single}ms)\n`);
@@ -1221,6 +1242,7 @@ export const _test = {
   cratesSparsePath,
   percentile,
   routeMetrics,
+  summarize,
   classify,
   POPULAR,
   popularJobs,

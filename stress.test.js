@@ -307,3 +307,20 @@ test("v1: a miss and an outage are told apart inside a 200", () => {
   assert.equal(_test.classify({ status: 200, artifactStatus: "unavailable" }), "note");
   assert.equal(_test.classify({ status: 200, artifactStatus: "analyzed" }), "ok");
 });
+
+test("summarize counts verdicts that carried an interpretation, by source", () => {
+  const s = _test.summarize([
+    { eco: "npm", kind: "ok", ms: 10, status: 200, source: "cache", lvl: 3, why: true },
+    { eco: "npm", kind: "ok", ms: 12, status: 200, source: "cache", lvl: -1, why: false },
+    { eco: "pypi", kind: "ok", ms: 40, status: 200, source: "scan:analysis", lvl: 2, why: true },
+    // v1 `unanalyzed`: answered, but no verdict, so nothing to explain.
+    { eco: "pypi", kind: "ok", ms: 5, status: 200, source: "cache", artifactStatus: "unanalyzed", why: false },
+    { eco: "cargo", kind: "miss", ms: 7, status: 404 },
+  ]);
+  assert.equal(s.why.n, 3);
+  assert.equal(s.why.with, 2);
+  assert.deepEqual(s.why.bySource, {
+    cache: { n: 2, with: 1 },
+    "scan:analysis": { n: 1, with: 1 },
+  });
+});
