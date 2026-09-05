@@ -4202,6 +4202,24 @@ test("sheddable background work is a penalty, not a refusal", () => {
   assert.equal(_test.foregroundPressure({ ...box, background_in_flight: 40 }), 0, "never negative");
 });
 
+// The kernel's CPU counters beat the load average when scan offers them: a
+// Linux box mid-download carries its blocked threads in load1 and a FreeBSD box
+// does not, so the same work read as saturation on one and calm on the other.
+test("measured cores busy outrank load1, and load1 stands in when absent", () => {
+  const box = { ready: true, slots: 48, slots_free: 8, in_flight: 0, physical_cpus: 16 };
+  // Linux under I/O: load says every core is spoken for, the counters say a quarter are.
+  assert.equal(_test.capability({ ...box, load1: 23, cpu_busy_cores: 4 }, null), null);
+  assert.equal(_test.occupancy({ ...box, load1: 23, cpu_busy_cores: 4 }), 0.25);
+  // The counters can also say what a low load hides.
+  assert.equal(_test.capability({ ...box, load1: 3, cpu_busy_cores: 17 }, null), "host saturated");
+  // A scan too old to report them, or one on a platform without counters, is judged on load1.
+  assert.equal(_test.machineBusy({ ...box, load1: 23 }), 23);
+  assert.equal(_test.machineBusy({ ...box, load1: 23, cpu_busy_cores: null }), 23);
+  assert.equal(_test.machineBusy({ ...box, cpu_busy_cores: 0, load1: 23 }), 0, "a measured zero is a reading, not an absence");
+  // Background discount applies to the measured number too.
+  assert.equal(_test.foregroundPressure({ ...box, load1: 30, cpu_busy_cores: 20, background_in_flight: 12 }), 0.5);
+});
+
 test("capability refuses a saturated host whatever its slots say", () => {
   const cores = 16;
   const free = { ready: true, slots: 48, slots_free: 48, in_flight: 0, physical_cpus: cores };

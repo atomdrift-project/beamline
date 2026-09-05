@@ -2139,10 +2139,28 @@ function occupancy(stats) {
 const HOST_PRESSURE_LIMIT = 1;
 function hostPressure(stats) {
   const cpus = Number(stats?.physical_cpus);
-  const load = Number(stats?.load1);
   if (!Number.isFinite(cpus) || cpus <= 0) return 0;
-  if (!Number.isFinite(load) || load <= 0) return 0;
-  return load / cpus;
+  const busy = machineBusy(stats);
+  if (!Number.isFinite(busy) || busy <= 0) return 0;
+  return busy / cpus;
+}
+
+// How much of the machine is working, in cores. `cpu_busy_cores` when scan
+// reports it: the kernel's own CPU counters over the last poll interval, which
+// mean the same thing on every host. `load1` otherwise, which does not — Linux
+// counts threads blocked on disk in it and FreeBSD counts only runnable ones,
+// so before this field existed the Linux servers read busier than the FreeBSD
+// one for the same work and were the first excluded on every I/O burst.
+// Both are thread counts against physical cores, deliberately: SMT siblings
+// add contention, not capacity, once every core is fed.
+function machineBusy(stats) {
+  // `null` is scan saying "not yet" (one poll old, or no counters here) and
+  // must not read as zero busy cores: Number(null) is 0.
+  const raw = stats?.cpu_busy_cores;
+  const measured = raw == null ? Number.NaN : Number(raw);
+  if (Number.isFinite(measured) && measured >= 0) return measured;
+  const load = Number(stats?.load1);
+  return Number.isFinite(load) ? load : 0;
 }
 
 // The load a new analysis would actually queue behind: the host's, less one
@@ -2153,11 +2171,11 @@ function hostPressure(stats) {
 // server too old to report the field is judged on the whole load, as before.
 function foregroundPressure(stats) {
   const cpus = Number(stats?.physical_cpus);
-  const load = Number(stats?.load1);
   if (!Number.isFinite(cpus) || cpus <= 0) return 0;
-  if (!Number.isFinite(load) || load <= 0) return 0;
+  const busy = machineBusy(stats);
+  if (!Number.isFinite(busy) || busy <= 0) return 0;
   const background = Math.max(0, Number(stats.background_in_flight) || 0);
-  return Math.max(0, load - background) / cpus;
+  return Math.max(0, busy - background) / cpus;
 }
 // Per-isolate stats cache. Isolates are recycled often, which is exactly why
 // scan publishes its own history rather than beamline accumulating one: a cold
@@ -3289,6 +3307,7 @@ export const _test = {
   occupancy,
   capability,
   foregroundPressure,
+  machineBusy,
   CACHE_LAYERS,
   beamlineSource,
   followCandidates,
