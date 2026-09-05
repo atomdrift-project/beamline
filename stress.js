@@ -453,8 +453,19 @@ async function ask(item, url, method) {
       issues,
     });
   } catch (err) {
-    return row(item, { ms: Date.now() - t0, status: 0, error: err.message || String(err), issues: [err.message || String(err)] });
+    const why = reason(err);
+    return row(item, { ms: Date.now() - t0, status: 0, error: why, issues: [why] });
   }
+}
+
+// Node's fetch reports every transport failure with the same message, "fetch
+// failed", and puts the reason — a reset, a TLS failure, a name that would not
+// resolve — in err.cause. A row that keeps only the message cannot tell those
+// apart, so carry the cause alongside it.
+function reason(err) {
+  const msg = err?.message || String(err);
+  const cause = err?.cause?.code || err?.cause?.message;
+  return cause && cause !== msg ? `${msg}: ${cause}` : msg;
 }
 
 // Read a v1 analysis, which answers as a stream: progress while the run is
@@ -536,7 +547,8 @@ async function askStream(item, url) {
       issues: checkV1(200, assessment, item.purl),
     });
   } catch (err) {
-    return row(item, { ms: Date.now() - t0, status: 0, error: err.message || String(err), issues: [err.message || String(err)] });
+    const why = reason(err);
+    return row(item, { ms: Date.now() - t0, status: 0, error: why, issues: [why] });
   }
 }
 

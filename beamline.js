@@ -75,6 +75,15 @@ const LOOKUP_RETRY_DEADLINE_MS = 5_000;
 // the real repair is on scan's side, keeping the ticker off the pool that
 // starves it.
 const STREAM_IDLE_MS = 300_000;
+// How long a stream may go without changing phase before the caller is handed
+// to another worker. Silence is one way a worker can be lost; the other is a
+// worker that keeps the ticker going while its analysis sits behind a
+// saturated pool — every frame says `analyzing`, the phase never moves, and
+// the idle clock above never fires. Measured: `fetch+graft` for 300s and
+// `cleave:resources` for 1800s, each on a heartbeat every 5s. Phase names are
+// scan's own progress report, so a phase that has not changed in this long is
+// a worker that is not going anywhere, whatever its ticker says.
+const STREAM_STALL_MS = 600_000;
 // How many times one analyze stream may be handed to another worker. A resume
 // is cheap when the original survived — scan attaches the retry to the run
 // already in progress — but a fleet dying under us has to terminate, not loop.
@@ -1519,6 +1528,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
           base,
           resume: (dead) => v1Resume(env, ctx, path, bytes, ids, locator, dead),
           idleMs: numEnv(env, "SCAN_STREAM_IDLE_MS", STREAM_IDLE_MS),
+          stallMs: numEnv(env, "SCAN_STREAM_STALL_MS", STREAM_STALL_MS),
           limit: numEnv(env, "SCAN_STREAM_RESUMES", STREAM_RESUMES),
         },
         // Only where there is something to file. An upload has no locator to
@@ -1649,7 +1659,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   // `floor` keeps elapsed times monotonic across a handover: a replacement
   // worker counts from its own zero, and the caller must never watch the run
   // travel backwards.
-  const phase = { name: null, startedElapsed: 0, lastElapsed: 0, floor: 0 };
+  const phase = { name: null, startedElapsed: 0, lastElapsed: 0, floor: 0, changedAt: Date.now() };
 
   const encodeLine = (line) => {
     const annotated = annotatedV1Lines(line, budget, meta, phase);
@@ -1689,12 +1699,16 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     // idle clock has won we stop awaiting the read, and a stream that errors
     // after that would otherwise surface only as an unhandled rejection.
     pending.catch(() => {});
+    // Two clocks: silence, and a phase that stopped changing. Whichever has
+    // less left decides the wait and names the failure.
+    const stallLeft = resume.stallMs ? resume.stallMs - (Date.now() - phase.changedAt) : Infinity;
+    const [why, waitMs] = stallLeft < resume.idleMs ? ["stalled", Math.max(0, stallLeft)] : ["idle", resume.idleMs];
     let timer;
     try {
       return await Promise.race([
         pending,
         new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error("idle")), resume.idleMs);
+          timer = setTimeout(() => reject(new Error(why)), waitMs);
         }),
       ]);
     } finally {
@@ -1742,6 +1756,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     buffered = "";
     phase.floor = phase.lastElapsed;
     phase.name = null;
+    phase.changedAt = Date.now();
     // Announced rather than papered over: the phase sequence restarts here, and
     // a caller watching progress is owed the reason. No `status` field, so a
     // reader looking for the terminal frame passes over it like any other
@@ -1824,7 +1839,8 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
           // it the stream ends undecided — which is what the caller has to be
           // allowed to see, since erroring here would be indistinguishable from
           // the truncation we just failed to repair.
-          if (await handover(err?.message === "idle" ? "idle" : "error")) continue;
+          const why = err?.message === "idle" || err?.message === "stalled" ? err.message : "error";
+          if (await handover(why)) continue;
           finished = true;
           continue;
         }
@@ -1917,6 +1933,7 @@ function annotatedV1Lines(line, budget, meta, phase) {
   if (!phase.name) {
     phase.name = name;
     phase.startedElapsed = elapsed;
+    phase.changedAt = Date.now();
     rows.push(JSON.stringify(phaseFrame(row, meta, phase, "started", elapsed)));
   } else {
     rows.push(JSON.stringify(phaseFrame(row, meta, phase, "running", elapsed)));
@@ -2116,6 +2133,10 @@ function occupancy(stats) {
 // sized on physical cores, and using logical would halve the apparent pressure
 // on any host with SMT — which is every host where this matters most. A worker
 // too old to report it contributes nothing rather than a guess.
+// load1 per physical core above which a worker is not offered work at all.
+// Below it the same number is a ranking penalty (see `occupancy`); at 1 every
+// core already has a runnable thread and a new analysis can only wait.
+const HOST_PRESSURE_LIMIT = 1;
 function hostPressure(stats) {
   const cpus = Number(stats?.physical_cpus);
   const load = Number(stats?.load1);
@@ -2427,6 +2448,12 @@ function capability(stats, sizeHint) {
   if (!stats) return null; // unknown: let the breaker decide, not a guess
   if (stats.ready === false) return "not ready";
   if (stats.overloaded === true) return "overloaded";
+  // A machine with more runnable threads than cores queues everything sent
+  // to it, whatever its own slot count says. The slots describe the server;
+  // the load describes the box the pull worker and any batch scan share with
+  // it. Measured: `slots_free=48 in_flight=0` beside `load1=23` on 16 cores,
+  // and an analysis dispatched there waited five minutes to start.
+  if (hostPressure(stats) > HOST_PRESSURE_LIMIT) return "host saturated";
   // Not a slow worker — a closed one. scan's slot acquire is non-blocking and
   // answers 429 rather than queueing, so dispatching here buys a rejection.
   if ((stats.slots_free ?? 1) <= 0) return "at capacity";
@@ -3236,6 +3263,7 @@ function trimSlash(s) {
 
 export const _test = {
   occupancy,
+  capability,
   CACHE_LAYERS,
   beamlineSource,
   followCandidates,

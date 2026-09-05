@@ -4180,3 +4180,19 @@ test("v1 analyze: a decision without a trailing newline is an answer, not a trun
   assert.equal(frames.at(-1).status, "analyzed");
   assert.equal(_test.breakerFor(DEAD).open(), false);
 });
+
+// The slots describe the server; the load describes the box. A pull worker
+// beside the server can have every core busy while the server reports every
+// slot free, and a router that only ranks on that sends work to a queue.
+// Measured: slots_free=48, in_flight=0, load1=23 on 16 cores — and the
+// analysis dispatched there waited five minutes to start.
+test("capability refuses a saturated host whatever its slots say", () => {
+  const cores = 16;
+  const free = { ready: true, slots: 48, slots_free: 48, in_flight: 0, physical_cpus: cores };
+  assert.equal(_test.capability({ ...free, load1: 23 }, null), "host saturated");
+  // Busy is a ranking matter, not a refusal, until every core has a runnable thread.
+  assert.equal(_test.capability({ ...free, load1: 15 }, null), null);
+  // A worker too old to report its cores is judged on its slots alone.
+  assert.equal(_test.capability({ ...free, physical_cpus: undefined, load1: 23 }, null), null);
+  assert.equal(_test.capability({ ...free, slots_free: 0, load1: 0 }, null), "at capacity");
+});
