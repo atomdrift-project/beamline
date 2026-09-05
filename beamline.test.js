@@ -4186,6 +4186,22 @@ test("v1 analyze: a decision without a trailing newline is an answer, not a trun
 // slot free, and a router that only ranks on that sends work to a queue.
 // Measured: slots_free=48, in_flight=0, load1=23 on 16 cores — and the
 // analysis dispatched there waited five minutes to start.
+// The pull worker's own jobs are load the box sheds when asked, so they must
+// not make it unroutable — only rank it lower. Measured 2026-09-05: 24 idle
+// slots on 16 cores held load1 at 20 with nothing interactive in flight, and
+// the server was excluded as saturated for hours while its reserve sat empty.
+test("sheddable background work is a penalty, not a refusal", () => {
+  const box = { ready: true, slots: 48, slots_free: 4, in_flight: 0, physical_cpus: 16, load1: 20 };
+  assert.equal(_test.capability({ ...box, background_in_flight: 12 }, null), null, "idle work discounted");
+  assert.equal(_test.capability(box, null), "host saturated", "a server that cannot say is judged on the whole load");
+  // Foreground load still refuses: twelve idle jobs do not excuse twenty-eight threads.
+  assert.equal(_test.capability({ ...box, load1: 30, background_in_flight: 12 }, null), "host saturated");
+  // The whole load stays in the ranking, so a quiet box is still preferred.
+  assert.ok(_test.occupancy({ ...box, background_in_flight: 12 }) > 1, "ranked as the busy box it is");
+  assert.equal(_test.foregroundPressure({ ...box, background_in_flight: 12 }), 0.5);
+  assert.equal(_test.foregroundPressure({ ...box, background_in_flight: 40 }), 0, "never negative");
+});
+
 test("capability refuses a saturated host whatever its slots say", () => {
   const cores = 16;
   const free = { ready: true, slots: 48, slots_free: 48, in_flight: 0, physical_cpus: cores };

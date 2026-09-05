@@ -2144,6 +2144,21 @@ function hostPressure(stats) {
   if (!Number.isFinite(load) || load <= 0) return 0;
   return load / cpus;
 }
+
+// The load a new analysis would actually queue behind: the host's, less one
+// runnable thread for each pull-queue job the server reports in
+// `background_in_flight`. One thread each is deliberately conservative — an
+// analysis fans out on rayon and may hold more — because what matters is that
+// the discount is bounded by work the server itself says is sheddable, and a
+// server too old to report the field is judged on the whole load, as before.
+function foregroundPressure(stats) {
+  const cpus = Number(stats?.physical_cpus);
+  const load = Number(stats?.load1);
+  if (!Number.isFinite(cpus) || cpus <= 0) return 0;
+  if (!Number.isFinite(load) || load <= 0) return 0;
+  const background = Math.max(0, Number(stats.background_in_flight) || 0);
+  return Math.max(0, load - background) / cpus;
+}
 // Per-isolate stats cache. Isolates are recycled often, which is exactly why
 // scan publishes its own history rather than beamline accumulating one: a cold
 // isolate gets a warm estimate from the first poll instead of routing blind
@@ -2453,7 +2468,16 @@ function capability(stats, sizeHint) {
   // the load describes the box the pull worker and any batch scan share with
   // it. Measured: `slots_free=48 in_flight=0` beside `load1=23` on 16 cores,
   // and an analysis dispatched there waited five minutes to start.
-  if (hostPressure(stats) > HOST_PRESSURE_LIMIT) return "host saturated";
+  //
+  // Judged on foreground load, not the whole of it. The idle worker's jobs
+  // are on the box and in load1, and they are the load that leaves when we
+  // send work: it stops claiming the moment a request lands and the server
+  // keeps a core reserve it cannot touch. Counting them here made a server
+  // full of sheddable work unroutable, and nothing could clear that — the
+  // worker yields to traffic, and the report kept the traffic away. Three of
+  // four servers sat idle on the interactive path that way (2026-09-05).
+  // They still rank below a quiet box: `occupancy` keeps the whole load.
+  if (foregroundPressure(stats) > HOST_PRESSURE_LIMIT) return "host saturated";
   // Not a slow worker — a closed one. scan's slot acquire is non-blocking and
   // answers 429 rather than queueing, so dispatching here buys a rejection.
   if ((stats.slots_free ?? 1) <= 0) return "at capacity";
@@ -3264,6 +3288,7 @@ function trimSlash(s) {
 export const _test = {
   occupancy,
   capability,
+  foregroundPressure,
   CACHE_LAYERS,
   beamlineSource,
   followCandidates,
