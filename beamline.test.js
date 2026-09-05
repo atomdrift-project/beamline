@@ -232,9 +232,14 @@ test("occupancy sees the machine, not just the server", () => {
     `scored ${_test.occupancy(idleLooking)} for a node with 50 of 64 cores busy`,
   );
 
-  // Its own work still counts when that is the larger of the two.
+  // Its own work is measured against its cores: eight analyses on sixty-four
+  // cores is an eighth busy, however many slots it advertised. (Whether it can
+  // *accept* another is capability()'s question, asked of slots_free.)
   const serving = { slots: 8, slots_free: 0, in_flight: 8, load1: 1, physical_cpus: 64 };
-  assert.equal(_test.occupancy(serving), 1, "a full server is full");
+  assert.equal(_test.occupancy(serving), 0.125, "eight running on sixty-four cores");
+  // And on four cores, three running is most of the box — the case that let
+  // a small server win the fleet on its averages and then fall over.
+  assert.equal(_test.occupancy({ slots: 12, slots_free: 9, in_flight: 3, load1: 3, physical_cpus: 4 }), 0.75);
 
   // Not added: the server's own analyses show up in load1 too, so summing
   // would charge for them twice.
@@ -4196,8 +4201,9 @@ test("sheddable background work is a penalty, not a refusal", () => {
   assert.equal(_test.capability(box, null), "host saturated", "a server that cannot say is judged on the whole load");
   // Foreground load still refuses: twelve idle jobs do not excuse twenty-eight threads.
   assert.equal(_test.capability({ ...box, load1: 30, background_in_flight: 12 }, null), "host saturated");
-  // The whole load stays in the ranking, so a quiet box is still preferred.
-  assert.ok(_test.occupancy({ ...box, background_in_flight: 12 }) > 1, "ranked as the busy box it is");
+  // The ranking reads the load that stays: twenty busy less twelve sheddable
+  // on sixteen cores is half a box, not a full one.
+  assert.equal(_test.occupancy({ ...box, background_in_flight: 12 }), 0.5, "ranked on foreground load");
   assert.equal(_test.foregroundPressure({ ...box, background_in_flight: 12 }), 0.5);
   assert.equal(_test.foregroundPressure({ ...box, background_in_flight: 40 }), 0, "never negative");
 });
@@ -4218,6 +4224,20 @@ test("measured cores busy outrank load1, and load1 stands in when absent", () =>
   assert.equal(_test.machineBusy({ ...box, cpu_busy_cores: 0, load1: 23 }), 0, "a measured zero is a reading, not an absence");
   // Background discount applies to the measured number too.
   assert.equal(_test.foregroundPressure({ ...box, load1: 30, cpu_busy_cores: 20, background_in_flight: 12 }), 0.5);
+});
+
+// The probe is exploration tied to starvation: the favourite is never probed,
+// a refused probe is never sent, and a worker used inside the window is not
+// starved. A cold isolate probes nobody until it has been alive for the window.
+test("a starved worker with room is offered one request", () => {
+  const W = _test.STARVE_PROBE_MS;
+  const w = (slots_free) => ({ stats: { slots_free } });
+  const pool = [w(4), w(16), w(0), w(8)];
+  assert.equal(_test.probeIndex(pool, [W * 2, W * 2, W * 2, W * 2]), 1, "the first starved worker with room, never index 0");
+  assert.equal(_test.probeIndex(pool, [W * 2, W - 1, W * 2, W * 2]), 3, "recently used is not starved; full is not probed");
+  assert.equal(_test.probeIndex(pool, [0, 0, 0, 0]), -1, "a cold isolate probes nobody");
+  assert.equal(_test.probeIndex([w(4), { stats: null }], [W * 2, W * 2]), -1, "unpolled is not evidence of room");
+  assert.equal(_test.probeIndex([w(4)], [W * 2]), -1, "one worker has nobody to probe");
 });
 
 test("capability refuses a saturated host whatever its slots say", () => {

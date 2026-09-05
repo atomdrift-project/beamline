@@ -1411,6 +1411,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
   }
   for (const base of ranked) {
     const worker = hostOf(base);
+    lastDispatch.set(base, Date.now());
     let upstream;
     try {
       // The query names the package and the body is the artifact, so a request
@@ -2119,31 +2120,38 @@ const CAPACITY_WEIGHT = 1.0;
 //
 // Unknown slots mean an unknown answer, and 0 keeps such a worker ranked on
 // latency alone rather than inventing a penalty for it.
+//
+// The server's own term is analyses in flight over *cores*, not over slots.
+// Slots are sized at three per core, so `in_flight / slots` said a four-core
+// box with three analyses running was a quarter busy when every core it had
+// was spoken for. Measured at concurrency 8 (2026-09-05): that box won 80% of
+// the fleet's dispatches on the strength of its small-package averages, then
+// saturated and was excluded, while a 128-core box took 11%. A worker too old
+// to report its cores is measured against its slots, as before.
+//
+// The host term is foreground pressure — machine busy less the cores its pull
+// worker holds — because that work leaves when a request lands, and ranking
+// on it penalized the two biggest boxes for load that would not be there.
 function occupancy(stats) {
   const slots = Number(stats?.slots);
   if (!Number.isFinite(slots) || slots <= 0) return 0;
   const running = Number(stats.in_flight ?? slots - (stats.slots_free ?? slots));
-  const mine = Number.isFinite(running) ? Math.max(0, running) / slots : 0;
-  return Math.max(mine, hostPressure(stats));
+  const cpus = Number(stats.physical_cpus);
+  const denominator = Number.isFinite(cpus) && cpus > 0 ? cpus : slots;
+  const mine = Number.isFinite(running) ? Math.max(0, running) / denominator : 0;
+  return Math.max(mine, foregroundPressure(stats));
 }
 
-// What the whole machine is doing, over the cores it really has.
+// Foreground busy threads per physical core above which a worker is not
+// offered work at all. Below it the same number is a ranking penalty (see
+// `occupancy`); at 1 every core already has a runnable thread that will not
+// yield, and a new analysis can only wait.
 //
 // `physical_cpus` rather than the logical count `/_/info` reports: slots are
 // sized on physical cores, and using logical would halve the apparent pressure
 // on any host with SMT — which is every host where this matters most. A worker
-// too old to report it contributes nothing rather than a guess.
-// load1 per physical core above which a worker is not offered work at all.
-// Below it the same number is a ranking penalty (see `occupancy`); at 1 every
-// core already has a runnable thread and a new analysis can only wait.
+// too old to report it contributes no host term rather than a guess.
 const HOST_PRESSURE_LIMIT = 1;
-function hostPressure(stats) {
-  const cpus = Number(stats?.physical_cpus);
-  if (!Number.isFinite(cpus) || cpus <= 0) return 0;
-  const busy = machineBusy(stats);
-  if (!Number.isFinite(busy) || busy <= 0) return 0;
-  return busy / cpus;
-}
 
 // How much of the machine is working, in cores. `cpu_busy_cores` when scan
 // reports it: the kernel's own CPU counters over the last poll interval, which
@@ -2163,12 +2171,12 @@ function machineBusy(stats) {
   return Number.isFinite(load) ? load : 0;
 }
 
-// The load a new analysis would actually queue behind: the host's, less one
-// runnable thread for each pull-queue job the server reports in
-// `background_in_flight`. One thread each is deliberately conservative — an
-// analysis fans out on rayon and may hold more — because what matters is that
-// the discount is bounded by work the server itself says is sheddable, and a
-// server too old to report the field is judged on the whole load, as before.
+// The load a new analysis would actually queue behind: the machine's, less
+// the cores the server says its pull worker holds (`background_in_flight`).
+// That number is bounded by the pull worker's core budget, which is what
+// makes subtracting it safe: it can never exceed what is sheddable, and the
+// remainder is work that stays when a request lands. A server too old to
+// report the field is judged on the whole load, as before.
 function foregroundPressure(stats) {
   const cpus = Number(stats?.physical_cpus);
   if (!Number.isFinite(cpus) || cpus <= 0) return 0;
@@ -2177,6 +2185,42 @@ function foregroundPressure(stats) {
   const background = Math.max(0, Number(stats.background_in_flight) || 0);
   return Math.max(0, busy - background) / cpus;
 }
+// When a routable worker has received nothing from this isolate for this long,
+// it is offered the next dispatch regardless of its rank: one request, to
+// give it a sample its own history can be repaired from.
+//
+// A worker that has been excluded for a while carries the averages of that
+// period into the hour after it, ranks last on them, and — with no
+// exploration by design — never receives the request that would correct them.
+// Measured 2026-09-05: a 16-core server with sixteen free permits took zero of
+// 128 analyses at concurrency 8, predicted at 150s from a window spent starved.
+// This is exploration tied to starvation, not to a coin: a worker that is
+// being used needs none, and one that is not gets exactly one request per
+// isolate per five minutes, which is the cheapest evidence there is.
+const STARVE_PROBE_MS = 300_000;
+const lastDispatch = new Map();
+const isolateBorn = Date.now();
+
+// Index into `pool` of the worker to probe, or -1. Never the favourite (it is
+// being used), never a worker with no free slot (the probe would be refused),
+// and never one this isolate has dispatched to inside the window. `ages` is
+// milliseconds since each pool entry was last dispatched to; a worker never
+// dispatched to counts from the isolate's birth, so a cold isolate probes
+// nobody for its first five minutes rather than everybody at once.
+function probeIndex(pool, ages) {
+  for (let i = 1; i < pool.length; i++) {
+    const w = pool[i];
+    if (w.stats == null) continue;
+    if ((w.stats.slots_free ?? 1) <= 0) continue;
+    if (ages[i] >= STARVE_PROBE_MS) return i;
+  }
+  return -1;
+}
+
+function dispatchAge(base, now) {
+  return now - (lastDispatch.get(base) ?? isolateBorn);
+}
+
 // Per-isolate stats cache. Isolates are recycled often, which is exactly why
 // scan publishes its own history rather than beamline accumulating one: a cold
 // isolate gets a warm estimate from the first poll instead of routing blind
@@ -2647,7 +2691,7 @@ async function lookupOrder(env, ctx, workers, ids) {
   return order;
 }
 
-async function rankPool(env, ctx, workers, hint) {
+async function rankPool(env, ctx, workers, hint, probe = false) {
   const polled = await Promise.all(
     workers.map(async (base, i) => ({ base, i, stats: await scanStats(env, ctx, base) })),
   );
@@ -2699,16 +2743,27 @@ async function rankPool(env, ctx, workers, hint) {
   // `informed` says the favourite was chosen on measurement rather than on the
   // configured order, which is the difference between a plan worth reading and
   // a coin toss.
-  return { pool, excluded: usable.length ? scored.filter((w) => w.why != null) : [], informed: pool[0].known };
+  let probed;
+  if (probe && pool.length > 1) {
+    const now = Date.now();
+    const i = probeIndex(pool, pool.map((w) => dispatchAge(w.base, now)));
+    if (i > 0) {
+      const [w] = pool.splice(i, 1);
+      pool.unshift(w);
+      probed = hostOf(w.base);
+    }
+  }
+  return { pool, excluded: usable.length ? scored.filter((w) => w.why != null) : [], informed: pool[0].known, probed };
 }
 
 async function rankWorkers(env, ctx, workers, ids, hint) {
-  const ranked = await rankPool(env, ctx, workers, hint);
+  const ranked = await rankPool(env, ctx, workers, hint, true);
   logLine("scan_route", {
     order: ranked.pool.map((w) => hostOf(w.base)).join(","),
     est_ms: ranked.pool.map((w) => Math.round(w.est)).join(","),
     excluded: ranked.excluded.length || undefined,
     informed: ranked.informed || undefined,
+    probed: ranked.probed,
     size: hint?.bytes ?? undefined,
     type: hint?.purl ? purlType(hint.purl) : undefined,
     ...ids,
@@ -3308,6 +3363,8 @@ export const _test = {
   capability,
   foregroundPressure,
   machineBusy,
+  probeIndex,
+  STARVE_PROBE_MS,
   CACHE_LAYERS,
   beamlineSource,
   followCandidates,
