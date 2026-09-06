@@ -2217,6 +2217,15 @@ function probeIndex(pool, ages) {
   return -1;
 }
 
+// The estimate a starved worker competes with: its own, unless that is worse
+// than the fleet's median, in which case the median. Pure; rankPool applies
+// it to workers past STARVE_PROBE_MS.
+function starvedEstimate(own, fleetEsts) {
+  const known = [...fleetEsts].sort((a, b) => a - b);
+  if (known.length < 2) return own;
+  return Math.min(own, known[Math.floor(known.length / 2)]);
+}
+
 function dispatchAge(base, now) {
   return now - (lastDispatch.get(base) ?? isolateBorn);
 }
@@ -2707,6 +2716,28 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
     why: capability(stats, hint?.bytes ?? null),
     r: Math.random(),
   }));
+  // A starved worker's own history is the wrong prior. It ranks on samples
+  // from whatever period stopped it being used — an hour of saturation, an
+  // exclusion — and with no requests arriving nothing replaces them; measured
+  // 2026-09-05 a 128-core server that had just answered its one probe in 3s
+  // was still estimated at 23-431s from the hour before and took 1% of a run.
+  // So while it is starved its estimate is capped at the fleet's median: it
+  // then competes as an ordinary worker, its real samples arrive, and the cap
+  // stops applying the moment it is being used again.
+  if (probe) {
+    const now = Date.now();
+    const known = scored.filter((w) => w.stats != null && w.known).map((w) => w.est).sort((a, b) => a - b);
+    if (known.length > 1) {
+      for (const w of scored) {
+        if (w.stats == null || dispatchAge(w.base, now) < STARVE_PROBE_MS) continue;
+        const capped = starvedEstimate(w.est, known);
+        if (capped < w.est) {
+          w.est = capped;
+          w.starved = true;
+        }
+      }
+    }
+  }
   const usable = scored.filter((w) => w.why == null);
   // Everything filtered out means the filter is wrong, or the fleet is. Either
   // way, refusing to dispatch is worse than dispatching on stale information.
@@ -2753,7 +2784,14 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
       probed = hostOf(w.base);
     }
   }
-  return { pool, excluded: usable.length ? scored.filter((w) => w.why != null) : [], informed: pool[0].known, probed };
+  const starved = scored.filter((w) => w.starved).map((w) => hostOf(w.base));
+  return {
+    pool,
+    excluded: usable.length ? scored.filter((w) => w.why != null) : [],
+    informed: pool[0].known,
+    probed,
+    starved: starved.length ? starved.join(",") : undefined,
+  };
 }
 
 async function rankWorkers(env, ctx, workers, ids, hint) {
@@ -2764,6 +2802,7 @@ async function rankWorkers(env, ctx, workers, ids, hint) {
     excluded: ranked.excluded.length || undefined,
     informed: ranked.informed || undefined,
     probed: ranked.probed,
+    starved: ranked.starved,
     size: hint?.bytes ?? undefined,
     type: hint?.purl ? purlType(hint.purl) : undefined,
     ...ids,
@@ -3364,6 +3403,7 @@ export const _test = {
   foregroundPressure,
   machineBusy,
   probeIndex,
+  starvedEstimate,
   STARVE_PROBE_MS,
   CACHE_LAYERS,
   beamlineSource,

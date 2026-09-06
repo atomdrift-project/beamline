@@ -4240,6 +4240,16 @@ test("a starved worker with room is offered one request", () => {
   assert.equal(_test.probeIndex([w(4)], [W * 2]), -1, "one worker has nobody to probe");
 });
 
+// A starved worker is ranked on the fleet's median rather than the history of
+// the period that starved it; a starved worker that is already faster keeps
+// its own number, and a fleet of one has no median to offer.
+test("a starved worker's estimate is capped at the fleet median", () => {
+  assert.equal(_test.starvedEstimate(431000, [12000, 26000, 431000]), 26000, "capped at the median");
+  assert.equal(_test.starvedEstimate(9000, [12000, 26000, 9000]), 9000, "a fast worker keeps its own");
+  assert.equal(_test.starvedEstimate(431000, [431000]), 431000, "no fleet, no cap");
+  assert.equal(_test.starvedEstimate(431000, [12000, 26000, 30000, 431000]), 30000, "upper median of an even fleet");
+});
+
 test("capability refuses a saturated host whatever its slots say", () => {
   const cores = 16;
   const free = { ready: true, slots: 48, slots_free: 48, in_flight: 0, physical_cpus: cores };
