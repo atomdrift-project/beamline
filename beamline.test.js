@@ -2998,6 +2998,13 @@ function mockBackend(opts) {
         rid: req.headers["x-request-id"] || "",
       });
       const body = await readReq(req);
+      if (opts.route) {
+        const out = opts.route(url, req.method);
+        if (out) {
+          res.writeHead(out.status ?? 200, out.headers ?? { "content-type": "application/json" });
+          return res.end(out.body == null ? "" : typeof out.body === "string" ? out.body : JSON.stringify(out.body));
+        }
+      }
       if (url.pathname === "/_/stats") {
         hits.stats += 1;
         if (!opts.stats) return send(res, 404, { error: "not found" });
@@ -3267,6 +3274,110 @@ test("occupancy scales the estimate; queue depth is still not added to it", asyn
     assert.equal(body.routes[0].dispatch[0].est_ms, 3500);
   } finally {
     await Promise.all([hopper.close(), busy.close()]);
+  }
+});
+
+test("occupancy counts what this isolate sent since the stats were polled", () => {
+  const stats = statsFor({ slots: 12, free: 12, inFlight: 0, physical_cpus: 4 });
+  assert.equal(_test.occupancy(stats), 0);
+  assert.equal(_test.occupancy(stats, 2), 0.5, "two of four cores are spoken for by our own dispatches");
+  assert.equal(_test.pendingSince("http://nowhere", null), 0, "no poll, nothing to count against");
+});
+
+test("a dispatch inside the stats window raises the estimate until the next poll", async () => {
+  _test.reset();
+  const hopper = await mockBackend({ bloom: "unknown" });
+  const idle = await mockBackend({ stats: statsFor({ slots: 4, free: 4, inFlight: 0, ms: 2000 }) });
+  const env = testEnv(hopper.url, { SCAN_URL: idle.url });
+  try {
+    const before = await (await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx)).json();
+    assert.equal(before.routes[0].dispatch[0].est_ms, 2000);
+    _test.noteDispatch(idle.url);
+    const after = await (await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx)).json();
+    // 2000 * (1 + 1/4): one of four slots is ours, whatever the cached stats say.
+    assert.equal(after.routes[0].dispatch[0].est_ms, 2500, "the router forgot what it had just sent");
+  } finally {
+    await Promise.all([hopper.close(), idle.close()]);
+  }
+});
+
+test("capability keeps a big analysis off a worker with every whale slot taken", () => {
+  const full = statsFor({ whale_slots: { in_use: 1, max: 1 } });
+  assert.equal(_test.capability(full, 1 << 20), null, "a small analysis needs no whale slot");
+  assert.equal(_test.capability(full, _test.BIG_JOB_BYTES + 1), "whale slots full");
+  assert.equal(_test.capability(statsFor({ whale_slots: { in_use: 0, max: 1 } }), _test.BIG_JOB_BYTES + 1), null);
+  // The upload cap applies to bytes the caller sends, not to a package the
+  // worker will fetch for itself.
+  const tiny = statsFor({ max_upload_mb: 1 });
+  assert.equal(_test.capability(tiny, 2 << 20), null);
+  assert.match(_test.capability(tiny, 2 << 20, true), /upload limit/);
+});
+
+test("a known whale is ranked by the threads each worker can give it", () => {
+  const small = statsFor({ physical_cpus: 4 });
+  const big = statsFor({ physical_cpus: 128 });
+  assert.equal(_test.whaleSlowdown(small, { bytes: _test.BIG_JOB_BYTES + 1 }), 8, "2 threads against 16");
+  assert.equal(_test.whaleSlowdown(big, { bytes: _test.BIG_JOB_BYTES + 1 }), 1);
+  assert.equal(_test.whaleSlowdown(small, { bytes: 1 << 20 }), 1, "a small package is not a whale");
+  assert.equal(_test.whaleSlowdown(small, { purl: "pkg:npm/x@1" }), 1, "no size, no opinion");
+});
+
+test("registry size: pypi from the release document, npm from the tarball itself", async () => {
+  const registry = await mockBackend({
+    route: (url, method) => {
+      if (url.pathname === "/pypi/big-wheel/1.0.0/json") {
+        return { body: { urls: [{ size: 1000 }, { size: 20 << 20 }] } };
+      }
+      if (url.pathname === "/@scope/pkg/2.0.0") return { body: { dist: { tarball: `${registry.url}/pkg-2.0.0.tgz` } } };
+      if (url.pathname === "/pkg-2.0.0.tgz" && method === "HEAD") {
+        return { headers: { "content-length": "9437184", "content-type": "application/octet-stream" } };
+      }
+      return null;
+    },
+  });
+  const env = { PYPI_URL: registry.url, NPM_REGISTRY_URL: registry.url };
+  try {
+    assert.equal(await _test.registrySize(env, waitCtx().ctx, "pkg:pypi/big-wheel@1.0.0", {}), 20 << 20);
+    assert.equal(await _test.registrySize(env, waitCtx().ctx, "pkg:npm/%40scope/pkg@2.0.0", {}), 9437184);
+    assert.equal(await _test.registrySize(env, waitCtx().ctx, "pkg:cargo/serde@1.0.0", {}), null, "no cheap size for cargo");
+    assert.equal(await _test.registrySize(env, waitCtx().ctx, "pkg:pypi/missing@0.1", {}), null, "an unknown release is no hint");
+    assert.deepEqual(_test.purlNameVersion("pkg:npm/%40scope/pkg@2.0.0"), { type: "npm", name: "@scope/pkg", version: "2.0.0" });
+    assert.equal(_test.purlNameVersion("pkg:npm/unversioned"), null);
+  } finally {
+    await registry.close();
+  }
+});
+
+test("v1 analyze: a big wheel goes to the worker with whale room, not the emptiest small box", async () => {
+  _test.reset();
+  const registry = await mockBackend({
+    route: (url) => (url.pathname === "/pypi/big-wheel/1.0.0/json" ? { body: { urls: [{ size: 80 << 20 }] } } : null),
+  });
+  const FRAME = '{"state":"analyzing","purl":"pkg:pypi/big-wheel@1.0.0","elapsed_ms":40,"phase":"unpack"}';
+  const DECISION = '{"decision":"allow","fires_at":-1,"purl":"pkg:pypi/big-wheel@1.0.0"}';
+  // Faster on paper and idle, but 4 cores and its one whale slot busy.
+  const small = await mockBackend({
+    stats: statsFor({ slots: 12, free: 12, inFlight: 0, ms: 1000, physical_cpus: 4, whale_slots: { in_use: 1, max: 1 } }),
+    analyzeStream: [FRAME, DECISION],
+  });
+  const big = await mockBackend({
+    stats: statsFor({ slots: 384, free: 300, inFlight: 84, ms: 3000, physical_cpus: 128, whale_slots: { in_use: 2, max: 8 } }),
+    analyzeStream: [FRAME, DECISION],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: `${small.url},${big.url}`, PYPI_URL: registry.url });
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Apypi%2Fbig-wheel%401.0.0", { method: "POST" }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200);
+    const frames = (await res.text()).trim().split("\n").map(JSON.parse);
+    assert.equal(frames.at(-1).status, "analyzed");
+    assert.equal(big.hits.analyze, 1, "the whale was not sent where the whale slots are");
+    assert.equal(small.hits.analyze, 0, "a full whale slot was dispatched to anyway");
+  } finally {
+    await Promise.all([registry.close(), small.close(), big.close()]);
   }
 });
 
@@ -3980,6 +4091,84 @@ test("v1 analyze: a clean close with no decision is a truncation too", async () 
     assert.equal(healthy.hits.analyze, 1, "the surviving worker was never asked");
   } finally {
     await Promise.all([quiet.close(), healthy.close()]);
+  }
+});
+
+// A worker that finds every big-analysis slot taken after the stream has begun
+// says so and closes without a decision. The caller is finished elsewhere, and
+// the refusal is not charged: the worker answered promptly and correctly.
+test("v1 analyze: a refusal mid-stream moves the caller on without charging the worker", async () => {
+  _test.reset();
+  const REFUSED = '{"state":"refused","purl":"pkg:npm/cut@1.0.0","elapsed_ms":900,"error":"whale lane at capacity","lane":"whale"}';
+  const full = await mockBackend({ analyzeStream: [CUT_FRAME, REFUSED] });
+  const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+  const env = testEnv(DEAD, { SCAN_URL: `${full.url},${healthy.url}` });
+  try {
+    for (let i = 0; i < _test.BREAKER_FAILS; i++) {
+      const frames = await analyzeFrames({ ...env, cache: _test.memoryCache() });
+      assert.equal(frames.at(-1).status, "analyzed", "a refusal was taken for an answer");
+      assert.equal(
+        frames.some((f) => f.state === "resumed"),
+        true,
+        "the handover was not announced to the caller",
+      );
+    }
+    assert.equal(healthy.hits.analyze, _test.BREAKER_FAILS, "the worker with room was not asked every time");
+    assert.equal(_test.breakerFor(full.url).open(), false, "a prompt refusal was charged as a fault");
+  } finally {
+    await Promise.all([full.close(), healthy.close()]);
+  }
+});
+
+// Refusals are not handovers. Three workers with their big-analysis slots busy
+// must not use up the budget the fourth worker's long analysis will need, and
+// a worker that has refused is not asked again while another is untried.
+test("v1 analyze: refusals neither spend the handover budget nor repeat a refuser", async () => {
+  _test.reset();
+  const REFUSED = '{"state":"refused","purl":"pkg:npm/cut@1.0.0","elapsed_ms":900,"error":"whale lane at capacity","lane":"whale"}';
+  const full = await Promise.all([1, 2, 3].map(() => mockBackend({ analyzeStream: [CUT_FRAME, REFUSED] })));
+  const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+  const env = testEnv(DEAD, {
+    SCAN_URL: [...full.map((b) => b.url), healthy.url].join(","),
+    SCAN_STREAM_RESUMES: "1",
+  });
+  try {
+    const frames = await analyzeFrames(env);
+    assert.equal(frames.at(-1).status, "analyzed", "three refusals were taken for an exhausted budget");
+    assert.equal(healthy.hits.analyze, 1, "the worker with room was not reached");
+    for (const b of full) assert.equal(b.hits.analyze, 1, "a refuser was asked again before the untried worker");
+  } finally {
+    await Promise.all([...full, healthy].map((b) => b.close()));
+  }
+});
+
+// A stall is a phase that has not changed, on a stream that is still talking.
+// With no handover left it is read on, not cut: the worker is alive and the
+// decision is still coming.
+test("v1 analyze: a long phase on a talking stream is waited out once handovers are spent", async () => {
+  _test.reset();
+  const slow = await mockBackend({
+    analyzeStream: async function* longPhase() {
+      for (let i = 0; i < 8; i++) {
+        yield CUT_FRAME;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      yield CUT_DECISION;
+    },
+  });
+  const env = testEnv(DEAD, {
+    SCAN_URL: slow.url,
+    SCAN_STREAM_STALL_MS: "50",
+    SCAN_STREAM_IDLE_MS: "1000",
+    SCAN_STREAM_RESUMES: "0",
+  });
+  try {
+    const frames = await analyzeFrames(env);
+    assert.equal(frames.at(-1).status, "analyzed", "a talking stream was cut at its first stall");
+    assert.equal(slow.hits.analyze, 1, "the stall was handed over instead of waited out");
+    assert.equal(_test.breakerFor(slow.url).open(), false, "a stall on a live stream was charged as a fault");
+  } finally {
+    await slow.close();
   }
 });
 

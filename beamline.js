@@ -88,6 +88,10 @@ const STREAM_STALL_MS = 600_000;
 // is cheap when the original survived — scan attaches the retry to the run
 // already in progress — but a fleet dying under us has to terminate, not loop.
 const STREAM_RESUMES = 3;
+// Mid-stream refusals a request may take before it is given up on. A refusal
+// is a worker with every big-analysis slot busy; the fleet has four workers,
+// and each is asked again only once every other one has refused.
+const MAX_STREAM_REFUSALS = 8;
 // How long beamline keeps reading an analysis whose caller has gone.
 //
 // The run is already paid for and already happening: scan detaches the
@@ -1329,7 +1333,15 @@ async function handleV1Analyze(request, env, ctx, url) {
   // progress rather than starting another beside it, so a caller who
   // reconnected belongs back on that worker — anywhere else pays for the whole
   // analysis a second time.
-  const busy = locator ? await runningWorker(env, ctx, locator, ids) : null;
+  // Three round trips that do not depend on each other, taken together: who
+  // is already running this package, what it weighs, and how the fleet looks
+  // right now. In sequence they cost a worker round trip apiece; measured
+  // 2026-09-06 the router's share of a median answer was 600ms.
+  const [busy, sizeHint] = await Promise.all([
+    locator ? runningWorker(env, ctx, locator, ids) : null,
+    locator?.type === "purl" ? registrySize(env, ctx, locator.value, ids) : (bytes ? bytes.byteLength : null),
+    Promise.all(scanWorkers(env, ctx.pin).map((base) => scanStats(env, ctx, base))),
+  ]);
   const tries = numEnv(env, "SCAN_RETRIES", SCAN_RETRIES);
   const backoffBase = numEnv(env, "SCAN_RETRY_BASE_MS", SCAN_RETRY_BASE_MS);
 
@@ -1367,6 +1379,7 @@ async function handleV1Analyze(request, env, ctx, url) {
       bytes,
       pass,
       cacheFollow,
+      sizeHint,
     );
     if (answered) return answered;
     const stillWorthOffering = pass.busy > 0 && Date.now() < busyDeadline;
@@ -1399,9 +1412,9 @@ function v1UnavailableCause(env, ctx, pass) {
 
 // One pass over the fleet. Returns the response, or null when every worker
 // refused and the pass is worth making again.
-async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheFollow) {
+async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheFollow, sizeHint) {
   const workers = scanWorkers(env, ctx.pin);
-  const hint = locator?.type === "purl" ? { purl: locator.value } : {};
+  const hint = v1Hint(locator, bytes, sizeHint);
   let ranked = workers.length ? await rankWorkers(env, ctx, workers, ids, hint) : [];
   if (busy) {
     // A preference, not a pin: a worker whose breaker is open is not in the
@@ -1412,6 +1425,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
   for (const base of ranked) {
     const worker = hostOf(base);
     lastDispatch.set(base, Date.now());
+    noteDispatch(base);
     let upstream;
     try {
       // The query names the package and the body is the artifact, so a request
@@ -1527,7 +1541,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
         // over in milliseconds, and a failed one is simply retried.
         {
           base,
-          resume: (dead) => v1Resume(env, ctx, path, bytes, ids, locator, dead),
+          resume: (tried) => v1Resume(env, ctx, path, bytes, ids, locator, tried, sizeHint),
           idleMs: numEnv(env, "SCAN_STREAM_IDLE_MS", STREAM_IDLE_MS),
           stallMs: numEnv(env, "SCAN_STREAM_STALL_MS", STREAM_STALL_MS),
           limit: numEnv(env, "SCAN_STREAM_RESUMES", STREAM_RESUMES),
@@ -1567,19 +1581,21 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
 // A 429 here is not worth waiting on. The caller is mid-stream and holding a
 // budget the queueing logic upstream never got to reason about, so a full
 // worker is simply skipped in favour of one with room.
-async function v1Resume(env, ctx, path, bytes, ids, locator, dead) {
+async function v1Resume(env, ctx, path, bytes, ids, locator, tried, sizeHint) {
   // An aborted request has nobody left to finish the analysis for, and every
   // fetch below would be made with a signal that is already tripped.
   if (clientAborted(ctx)) return null;
   const workers = scanWorkers(env, ctx.pin);
   if (!workers.length) return null;
-  const hint = locator?.type === "purl" ? { purl: locator.value } : {};
-  const ranked = await rankWorkers(env, ctx, workers, ids, hint);
-  const busy = locator ? await runningWorker(env, ctx, locator, ids) : null;
+  const hint = v1Hint(locator, bytes, sizeHint);
+  const [ranked, busy] = await Promise.all([
+    rankWorkers(env, ctx, workers, ids, hint),
+    locator ? runningWorker(env, ctx, locator, ids) : null,
+  ]);
   const order = [
     ...ranked.filter((base) => busy && hostOf(base) === busy),
-    ...ranked.filter((base) => (!busy || hostOf(base) !== busy) && base !== dead),
-    ...ranked.filter((base) => (!busy || hostOf(base) !== busy) && base === dead),
+    ...ranked.filter((base) => (!busy || hostOf(base) !== busy) && !tried.has(base)),
+    ...ranked.filter((base) => (!busy || hostOf(base) !== busy) && tried.has(base)),
   ];
 
   for (const base of order) {
@@ -1604,6 +1620,7 @@ async function v1Resume(env, ctx, path, bytes, ids, locator, dead) {
       continue;
     }
     breakerFor(base).ok();
+    if (worker !== busy) noteDispatch(base);
     logLine("v1_analyze_resume", {
       src: "scan",
       status: 200,
@@ -1654,8 +1671,17 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   let reader = stream.getReader();
   let buffered = "";
   let decisionSeen = false;
+  let refused = false;
   let finished = false;
   let handovers = 0;
+  let refusals = 0;
+  // Every worker this request has already been on. A resume goes to the rest
+  // first: two workers refusing in turn used to bounce the request between
+  // them while a third with room was never asked.
+  const tried = new Set();
+  // A read that outlived its stall timer. Kept, not dropped: when the stream
+  // is read on rather than handed over, the frame it delivers still counts.
+  let inflight = null;
   const queued = [];
   // `floor` keeps elapsed times monotonic across a handover: a replacement
   // worker counts from its own zero, and the caller must never watch the run
@@ -1664,6 +1690,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
 
   const encodeLine = (line) => {
     const annotated = annotatedV1Lines(line, budget, meta, phase);
+    if (annotated.refused) refused = true;
     // A decision is terminal by contract. Register its short cache write as
     // soon as we observe it: callers are entitled to stop reading immediately
     // after this line and may cancel the stream before an EOF-driven flush.
@@ -1694,7 +1721,8 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   // very patient peer — so without a deadline here the caller waits out a
   // worker that is never going to answer.
   const readChunk = async () => {
-    const pending = reader.read();
+    const pending = inflight ?? reader.read();
+    inflight = null;
     if (!resume?.idleMs) return pending;
     // The loser of this race stays pending. Give it a handler now: once the
     // idle clock has won we stop awaiting the read, and a stream that errors
@@ -1712,6 +1740,9 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
           timer = setTimeout(() => reject(new Error(why)), waitMs);
         }),
       ]);
+    } catch (err) {
+      if (err?.message === why) inflight = pending;
+      throw err;
     } finally {
       clearTimeout(timer);
     }
@@ -1730,31 +1761,42 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     // than at the 200, which only ever proved we could reach it and route to
     // it: a node being upgraded accepts every request and drops every stream,
     // and crediting each of those as a success kept it top of the ranking while
-    // it failed every caller.
-    breakerFor(resume.base).fail();
-    const spent = handovers >= resume.limit;
+    // it failed every caller. A refusal is the exception: the worker answered
+    // promptly and correctly that it had no room for this one.
+    // A stalled stream is still talking, so its worker is alive too.
+    if (why !== "refused" && why !== "stalled") breakerFor(resume.base).fail();
+    // Refusals have their own budget. One costs milliseconds and says nothing
+    // about the request, and three of them spending the handovers left an
+    // 11-minute analysis on the fourth worker to be cut at its first stall.
+    const used = why === "refused" ? refusals : handovers;
+    const limit = why === "refused" ? MAX_STREAM_REFUSALS : resume.limit;
+    const spent = used >= limit;
     logLine("v1_analyze_stream", {
       worker: hostOf(resume.base),
       why,
-      handover: spent ? undefined : handovers + 1,
+      handover: spent ? undefined : used + 1,
       exhausted: spent || undefined,
       ...meta.ids,
     });
     if (spent) return false;
-    handovers += 1;
+    if (why === "refused") refusals += 1;
+    else handovers += 1;
+    tried.add(resume.base);
     try {
       await reader.cancel();
     } catch {
       // Already dead: cancelling is a courtesy to a live worker, not a step.
     }
-    const next = await resume.resume(resume.base);
+    const next = await resume.resume(tried);
     if (!next) return false;
     reader = next.body.getReader();
+    inflight = null;
     resume.base = next.base;
     // The dead worker's trailing bytes are half a frame, not a frame, and its
     // clock is not the replacement's.
     decoder = new TextDecoder();
     buffered = "";
+    refused = false;
     phase.floor = phase.lastElapsed;
     phase.name = null;
     phase.changedAt = Date.now();
@@ -1841,6 +1883,16 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
           // allowed to see, since erroring here would be indistinguishable from
           // the truncation we just failed to repair.
           const why = err?.message === "idle" || err?.message === "stalled" ? err.message : "error";
+          // Stalled is not silent: frames still arrive, only the phase has not
+          // changed. A whale spends longer than that in one phase (an
+          // 11-minute `archive:whl` on rdu2 was cut this way, 2026-09-06),
+          // so with no handover left the stream is read on and asked again
+          // after another stall interval.
+          if (why === "stalled" && (!resume || handovers >= resume.limit)) {
+            phase.changedAt = Date.now();
+            logLine("v1_analyze_stream", { worker: resume ? hostOf(resume.base) : undefined, why, kept: true, ...meta.ids });
+            continue;
+          }
           if (await handover(why)) continue;
           finished = true;
           continue;
@@ -1860,7 +1912,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
           }
           // A clean close with no decision is a truncation too: a worker taken
           // down between frames shuts its side politely and says nothing.
-          if (!decisionSeen && (await handover("eof"))) continue;
+          if (!decisionSeen && (await handover(refused ? "refused" : "eof"))) continue;
           finished = true;
           continue;
         }
@@ -1920,7 +1972,10 @@ function annotatedV1Lines(line, budget, meta, phase) {
   }
 
   if (row.state !== "analyzing") {
-    return { lines: [budgetedV1Line(line, budget, meta.locator)], decision: null };
+    // A worker that took the request and then found every big-analysis slot
+    // busy says so and closes without a decision. Not a fault: it answered
+    // promptly and correctly, and the caller belongs on a worker with room.
+    return { lines: [budgetedV1Line(line, budget, meta.locator)], decision: null, refused: row.state === "refused" };
   }
 
   const name = typeof row.phase === "string" && row.phase.trim() ? row.phase.trim() : "unknown";
@@ -2132,13 +2187,21 @@ const CAPACITY_WEIGHT = 1.0;
 // The host term is foreground pressure — machine busy less the cores its pull
 // worker holds — because that work leaves when a request lands, and ranking
 // on it penalized the two biggest boxes for load that would not be there.
-function occupancy(stats) {
+//
+// `pending` is what this isolate has sent the worker since those stats were
+// polled. Stats are cached for STATS_TTL_MS, and inside that window a worker's
+// `in_flight` never moves, so every dispatch in the window went to whichever
+// worker looked emptiest at the poll: run 5 (2026-09-06, concurrency 8) sent
+// them in runs of four and five and stacked three big wheels on a 4-core box
+// in two minutes. Counting our own dispatches is what the next poll will show.
+function occupancy(stats, pending = 0) {
   const slots = Number(stats?.slots);
   if (!Number.isFinite(slots) || slots <= 0) return 0;
-  const running = Number(stats.in_flight ?? slots - (stats.slots_free ?? slots));
+  const reported = Number(stats.in_flight ?? slots - (stats.slots_free ?? slots));
+  const running = (Number.isFinite(reported) ? Math.max(0, reported) : 0) + Math.max(0, pending);
   const cpus = Number(stats.physical_cpus);
   const denominator = Number.isFinite(cpus) && cpus > 0 ? cpus : slots;
-  const mine = Number.isFinite(running) ? Math.max(0, running) / denominator : 0;
+  const mine = running / denominator;
   return Math.max(mine, foregroundPressure(stats));
 }
 
@@ -2236,6 +2299,107 @@ function dispatchAge(base, now) {
 // until it has seen enough traffic to learn.
 const statsCache = new Map();
 
+function statsPolledAt(base) {
+  return statsCache.get(base)?.at ?? null;
+}
+
+// When this isolate last dispatched to each worker, newest last. Read by
+// `pendingSince` for the occupancy term; see `occupancy`.
+const dispatchLog = new Map();
+
+function noteDispatch(base, now = Date.now()) {
+  const log = dispatchLog.get(base) ?? [];
+  log.push(now);
+  while (log.length && now - log[0] > STATS_TTL_MS) log.shift();
+  dispatchLog.set(base, log);
+}
+
+// Dispatches to `base` since its stats were polled at `at`; those before it
+// are already in the worker's own `in_flight`.
+function pendingSince(base, at, now = Date.now()) {
+  const log = dispatchLog.get(base);
+  if (!log || at == null) return 0;
+  return log.filter((t) => t > at && now - t <= STATS_TTL_MS).length;
+}
+
+// The size of a package, from its registry, before any worker is asked. pypi
+// and npm say it in one small request each; cargo and golang do not, and get
+// no hint. Cached by coordinate, since a published artifact never changes.
+const sizeCache = new Map();
+const SIZE_CACHE_MAX = 4096;
+const SIZE_LOOKUP_MS = 1_500;
+
+async function registrySize(env, ctx, purl, ids) {
+  const hit = sizeCache.get(purl);
+  if (hit !== undefined) return hit;
+  let size = null;
+  try {
+    size = await registrySizeOf(env, ctx, purl);
+  } catch (err) {
+    logLine("v1_size_hint", { purl, err: errText(err), ...ids });
+  }
+  if (sizeCache.size >= SIZE_CACHE_MAX) sizeCache.delete(sizeCache.keys().next().value);
+  sizeCache.set(purl, size);
+  if (size != null) logLine("v1_size_hint", { purl, bytes: size, ...ids });
+  return size;
+}
+
+function purlNameVersion(purl) {
+  const rest = String(purl || "").replace(/^pkg:/i, "");
+  const slash = rest.indexOf("/");
+  const at = rest.lastIndexOf("@");
+  if (slash < 0 || at <= slash + 1 || at === rest.length - 1) return null;
+  try {
+    return {
+      type: rest.slice(0, slash).toLowerCase(),
+      name: decodeURIComponent(rest.slice(slash + 1, at)),
+      version: decodeURIComponent(rest.slice(at + 1)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function registrySizeOf(env, ctx, purl) {
+  const parts = purlNameVersion(purl);
+  if (!parts) return null;
+  const json = async (resp) => (resp.ok ? await resp.json() : (await drain(resp), null));
+  if (parts.type === "pypi") {
+    const base = (env.PYPI_URL || "https://pypi.org").replace(/\/$/, "");
+    const doc = await fetchTimeout(
+      `${base}/pypi/${encodeURIComponent(parts.name)}/${encodeURIComponent(parts.version)}/json`,
+      { headers: { accept: "application/json" } },
+      SIZE_LOOKUP_MS,
+      ctx,
+      json,
+    );
+    // The largest file of the release: which one the worker fetches is its
+    // decision, and the routing question is only whether this is a whale.
+    const sizes = (doc?.urls || []).map((u) => Number(u?.size)).filter((n) => Number.isFinite(n) && n > 0);
+    return sizes.length ? Math.max(...sizes) : null;
+  }
+  if (parts.type === "npm") {
+    const base = (env.NPM_REGISTRY_URL || "https://registry.npmjs.org").replace(/\/$/, "");
+    const doc = await fetchTimeout(
+      `${base}/${parts.name}/${encodeURIComponent(parts.version)}`,
+      { headers: { accept: "application/json" } },
+      SIZE_LOOKUP_MS,
+      ctx,
+      json,
+    );
+    const tarball = doc?.dist?.tarball;
+    if (typeof tarball !== "string" || !tarball) return null;
+    // The packument's `unpackedSize` is the tree, not the tarball the worker
+    // downloads; a HEAD on the tarball is the number the worker's lanes use.
+    const length = await fetchTimeout(tarball, { method: "HEAD" }, SIZE_LOOKUP_MS, ctx, async (resp) => {
+      await drain(resp);
+      return resp.ok ? Number(resp.headers.get("content-length")) : Number.NaN;
+    });
+    return Number.isFinite(length) && length > 0 ? length : null;
+  }
+  return null;
+}
+
 // The size buckets scan reports, and their upper bounds. Kept in step with
 // SIZE_BUCKETS in scan's src/server/mod.rs.
 const SIZE_BUCKETS = [
@@ -2305,7 +2469,7 @@ async function scanStats(env, ctx, base) {
 // one worker being slow at *large archives*, not slow in general — a scalar
 // average would have branded it slow for every small package too, and sent
 // those somewhere worse.
-function predictMs(stats, hint, mix) {
+function predictMs(stats, hint, mix, pending = 0) {
   if (!stats) return UNKNOWN_JOB_MS;
   // Order matters. When a class was named but this worker has never done one,
   // the fleet mix is the wrong substitute: it is renormalized over whatever
@@ -2326,7 +2490,35 @@ function predictMs(stats, hint, mix) {
     ? (classed ?? UNKNOWN_JOB_MS)
     : (classed ?? (hint == null ? mixedMs(stats, mix) : null) ?? blendedMs(stats) ?? UNKNOWN_JOB_MS);
   // How long the work takes, then how likely this worker is to take it.
-  return base * (1 + CAPACITY_WEIGHT * occupancy(stats));
+  return base * whaleSlowdown(stats, hint) * (1 + CAPACITY_WEIGHT * occupancy(stats, pending));
+}
+
+// scan runs a big analysis on a private pool of `physical_cpus / 4` threads,
+// 2 to 16, so the same wheel takes several times longer on a 4-core box than
+// on a 128-core one. Ranked on that ratio when the size is known, so whales
+// go where the threads are; the same box's own by-size average says the same
+// thing once it has enough samples, and this says it from the first one.
+const BIG_JOB_BYTES = 8 << 20;
+const WHALE_THREADS_MAX = 16;
+
+function whaleThreads(stats) {
+  const cpus = Number(stats?.physical_cpus);
+  if (!Number.isFinite(cpus) || cpus <= 0) return WHALE_THREADS_MAX;
+  return Math.min(WHALE_THREADS_MAX, Math.max(2, Math.floor(cpus / 4)));
+}
+
+function whaleSlowdown(stats, hint) {
+  if (!(hint?.bytes > BIG_JOB_BYTES)) return 1;
+  return WHALE_THREADS_MAX / whaleThreads(stats);
+}
+
+// The routing hint for one request: the package it names and, when known
+// before dispatch, how big it is.
+function v1Hint(locator, bytes, sizeHint) {
+  const hint = locator?.type === "purl" ? { purl: locator.value } : {};
+  if (bytes) hint.upload = true;
+  if (sizeHint != null) hint.bytes = sizeHint;
+  return hint;
 }
 
 
@@ -2530,7 +2722,7 @@ function hasHistory(stats, hint, mix) {
 // These are not preferences. A worker missing 7z returns a weaker verdict on a
 // DMG rather than a slower one — and being weaker, it is also faster, so a
 // purely latency-ranked router would actively prefer it.
-function capability(stats, sizeHint) {
+function capability(stats, sizeHint, upload = false) {
   if (!stats) return null; // unknown: let the breaker decide, not a guess
   if (stats.ready === false) return "not ready";
   if (stats.overloaded === true) return "overloaded";
@@ -2552,9 +2744,17 @@ function capability(stats, sizeHint) {
   // Not a slow worker — a closed one. scan's slot acquire is non-blocking and
   // answers 429 rather than queueing, so dispatching here buys a rejection.
   if ((stats.slots_free ?? 1) <= 0) return "at capacity";
+  // A big analysis needs one of the worker's whale slots; with every one
+  // taken it refuses, so the refusal round trip is skipped here.
+  if (sizeHint != null && sizeHint > BIG_JOB_BYTES) {
+    const whale = stats.whale_slots;
+    if (whale && Number(whale.max) > 0 && Number(whale.in_use) >= Number(whale.max)) return "whale slots full";
+  }
   // `!= null`, not truthiness: a worker advertising 0 accepts nothing, and
   // reading that as "no limit" sends it exactly the bodies it will refuse.
-  if (sizeHint != null && stats.max_upload_mb != null && sizeHint > stats.max_upload_mb * 1024 * 1024) {
+  // Only for bytes the caller sends: a package the worker fetches for itself
+  // never passes through the upload limit.
+  if (upload && sizeHint != null && stats.max_upload_mb != null && sizeHint > stats.max_upload_mb * 1024 * 1024) {
     return `upload limit ${stats.max_upload_mb}MB < ${sizeHint}B`;
   }
   return null;
@@ -2711,9 +2911,9 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
     base,
     stats,
     i,
-    est: predictMs(stats, hint, mix),
+    est: predictMs(stats, hint, mix, pendingSince(base, statsPolledAt(base))),
     known: hasHistory(stats, hint, mix),
-    why: capability(stats, hint?.bytes ?? null),
+    why: capability(stats, hint?.bytes ?? null, hint?.upload === true),
     r: Math.random(),
   }));
   // A starved worker's own history is the wrong prior. It ranks on samples
@@ -3400,6 +3600,12 @@ function trimSlash(s) {
 export const _test = {
   occupancy,
   capability,
+  noteDispatch,
+  pendingSince,
+  registrySize,
+  purlNameVersion,
+  whaleSlowdown,
+  BIG_JOB_BYTES,
   foregroundPressure,
   machineBusy,
   probeIndex,
