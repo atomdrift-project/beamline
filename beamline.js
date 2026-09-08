@@ -176,6 +176,15 @@ function recordRequest(env, request, response, ms) {
 // be asked, and timing it would measure how quickly beamline gave up.
 const ROUTE_VERDICT = "analyze:verdict";
 
+// An analysis whose caller hung up before it finished.
+//
+// The run completed and what it cost is worth keeping — it is the same work on
+// the same worker — but no caller ever received it, so it does not belong in
+// the series that answers how long callers wait. Kept as its own route rather
+// than dropped: these are the longest runs the fleet does, and a series that
+// silently omits them would understate what analysis costs.
+const ROUTE_ORPHAN = "analyze:orphan";
+
 // One datapoint, written the same way wherever it is written from.
 //
 // Read off the headers that went out rather than threaded down from where the
@@ -1622,12 +1631,30 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
     // What the run cost, filed when the assessment goes out rather than now.
     // Called once — the stream registers the first terminal decision and
     // ignores anything after it.
-    const settled = () => {
+    const settled = ({ finisher, orphaned }) => {
       const took = Date.now() - t0;
-      writePoint(env, ROUTE_VERDICT, streamed, ecosystemOf(url), 200, took);
+      // Credited to whoever produced the decision. After a handover that is not
+      // the worker named in the response headers — those went out minutes ago
+      // and cannot be corrected — and crediting them would put a stranded run
+      // on the record of the box that rescued it. The breaker beside this call
+      // already charges the finisher; this is the same rule for the same event.
+      const credited = new Headers(streamed);
+      if (finisher) credited.set("X-Beamline-Worker", finisher);
+      // An abandoned run is filed apart. Its analysis really did take this long
+      // and is worth keeping, but nobody was waiting at the end of it, and
+      // ROUTE_VERDICT answers "how long until the caller had an answer". Orphans
+      // are the longest runs there are — they are the ones whose caller gave up
+      // — so folding them in would bias exactly the tail that gets read.
+      writePoint(env, orphaned ? ROUTE_ORPHAN : ROUTE_VERDICT, credited, ecosystemOf(url), 200, took);
       // Also a log line, because Workers Logs is the other place these are read
       // and it indexes the fields it is given. Same numbers, same names.
-      logLine("v1_analyze_verdict", { src: source, worker, ms: took, ...ids });
+      logLine("v1_analyze_verdict", {
+        src: source,
+        worker: finisher || worker,
+        orphaned: orphaned || undefined,
+        ms: took,
+        ...ids,
+      });
     };
     return new Response(
       annotatedV1Stream(
@@ -1770,6 +1797,10 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   let reader = stream.getReader();
   let buffered = "";
   let decisionSeen = false;
+  // Set once the caller has gone and the stream is being read for the decision
+  // alone. Carried into the telemetry so an abandoned run is not counted as one
+  // somebody waited for.
+  let abandoned = false;
   let refused = false;
   let finished = false;
   let handovers = 0;
@@ -1802,7 +1833,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
       // response opened with minutes ago. Telemetry must never take a stream
       // down with it, so it is guarded like the logging around it.
       try {
-        meta.settled?.();
+        meta.settled?.({ finisher: resume ? hostOf(resume.base) : null, orphaned: abandoned });
       } catch (err) {
         logLine("v1_analyze_verdict", { recorded: false, err: errText(err), ...meta.ids });
       }
@@ -1933,6 +1964,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   // worker that dies with nobody waiting takes its run with it, and asking a
   // second worker to redo it would spend a slot on an answer nobody is owed.
   const drainToDecision = async () => {
+    abandoned = true;
     const deadline = Date.now() + (orphan?.budgetMs || ORPHAN_BUDGET_MS);
     try {
       while (!decisionSeen && Date.now() < deadline) {
@@ -2423,10 +2455,17 @@ function noteDispatch(base, now = Date.now()) {
 
 // Dispatches to `base` since its stats were polled at `at`; those before it
 // are already in the worker's own `in_flight`.
+//
+// `>=`, not `>`. `at` is stamped before the poll's own round trip, so a dispatch
+// recorded in that same millisecond cannot have reached the worker in time to be
+// counted in the `in_flight` it answered with. Under `>` it was counted by
+// neither side, and the router read a worker as one slot emptier than it was —
+// an undercount, which is the direction that sends more work to a box already
+// holding some. The cost of being wrong the other way is one slot of caution.
 function pendingSince(base, at, now = Date.now()) {
   const log = dispatchLog.get(base);
   if (!log || at == null) return 0;
-  return log.filter((t) => t > at && now - t <= STATS_TTL_MS).length;
+  return log.filter((t) => t >= at && now - t <= STATS_TTL_MS).length;
 }
 
 // The size of a package, from its registry, before any worker is asked. pypi
@@ -3509,22 +3548,6 @@ function cacheId(req) {
   return typeof req === "string" ? req : req.url;
 }
 
-// The copy that goes into our cache.
-//
-// Cloudflare will not store a `private` response, which would silently leave
-// every token-protected deployment with no cache at all. Our cache sits behind
-// the 401 and every valid token gets the same answer, so the stored copy drops
-// the directive that the client's copy keeps.
-//
-// Every writer goes through here. When only one of them did, the other wrote
-// `private` for as long as it existed and Cloudflare dropped all of it.
-function storedCopy(res) {
-  const copy = res.clone();
-  const cc = copy.headers.get("cache-control") || "";
-  if (cc.startsWith("private")) copy.headers.set("cache-control", cc.replace("private", "public"));
-  return copy;
-}
-
 // The copy that goes into caches.default.
 //
 // `public`, always — including on an authenticated deployment, where the answer
@@ -3544,15 +3567,13 @@ function storedCopy(res) {
 // clientScope() still stamps that, and is unchanged.
 function storedDocument(env, body) {
   const canonical = v1DocumentBody(body) || body;
-  return storedCopy(
-    new Response(canonical, {
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-        "cache-control": `public, max-age=${v1MaxAge(env, canonical)}`,
-      },
-    }),
-  );
+  return new Response(canonical, {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": `public, max-age=${v1MaxAge(env, canonical)}`,
+    },
+  });
 }
 
 function waitUntil(ctx, p) {

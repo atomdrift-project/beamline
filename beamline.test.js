@@ -4652,3 +4652,80 @@ test("v1 analyze: a KV hit warms the key it was asked for, not only the digest",
     await scan.close();
   }
 });
+
+// A run that changed workers mid-stream is credited to the one that finished it.
+//
+// The response headers named the first worker and went out minutes earlier; they
+// cannot be corrected. The datapoint is written when the decision arrives, so it
+// can be, and it must be — the breaker beside it already charges the finisher,
+// and a per-worker latency table that blames the box which rescued a stranded
+// run points every investigation at the wrong machine.
+test("v1 analyze: the verdict point credits the worker that finished the run", async () => {
+  _test.reset();
+  const points = [];
+  const dying = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION], analyzeCut: 1 });
+  const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+  const env = {
+    ...testEnv(DEAD, { SCAN_URL: `${dying.url},${healthy.url}` }),
+    BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
+  };
+  try {
+    const frames = await analyzeFrames(env);
+    assert.equal(frames.at(-1).status, "analyzed", "the caller never got a decision");
+    assert.ok(frames.some((f) => f.state === "resumed"), "precondition: no handover happened");
+
+    const verdict = points.find((p) => p.blobs[0] === "analyze:verdict");
+    assert.ok(verdict, "a finished analysis wrote no verdict point");
+    const finisher = new URL(healthy.url).host;
+    const starter = new URL(dying.url).host;
+    assert.equal(verdict.blobs[3], finisher, `credited ${verdict.blobs[3]}, not the worker that finished`);
+    assert.notEqual(verdict.blobs[3], starter, "credited the worker that dropped the stream");
+  } finally {
+    await Promise.all([dying.close(), healthy.close()]);
+  }
+});
+
+// A caller who hangs up is not a caller who waited.
+//
+// Beamline reads an abandoned stream to the end so the verdict still reaches the
+// cache, which is worth doing — but nobody received that answer. Orphans are the
+// longest runs there are, by selection: they are the ones whose caller gave up.
+// Folding them into the series that answers "how long until the caller had an
+// answer" would bias exactly the tail that capacity planning reads.
+test("v1 analyze: an abandoned run is filed apart from one somebody waited for", async () => {
+  _test.reset();
+  const points = [];
+  const scan = await mockBackend({
+    analyzeStream: async function* () {
+      yield CUT_FRAME;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      yield CUT_DECISION;
+    },
+  });
+  const env = {
+    ...testEnv(DEAD, { SCAN_URL: scan.url }),
+    BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
+  };
+  const ctx = waitCtx();
+  try {
+    const res = await handle(
+      new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fcut%401.0.0", { method: "POST" }),
+      env,
+      ctx.ctx,
+    );
+    // Read the first frame, then leave — the shape of a caller that gave up.
+    const reader = res.body.getReader();
+    await reader.read();
+    await reader.cancel();
+    await ctx.flush();
+
+    const routes = points.map((p) => p.blobs[0]);
+    assert.ok(routes.includes("analyze:orphan"), `no orphan point was written (routes: ${routes})`);
+    assert.ok(
+      !routes.includes("analyze:verdict"),
+      "an abandoned run was counted as one a caller waited for",
+    );
+  } finally {
+    await scan.close();
+  }
+});
