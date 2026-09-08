@@ -1337,6 +1337,25 @@ async function handleV1Analyze(request, env, ctx, url) {
       // trip to learn something we were already holding, and answering them
       // never fixed it either.
       const body = v1BudgetedBody(document, budget, locator);
+      // An answer that came from KV warms L0 under the key it was asked for,
+      // exactly as the lookup does on its own KV hit.
+      //
+      // Without this the only write on this path is the digest backfill below,
+      // which answers a different caller entirely — the one holding a hash. The
+      // locator key that was just read stayed cold, so a client that only ever
+      // calls /v1/analyze paid the L1 round trip for the same package in the
+      // same colo indefinitely, and L0 looked broken while working perfectly.
+      // It was warmed only by accident, when a lookup for the same package
+      // happened to come past.
+      if (!hit.fromCache) {
+        waitUntil(
+          ctx,
+          cache.put(
+            new Request(`${url.origin}${v1CachePath(null, [locator], served)}`),
+            storedDocument(document),
+          ),
+        );
+      }
       // Filed at the digest under the policy that produced it, not the one that
       // asked, for the reason the lookup warms its own key that way.
       waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document, served));

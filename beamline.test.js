@@ -4581,3 +4581,54 @@ test("v1 lookup: an authenticated deployment still warms the edge cache", async 
     await scan.close();
   }
 });
+
+// L0 is per-colo; KV is global. So a colo that has not seen a package before
+// reads it from KV — and must then hold it, or it reads it from KV forever.
+//
+// /v1/analyze used to write only the digest key on that path, which answers the
+// caller holding a hash and not the one who just asked by PURL. A client that
+// only calls /v1/analyze — which is what a precache pipeline is — therefore paid
+// the L1 round trip for the same package on every request into a warm colo, and
+// L0 looked broken while working perfectly. It was warmed only by accident, when
+// a /v1/lookup for the same package happened past.
+test("v1 analyze: a KV hit warms the key it was asked for, not only the digest", async () => {
+  const purl = "pkg:cargo/tokio@1.40.0";
+  const stored = new Map();
+  const kv = {
+    async get(key) { return stored.get(key) || null; },
+    async put(key, value) { stored.set(key, value); },
+  };
+  const scan = await mockBackend({
+    analyzeStream: [`{"decision":"allow","fires_at":-1,"purl":"${purl}","engine_version":"2.8.0"}`],
+  });
+  const ask = (env, ctx) =>
+    handle(
+      new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}`, { method: "POST" }),
+      env,
+      ctx,
+    );
+  try {
+    // One colo analyses it, filling both layers.
+    const first = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_KV: kv });
+    const warm = waitCtx();
+    await (await ask(first, warm.ctx)).text();
+    await warm.flush();
+    assert.ok(stored.size > 0, "precondition: the analysis reached KV");
+
+    // A second colo: same KV, its own empty edge cache.
+    const cold = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_KV: kv, cache: _test.memoryCache() });
+    const miss = waitCtx();
+    const l1 = await ask(cold, miss.ctx);
+    await l1.text();
+    assert.equal(l1.headers.get("x-beamline-source"), "kv", "precondition: the cold colo read KV");
+    await miss.flush();
+
+    const again = await ask(cold, waitCtx().ctx);
+    await again.text();
+    assert.equal(again.headers.get("x-beamline-source"), "cache", "the KV answer never reached L0");
+    assert.equal(again.headers.get("x-cache-layer"), "0");
+    assert.equal(scan.hits.analyze, 1, "an analysis slot was spent on an answer both layers held");
+  } finally {
+    await scan.close();
+  }
+});
