@@ -146,42 +146,74 @@ export async function handle(request, env, ctx) {
 // gets believed. This also means every route is covered by construction —
 // there is no second place to remember.
 function recordRequest(env, request, response, ms) {
-  // Absent locally (`node local.js`) and in tests, and `writeDataPoint` is
-  // fire-and-forget: it returns void, never throws, and must not be awaited.
-  const ae = env?.BEAMLINE_AE;
-  if (typeof ae?.writeDataPoint !== "function" || !response) return;
+  if (!response) return;
   const url = new URL(request.url);
-  const source = response.headers.get("X-Beamline-Source") || "";
   // Named, not derived from the path: a 404 on /v1/anything would otherwise
   // become a label of its own, and a metric dimension the caller chooses is
   // unbounded by definition.
   const route =
     url.pathname === "/v1/lookup" || url.pathname === "/v1/analyze" ? url.pathname.slice("/v1/".length) : "other";
-  // Deliberately no `indexes`. The only high-cardinality field here is the
-  // artifact, and a PURL is the caller's dependency list — the same knowledge
-  // `cacheScope` marks private on an authenticated deployment. It does not
-  // belong in an analytics dataset by default; the ecosystem is enough to tell
-  // npm from crates without naming anyone's packages.
+  // `ms` here is time to the response, not to the verdict. On a streamed
+  // analysis the headers go out first and the assessment arrives later, so this
+  // measures what the caller waited before hearing anything — the number that
+  // decides whether a proxy in the middle cuts the connection. What the run
+  // cost is ROUTE_VERDICT, written when the assessment goes out.
+  writePoint(env, route, response.headers, ecosystemOf(url), response.status, ms);
+}
+
+// The route a completed analysis is filed under, beside the `analyze` point
+// that timed its headers.
+//
+// /v1/analyze answers with a stream: the response is the start of the answer,
+// not the answer, and a p90 over `analyze` on this route reports time to first
+// byte. That number is worth having — it is the one a proxy's idle timeout acts
+// on — but it is not what an analysis costs, and the two cannot share a series
+// without one of them being read as the other.
+//
+// Every terminal verdict is filed here, cached or scanned, so "how long until
+// the caller had an answer" is one query and not a union of two. An analysis
+// nobody could run is in no row: `unavailable` reports that the fleet could not
+// be asked, and timing it would measure how quickly beamline gave up.
+const ROUTE_VERDICT = "analyze:verdict";
+
+// One datapoint, written the same way wherever it is written from.
+//
+// Read off the headers that went out rather than threaded down from where the
+// answer was decided, because those are what the caller was told: a metric that
+// can disagree with what the caller saw is worse than no metric, it is the one
+// that gets believed. It also means a new route is covered by construction.
+//
+// Deliberately no `indexes`. The only high-cardinality field here is the
+// artifact, and a PURL is the caller's dependency list — the same knowledge
+// `cacheScope` marks private on an authenticated deployment. It does not belong
+// in an analytics dataset by default; the ecosystem is enough to tell npm from
+// crates without naming anyone's packages.
+function writePoint(env, route, headers, ecosystem, status, ms) {
+  // Absent locally (`node local.js`) and in tests, and `writeDataPoint` is
+  // fire-and-forget: it returns void, never throws, and must not be awaited.
+  const ae = env?.BEAMLINE_AE;
+  if (typeof ae?.writeDataPoint !== "function") return;
+  const source = headers.get("X-Beamline-Source") || "";
   ae.writeDataPoint({
     blobs: [
       route,
       source,
-      response.headers.get("X-Beamline-Follow") || "",
-      response.headers.get("X-Beamline-Worker") || "",
-      purlType(url.searchParams.get("purl") || ""),
-      String(response.status),
+      headers.get("X-Beamline-Follow") || "",
+      headers.get("X-Beamline-Worker") || "",
+      ecosystem,
+      String(status),
     ],
     // `layer` carries -1 when nothing answered, matching what poppy records: a
     // request that reached no layer is not a shallow one, and averaging it as
     // zero would report the fleet at its cheapest exactly when it is down.
-    //
-    // `ms` is time to the response, not to the decision. On a streamed analysis
-    // the headers go out first and the verdict arrives later, so this measures
-    // what the caller waited before hearing anything — which is the number that
-    // decides whether a proxy cuts the connection, and not the cost of the run.
-    // `source = scan:analysis` is what separates the two.
     doubles: [CACHE_LAYERS.get(source) ?? -1, ms],
   });
+}
+
+// Which ecosystem was asked about, from the caller's own query. A bounded set;
+// anything else is `other`.
+function ecosystemOf(url) {
+  return purlType(url.searchParams.get("purl") || "");
 }
 
 
@@ -424,7 +456,7 @@ async function handleV1Lookup(env, ctx, url) {
           ctx,
           cache.put(
             new Request(`${url.origin}${v1CachePath(sha, locators, served)}`),
-            storedDocument(document, env),
+            storedDocument(document),
           ),
         );
         return res;
@@ -660,10 +692,7 @@ async function backfillDigestKey(env, cache, origin, body, follow) {
   // one leaves the digest key saying "nobody has analyzed this" while the
   // locator key beside it holds the verdict.
   if (existing && v1CachedVerdict(await existing.text().catch(() => null))) return;
-  await cache.put(
-    key,
-    storedDocument(body, env),
-  );
+  await cache.put(key, storedDocument(body));
   await kvPut(env, path, body);
   logLine("v1_cache_backfill", { key: "sha256", sha, follow, max_age: maxAge });
 }
@@ -718,7 +747,7 @@ async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, 
   await Promise.all(
     keys.map(async (key) => {
       try {
-        await cache.put(key, storedDocument(body, env));
+        await cache.put(key, storedDocument(body));
         const parsed = new URL(key.url);
         await kvPut(env, `${parsed.pathname}${parsed.search}`, body);
       } catch (err) {
@@ -1320,6 +1349,11 @@ async function handleV1Analyze(request, env, ctx, url) {
       });
       if (served !== follow.value) answered.set("X-Beamline-Follow", served);
       setSource(answered, hit.fromCache ? "cache" : "kv");
+      // A held verdict is whole the moment it goes out, so its two points carry
+      // the same time. Written anyway: the series is every answer this route
+      // gave, and one missing its cheap half would read as a fleet that only
+      // ever scans.
+      writePoint(env, ROUTE_VERDICT, answered, ecosystemOf(url), 200, Date.now() - t0);
       return new Response(`${body.trimEnd()}\n`, { status: 200, headers: answered });
     }
     // Why we are about to spend an analysis slot. Without this a cache that
@@ -1530,11 +1564,21 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
       "X-Beamline-Worker": worker,
     });
     setSource(streamed, source);
+    // What the run cost, filed when the assessment goes out rather than now.
+    // Called once — the stream registers the first terminal decision and
+    // ignores anything after it.
+    const settled = () => {
+      const took = Date.now() - t0;
+      writePoint(env, ROUTE_VERDICT, streamed, ecosystemOf(url), 200, took);
+      // Also a log line, because Workers Logs is the other place these are read
+      // and it indexes the fields it is given. Same numbers, same names.
+      logLine("v1_analyze_verdict", { src: source, worker, ms: took, ...ids });
+    };
     return new Response(
       annotatedV1Stream(
         upstream.body,
         budget,
-        { requestId: ctx.rid, locator, startedAt: t0, ids },
+        { requestId: ctx.rid, locator, startedAt: t0, ids, settled },
         cacheDecision,
         // Only the analyze path resumes. It is the only one that holds a stream
         // long enough for its worker to be taken away mid-answer — a lookup is
@@ -1699,6 +1743,14 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
       // The worker finished what it took on. Charged to whoever is serving the
       // stream now, which after a handover is not who started it.
       if (resume) breakerFor(resume.base).ok();
+      // How long the caller waited for an answer, as against the headers this
+      // response opened with minutes ago. Telemetry must never take a stream
+      // down with it, so it is guarded like the logging around it.
+      try {
+        meta.settled?.();
+      } catch (err) {
+        logLine("v1_analyze_verdict", { recorded: false, err: errText(err), ...meta.ids });
+      }
       if (onDecision) {
         try {
           onDecision(annotated.decision);
@@ -3418,14 +3470,31 @@ function storedCopy(res) {
   return copy;
 }
 
-function storedDocument(body, env) {
+// The copy that goes into caches.default.
+//
+// `public`, always — including on an authenticated deployment, where the answer
+// sent to the caller is `private`. Those are two different headers doing two
+// different jobs, and conflating them is what emptied L0: caches.default is a
+// shared cache, so a response marked `private` instructs it not to store, and
+// `cache.put` duly refuses. Every verdict then lived in KV alone and every
+// lookup paid the L1 round trip, on the deployments that have a token — which
+// is the deployments that matter.
+//
+// Marking the stored copy `public` shares it with nobody. The key is the
+// artifact's identity, it lives on beamline's own origin, and the token gate in
+// dispatch() runs before any route reads the cache — so the only way to this
+// entry is through a request that has already authenticated. What must stay
+// `private` is the header the caller receives, because that one travels: it is
+// read by their proxy and their browser, and a PURL is their dependency list.
+// clientScope() still stamps that, and is unchanged.
+function storedDocument(body) {
   const canonical = v1DocumentBody(body) || body;
   return storedCopy(
     new Response(canonical, {
       status: 200,
       headers: {
         "content-type": "application/json",
-        "cache-control": `${cacheScope(env)}, max-age=${v1MaxAge(canonical)}`,
+        "cache-control": `public, max-age=${v1MaxAge(canonical)}`,
       },
     }),
   );

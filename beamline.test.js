@@ -4449,3 +4449,135 @@ test("capability refuses a saturated host whatever its slots say", () => {
   assert.equal(_test.capability({ ...free, physical_cpus: undefined, load1: 23 }, null), null);
   assert.equal(_test.capability({ ...free, slots_free: 0, load1: 0 }, null), "at capacity");
 });
+
+// A streamed analysis is timed twice, and the two numbers answer different
+// questions. The `analyze` point stops when the headers go out — what a proxy's
+// idle timeout acts on — and the analysis is still running. What the run cost is
+// `analyze:verdict`, and reading the first as the second is what made the
+// Cloudflare-side latency wrong: on this route it reports time to first byte.
+test("v1 analyze: the run is timed to the verdict, not to the headers", async () => {
+  _test.reset();
+  const points = [];
+  const SCAN_MS = 60;
+  const scan = await mockBackend({
+    analyzeStream: async function* () {
+      yield CUT_FRAME;
+      await new Promise((resolve) => setTimeout(resolve, SCAN_MS));
+      yield CUT_DECISION;
+    },
+  });
+  const env = {
+    ...testEnv(DEAD, { SCAN_URL: scan.url }),
+    BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
+  };
+  try {
+    const frames = await analyzeFrames(env);
+    assert.equal(frames.at(-1).status, "analyzed", "the caller never got a decision");
+
+    const byRoute = new Map(points.map((p) => [p.blobs[0], p]));
+    assert.deepEqual([...byRoute.keys()].sort(), ["analyze", "analyze:verdict"]);
+
+    const headers = byRoute.get("analyze");
+    const verdict = byRoute.get("analyze:verdict");
+    // The whole point: the headers went out before the analysis finished, so
+    // one time covers the run and the other cannot. An equal pair means the
+    // verdict point is being written from the wrong place.
+    assert.ok(
+      headers.doubles[1] < SCAN_MS,
+      `the headers point (${headers.doubles[1]}ms) already contains the ${SCAN_MS}ms run`,
+    );
+    assert.ok(
+      verdict.doubles[1] >= SCAN_MS - 1,
+      `the verdict point (${verdict.doubles[1]}ms) is short of the ${SCAN_MS}ms run`,
+    );
+    // Same dimensions on both, so one query can compare them.
+    assert.deepEqual(verdict.blobs.slice(1), headers.blobs.slice(1));
+    assert.equal(verdict.blobs[1], "scan:analysis", "work was not filed as work");
+    assert.equal(verdict.blobs[4], "npm");
+    assert.equal(verdict.blobs[5], "200");
+  } finally {
+    await scan.close();
+  }
+});
+
+// Every verdict is in the series, not only the expensive ones. A dashboard that
+// held work and nothing else would report the fleet as permanently slow, and
+// the cache — the thing most answers come from — would be invisible.
+test("v1 analyze: a held verdict is filed in the same series as a run", async () => {
+  _test.reset();
+  const points = [];
+  // Carries an engine: a row no engine produced is never filed as a verdict,
+  // so a decision without one would be re-analysed and never reach the cache.
+  const CACHEABLE = '{"decision":"allow","fires_at":-1,"purl":"pkg:npm/cut@1.0.0","engine_version":"2.8.0"}';
+  const scan = await mockBackend({ analyzeStream: [CUT_FRAME, CACHEABLE] });
+  const env = {
+    ...testEnv(DEAD, { SCAN_URL: scan.url }),
+    BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
+  };
+  const ask = () =>
+    new Request("http://beamline/v1/analyze?purl=pkg%3Anpm%2Fcut%401.0.0", { method: "POST" });
+  const ctx = waitCtx();
+  try {
+    await (await handle(ask(), env, ctx.ctx)).text();
+    // The cache write is handed to waitUntil once the decision arrives, so the
+    // second ask has to wait for it or it simply analyses again.
+    await ctx.flush();
+    points.length = 0;
+    // Asked again: the same question, now answered from the cache.
+    const body = await (await handle(ask(), env, waitCtx().ctx)).text();
+    assert.equal(JSON.parse(body.trim()).status, "analyzed");
+    assert.equal(scan.hits.analyze, 1, "the second ask spent an analysis slot");
+
+    const verdict = points.find((p) => p.blobs[0] === "analyze:verdict");
+    assert.ok(verdict, "a cached verdict wrote no verdict point");
+    assert.equal(verdict.blobs[1], "cache");
+    assert.equal(verdict.doubles[0], 0, "the edge is layer 0");
+  } finally {
+    await scan.close();
+  }
+});
+
+// The edge cache must work on the deployments that have a token, which is the
+// deployments that matter.
+//
+// caches.default is a shared cache, so a response marked `private` instructs it
+// not to store and `cache.put` refuses. The stored copy used to be stamped with
+// the caller's scope, so on an authenticated deployment L0 accepted nothing:
+// every verdict lived in KV alone, and `x-beamline-source: kv` came back on the
+// second ask, the third, and every one after. Both scopes are asserted here
+// because they are one bug in two halves — a fix that made the stored copy
+// public by making the client's copy public too would leak a caller's
+// dependency list to their proxy.
+test("v1 lookup: an authenticated deployment still warms the edge cache", async () => {
+  const purl = "pkg:npm/scoped@1.0.0";
+  const scan = await mockBackend({
+    v1: () => ({
+      decision: "allow", purl, sha256: HELLO_SHA, severity: "benign", fires_at: -1,
+      reason: null, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z",
+    }),
+    v1Headers: { "x-scan-source": "scan:index" },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_TOKEN: "s3cret" });
+  const ask = () =>
+    new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`, {
+      headers: { authorization: "Bearer s3cret" },
+    });
+  const ctx = waitCtx();
+  try {
+    const first = await handle(ask(), env, ctx.ctx);
+    await first.text();
+    assert.equal(first.headers.get("x-beamline-source"), "scan:index", "precondition: the worker answered");
+    // The client's copy is private: it travels to their proxy, and the question
+    // it answers is which package they depend on.
+    assert.match(first.headers.get("cache-control"), /^private,/);
+    await ctx.flush();
+
+    const again = await handle(ask(), env, waitCtx().ctx);
+    await again.text();
+    assert.equal(again.headers.get("x-beamline-source"), "cache", "L0 stored nothing, so KV pays for every lookup");
+    assert.equal(again.headers.get("x-cache-layer"), "0");
+    assert.equal(scan.hits.v1, 1, "the worker was asked twice for one answer");
+  } finally {
+    await scan.close();
+  }
+});

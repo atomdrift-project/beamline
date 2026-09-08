@@ -30,6 +30,37 @@ stream is a failure the transport cannot report. Whoever dropped the stream is
 charged for it, and the credit for an analysis is issued when a decision
 arrives, not when the worker accepts the request.
 
+## Telemetry
+
+Beamline cannot be scraped: it is stateless and runs in every colo, so a
+`/metrics` route would report one isolate's counters in one city. It writes one
+datapoint per request to the `beamline_requests` Analytics Engine dataset
+instead, read back through the SQL API. The `beamline - edge` dashboard in the
+`grafana` repo draws it; the same numbers also land in Workers Logs, where the
+Cloudflare dashboard's Query Builder can aggregate them without any of that.
+
+| | |
+| --- | --- |
+| `blob1` | route: `lookup`, `analyze`, `analyze:verdict`, `other` |
+| `blob2` | source — the layer that answered |
+| `blob3` | follow policy the answer was filed under |
+| `blob4` | scan worker, empty when a beamline layer answered |
+| `blob5` | ecosystem, from the caller's PURL |
+| `blob6` | HTTP status |
+| `double1` | cache layer, `-1` when nothing answered |
+| `double2` | milliseconds |
+
+`analyze` and `analyze:verdict` are two clocks on one request and are not
+interchangeable. `/v1/analyze` answers with a stream, so `analyze` stops when the
+response headers go out — time to first byte, the number a proxy's idle timeout
+acts on — while the analysis is still running. `analyze:verdict` is what the run
+cost. Every terminal verdict is filed under it, cached or scanned; an
+`unavailable` is under neither, because timing it would measure how quickly
+beamline gave up rather than how long anything took.
+
+No `indexes`. The only high-cardinality field would be the artifact, and a PURL
+is the caller's dependency list.
+
 The optional Workers KV L1 namespace is titled `beamline` by default. Run
 `make kv-create`, then deploy by passing its returned ID as `KV`:
 
