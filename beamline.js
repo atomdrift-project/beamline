@@ -323,7 +323,15 @@ const V1_MAX_KEYS = 50;
 // wrong the moment anything analyzes the artifact. A decision carrying
 // `unavailable` is not cached at all — it describes this moment's reachability,
 // and storing it would keep an outage alive after it ended.
-const V1_VERDICT_MAX_AGE = 3600;
+// Seventy-two hours rather than the hour it was. An artifact is immutable — a PURL
+// naming a version is the same bytes tomorrow — so the only thing a short TTL
+// buys is picking up a re-score from a newer engine, and an hour bought that at
+// the price of a KV round trip on almost every repeat ask. Measured over the
+// fleet before this changed: L0 answered 0.5% of cached analyses and KV 87%,
+// because poppy walks thousands of packages before returning to any one of
+// them and the entry had long expired by then. See VERDICT_MAX_AGE, which
+// overrides this without a deploy of the code.
+const V1_VERDICT_MAX_AGE = 259200;
 // The largest artifact a caller may hand us directly. A Worker holds an upload
 // in memory to be able to offer it to a second worker when the first refuses,
 // so this is a memory bound as much as a policy one. Anything bigger belongs in
@@ -429,7 +437,7 @@ async function handleV1Lookup(env, ctx, url) {
     // an `unanalyzed` really is gone a minute later — but the caller was being
     // told to hold it for four hours, which is exactly the staleness the short
     // TTL exists to prevent.
-    res.headers.set("cache-control", clientScope(env, v1MaxAge(document)));
+    res.headers.set("cache-control", clientScope(env, v1MaxAge(env, document)));
     res.headers.delete("X-Beamline-Worker");
     if (served !== follow.value) res.headers.set("X-Beamline-Follow", served);
     return res;
@@ -444,7 +452,7 @@ async function handleV1Lookup(env, ctx, url) {
       const { document, policy: served } = stored;
       const body = v1BudgetedBody(document, budget, locator, true);
       if (body) {
-        const res = v1Body(env, body, 200, null, v1MaxAge(document));
+        const res = v1Body(env, body, 200, null, v1MaxAge(env, document));
         setSource(res.headers, "kv");
         if (served !== follow.value) res.headers.set("X-Beamline-Follow", served);
         // Warmed under the policy that produced it, never under the one that
@@ -456,7 +464,7 @@ async function handleV1Lookup(env, ctx, url) {
           ctx,
           cache.put(
             new Request(`${url.origin}${v1CachePath(sha, locators, served)}`),
-            storedDocument(document),
+            storedDocument(env, document),
           ),
         );
         return res;
@@ -560,8 +568,8 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
         const document = v1DocumentBody(answered.body);
         const stored = document || answered.body;
         const body = document ? v1BudgetedBody(document, budget, locator) : (v1BudgetedBody(answered.body, budget, locator) || answered.body);
-        const res = v1Body(env, body, 200, worker, v1MaxAge(stored), source);
-        if (!v1MaxAge(stored)) return res;
+        const res = v1Body(env, body, 200, worker, v1MaxAge(env, stored), source);
+        if (!v1MaxAge(env, stored)) return res;
         // The asked-for key and every resolved alias are stored together; the
         // digest the answer names is
         // stored here. A lookup by PURL that reached a worker has just learned
@@ -682,7 +690,7 @@ function v1CachePath(sha, locators, follow) {
 async function backfillDigestKey(env, cache, origin, body, follow) {
   const sha = v1DecisionSha(body);
   if (!sha) return;
-  const maxAge = v1MaxAge(body);
+  const maxAge = v1MaxAge(env, body);
   if (!maxAge) return;
   const path = v1CachePath(sha, [], follow);
   const key = new Request(`${origin}${path}`);
@@ -692,7 +700,7 @@ async function backfillDigestKey(env, cache, origin, body, follow) {
   // one leaves the digest key saying "nobody has analyzed this" while the
   // locator key beside it holds the verdict.
   if (existing && v1CachedVerdict(await existing.text().catch(() => null))) return;
-  await cache.put(key, storedDocument(body));
+  await cache.put(key, storedDocument(env, body));
   await kvPut(env, path, body);
   logLine("v1_cache_backfill", { key: "sha256", sha, follow, max_age: maxAge });
 }
@@ -747,7 +755,7 @@ async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, 
   await Promise.all(
     keys.map(async (key) => {
       try {
-        await cache.put(key, storedDocument(body));
+        await cache.put(key, storedDocument(env, body));
         const parsed = new URL(key.url);
         await kvPut(env, `${parsed.pathname}${parsed.search}`, body);
       } catch (err) {
@@ -941,15 +949,37 @@ function followCandidates(policy) {
 //
 // load answers with {document, ...} for one policy, or null. Whatever else it
 // carries comes back untouched, alongside the policy that answered.
+//
+// The policy the caller named is read alone, because it is the one that usually
+// answers and a hit there costs exactly one round trip. Only when it holds no
+// decision are the wider candidates read, and then all at once: they are
+// independent keys, so walking them in series bought nothing but their latency
+// added together. Measured on the fleet, the KV walk was the difference between
+// /lookup at 314ms and /analyze at 163ms — /lookup is the route built to miss,
+// so it paid for the whole walk almost every time.
+//
+// The order the answer is chosen in is unchanged, and has to be: narrowest
+// first, first decision wins, the caller's own non-decision as the fallback.
+// What changes is only when the reads are issued.
+//
+// A wider candidate holding a decision now costs the reads after it as well,
+// which the series walk would have skipped. That is the trade: a few more reads
+// on a path that was already the expensive one, against removing the round
+// trips that made it expensive.
 async function nearestAnswer(candidates, load) {
-  let fallback = null;
-  for (const [index, policy] of candidates.entries()) {
-    const found = await load(policy);
-    if (!found) continue;
-    if (v1CachedVerdict(found.document)) return { ...found, policy };
-    // Narrowest first, so index 0 is the policy the caller named. A
-    // non-decision at any later candidate answers a question nobody asked.
-    if (index === 0) fallback = { ...found, policy };
+  const [asked, ...wider] = candidates;
+  if (asked === undefined) return null;
+
+  const first = await load(asked);
+  if (first && v1CachedVerdict(first.document)) return { ...first, policy: asked };
+  // Narrowest first, so this is the policy the caller named. A non-decision at
+  // any later candidate answers a question nobody asked.
+  const fallback = first ? { ...first, policy: asked } : null;
+  if (!wider.length) return fallback;
+
+  const rest = await Promise.all(wider.map((policy) => load(policy)));
+  for (const [index, found] of rest.entries()) {
+    if (found && v1CachedVerdict(found.document)) return { ...found, policy: wider[index] };
   }
   return fallback;
 }
@@ -1057,7 +1087,7 @@ async function kvGet(env, path) {
 async function kvPut(env, path, body) {
   const kv = env && env.BEAMLINE_KV;
   if (!kv || typeof kv.put !== "function") return;
-  const maxAge = v1MaxAge(body);
+  const maxAge = v1MaxAge(env, body);
   const ttl = maxAge === V1_NO_ENGINE_MAX_AGE ? maxAge : numEnv(env, "KV_MAX_AGE", V1_KV_MAX_AGE);
   await kv.put(await kvKey(path), body, { expirationTtl: Math.max(KV_MIN_TTL, Math.round(ttl)) });
 }
@@ -1114,7 +1144,13 @@ function v1OutageBody(body) {
   }
 }
 
-function v1MaxAge(body) {
+// How long this document may be held, in seconds.
+//
+// `env` is read for the verdict age only. The short ages are policy about what
+// the document *is* — an absence goes stale the moment anything analyzes the
+// artifact, an outage describes only this moment — and neither is a deployment
+// choice. How long a settled verdict is worth keeping is.
+function v1MaxAge(env, body) {
   try {
     const row = JSON.parse(body);
     const rows = Array.isArray(row) ? row : [row];
@@ -1123,7 +1159,7 @@ function v1MaxAge(body) {
   } catch {
     return V1_NO_ENGINE_MAX_AGE;
   }
-  return V1_VERDICT_MAX_AGE;
+  return numEnv(env, "VERDICT_MAX_AGE", V1_VERDICT_MAX_AGE);
 }
 
 function beamlineSource(source) {
@@ -1352,7 +1388,7 @@ async function handleV1Analyze(request, env, ctx, url) {
           ctx,
           cache.put(
             new Request(`${url.origin}${v1CachePath(null, [locator], served)}`),
-            storedDocument(document),
+            storedDocument(env, document),
           ),
         );
       }
@@ -1707,7 +1743,7 @@ async function cacheV1Decision(env, ctx, origin, locator, decided, follow, canon
     logLine("v1_cache_write", { stored: false, reason: "invalid_decision", ...ids });
     return;
   }
-  const maxAge = v1MaxAge(document);
+  const maxAge = v1MaxAge(env, document);
   if (!maxAge) {
     logLine("v1_cache_write", { stored: false, reason: "uncacheable", ...ids });
     return;
@@ -3506,14 +3542,14 @@ function storedCopy(res) {
 // `private` is the header the caller receives, because that one travels: it is
 // read by their proxy and their browser, and a PURL is their dependency list.
 // clientScope() still stamps that, and is unchanged.
-function storedDocument(body) {
+function storedDocument(env, body) {
   const canonical = v1DocumentBody(body) || body;
   return storedCopy(
     new Response(canonical, {
       status: 200,
       headers: {
         "content-type": "application/json",
-        "cache-control": `public, max-age=${v1MaxAge(canonical)}`,
+        "cache-control": `public, max-age=${v1MaxAge(env, canonical)}`,
       },
     }),
   );

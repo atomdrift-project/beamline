@@ -2475,7 +2475,7 @@ test("v1: a verdict caches for longer than an absence", async () => {
       env,
       waitCtx().ctx,
     );
-    assert.match(bad.headers.get("cache-control"), /max-age=3600/);
+    assert.match(bad.headers.get("cache-control"), /max-age=259200/);
 
     const nothing = await handle(
       new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fquiet%401.0.0"),
@@ -2483,6 +2483,25 @@ test("v1: a verdict caches for longer than an absence", async () => {
       waitCtx().ctx,
     );
     assert.match(nothing.headers.get("cache-control"), /max-age=60/, "an absence was cached as a verdict");
+
+    // The deployment knob, which nothing read until 2026-09-08: wrangler.toml
+    // documented VERDICT_MAX_AGE and set it, and the code used a constant
+    // instead. Tuning the value did nothing at all, which is worse than having
+    // no knob — the comment beside it invited exactly the change that had no
+    // effect. An absence is not tunable and must stay on its own short clock.
+    const tuned = testEnv(DEAD, { SCAN_URL: scan.url, VERDICT_MAX_AGE: "900" });
+    const short = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0"),
+      tuned,
+      waitCtx().ctx,
+    );
+    assert.match(short.headers.get("cache-control"), /max-age=900/, "VERDICT_MAX_AGE was ignored");
+    const stillShort = await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fquiet%401.0.0"),
+      tuned,
+      waitCtx().ctx,
+    );
+    assert.match(stillShort.headers.get("cache-control"), /max-age=60/, "an absence followed the verdict knob");
   } finally {
     await scan.close();
   }
@@ -2912,6 +2931,7 @@ function testEnv(url, extra = {}) {
     HOPPER_POLL_MS: extra.HOPPER_POLL_MS ?? "10",
     SCAN_TIMEOUT_MS: extra.SCAN_TIMEOUT_MS ?? "2000",
     MAX_BYTES: extra.MAX_BYTES,
+    VERDICT_MAX_AGE: extra.VERDICT_MAX_AGE,
     HOPPER_HEDGE_MS: extra.HOPPER_HEDGE_MS,
     HOPPER_LOOKUP_MS: extra.HOPPER_LOOKUP_MS,
     // Retries are real behaviour worth exercising, but not at a real clock:

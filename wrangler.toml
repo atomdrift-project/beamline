@@ -34,9 +34,20 @@ head_sampling_rate = 1
 [vars]
 MAX_BYTES = "16777216"
 SCAN_TIMEOUT_MS = "1800000"
-# How long a verdict stays in caches.default. Short while the service is still
-# moving; raise it once the answers have settled.
-VERDICT_MAX_AGE = "3600"
+# How long a verdict stays in caches.default.
+#
+# Seventy-two hours. An artifact is immutable, so the only thing a shorter age
+# buys is picking up a re-score from a newer engine — and at the hour this used
+# to be (and for as long as nothing read this variable, which was until
+# 2026-09-08) L0 answered 0.5% of cached analyses while KV answered 87%: a
+# precache pass walks thousands of packages before it returns to one, and the
+# entry was long gone by then.
+#
+# Detections ship several times a day, so this is deliberately not the lever for
+# picking them up — three days of L0 would sit in front of any of them. Purging
+# the artifacts a new detection actually changes is, and until that exists a
+# re-score is visible only to callers whose colo has not cached the verdict.
+VERDICT_MAX_AGE = "259200"
 # How long a verdict stays in Workers KV, the layer behind it. Measured from the
 # write; a read does not extend it. Written without an expiry a verdict is
 # stored forever, and a key whose spelling stops being read is never reclaimed.
