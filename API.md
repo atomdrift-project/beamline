@@ -11,6 +11,7 @@ GET  /v1/lookup?sha256={64hex}
 GET  /v1/lookup?purl=a&purl=b                 up to 50 per URL
 POST /v1/analyze?purl={purl}                  answers from cache or spends an
 POST /v1/analyze?url={url}                    exact URL; scan fetches and hashes it
+POST /v1/analyze?sha256={64hex}&refresh=1     reconcile Hopper; analyze if stale
 POST /v1/analyze                              analysis slot; streams. The
                                               artifact may be the raw body
 
@@ -93,6 +94,22 @@ To analyze an already-resolved artifact URL, use
 `POST /v1/analyze?url=https%3A%2F%2F…`. Scan fetches that exact URL, computes the
 SHA-256, and Beamline stores the result under the URL and digest (and under a
 PURL when scan supplies one).
+
+### Refreshing a stored sample
+
+`POST /v1/analyze?sha256={64hex}&refresh=1` is the rescan path for a sample
+already stored in Hopper. `refresh=1` skips Beamline's Cache API and KV reads,
+so the request always reaches Scan. A current Scan-local verdict may answer
+immediately; otherwise Scan asks Hopper's authoritative side and reuses its
+verdict only when `traits_version` matches the traits version Scan currently
+has loaded. If it does not match (or no verdict exists), Scan fetches the
+immutable bytes from Hopper and processes them through the normal analysis
+path. Cleave's content-addressed analysis cache remains enabled.
+
+The terminal assessment is written back under the ordinary SHA cache key;
+`refresh` is not part of that key. A newly processed assessment is also
+published to Hopper through Scan's normal result path. Only the exact spelling
+`refresh=1` opts in.
 
 ```
 $ curl -sN -X POST --data-binary @suspect.tgz \
@@ -367,12 +384,14 @@ reworded.
 | code | status | |
 | --- | --- | --- |
 | `missing_package` | 400 | Neither `purl`, `url`, nor `sha256`. |
-| `multiple_locators` | 400 | `purl` and `url` were supplied together. |
+| `multiple_locators` | 400 | More than one of `purl`, `url`, and `sha256` was supplied. |
 | `invalid_url` | 400 | Not an absolute `http` or `https` URL. |
 | `url_with_body` | 400 | An exact URL cannot be combined with uploaded bytes. |
 | `invalid_follow_policy` | 400 | Unknown, empty, or contradictory `follow` selection. |
 | `invalid_purl` | 400 | Not a package URL. |
 | `invalid_sha256` | 400 | Not 64 hexadecimal characters. |
+| `missing_sha256` | 400 | `refresh=1` was supplied without a SHA-256 locator. |
+| `refresh_required` | 400 | A SHA-256 analyze request must include `refresh=1`. |
 | `too_many_packages` | 413 | Over 50 in one URL. Use several requests. |
 | `empty_artifact` | 400 | The uploaded body had no bytes. |
 | `artifact_too_large` | 413 | Over the 16 MiB upload cap; use `purl`. |
@@ -478,6 +497,8 @@ Three things never answer from the cache:
   and the second says we could not find out.
 - a request carrying `X-Beamline-Pin`, which exists to time a specific
   backend.
+- a request carrying `refresh=1`; it reaches Scan and then repopulates the
+  ordinary cache key with the terminal assessment.
 
 A `follow` policy is not on that list: it is part of the cache key rather than
 a reason to skip it. Two policies can reach opposite verdicts about one

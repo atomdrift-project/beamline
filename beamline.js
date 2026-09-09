@@ -251,6 +251,10 @@ async function dispatch(request, env, ctx) {
   if (request.signal && !ctx.signal) ctx.signal = request.signal;
 
   const url = new URL(request.url);
+  // A refresh is a cache-read policy, not part of an artifact's identity. It
+  // therefore bypasses Beamline's Cache API/KV reads while retaining the
+  // ordinary canonical key for the result Scan returns and we write back.
+  ctx.refresh = url.searchParams.get("refresh") === "1";
   // /_/health is the name every service in this stack answers to; /healthz
   // stays because the Makefile and the stress harness probe it.
   if (url.pathname === "/healthz" || url.pathname === "/_/health") {
@@ -1267,15 +1271,34 @@ function v1Error(status, code, message) {
 async function handleV1Analyze(request, env, ctx, url) {
   const purl = (url.searchParams.get("purl") || "").trim();
   const artifactUrl = (url.searchParams.get("url") || "").trim();
+  const sha256 = (url.searchParams.get("sha256") || "").trim().toLowerCase();
   const budgetRaw = url.searchParams.get("false_positive_budget");
   const budget = parseFalsePositiveBudget(budgetRaw);
-  if (purl && artifactUrl) return v1Error(400, "multiple_locators", "Use ?purl= or ?url=, not both.");
+  const locatorCount = Number(Boolean(purl)) + Number(Boolean(artifactUrl)) + Number(Boolean(sha256));
+  if (locatorCount > 1) {
+    return v1Error(400, "multiple_locators", "Use ?purl=, ?url=, or ?sha256=, not more than one.");
+  }
+  if (sha256 && !SHA_RE.test(sha256)) {
+    return v1Error(400, "invalid_sha256", "sha256 must be 64 hexadecimal characters.");
+  }
+  if (sha256 && !ctx.refresh) {
+    return v1Error(400, "refresh_required", "?sha256= on /v1/analyze requires refresh=1.");
+  }
+  if (ctx.refresh && !sha256) {
+    return v1Error(400, "missing_sha256", "refresh=1 requires ?sha256=.");
+  }
   if (artifactUrl && !validArtifactUrl(artifactUrl)) {
     return v1Error(400, "invalid_url", "url must be an absolute http or https URL.");
   }
-  const locator = purl ? { type: "purl", value: purl } : artifactUrl ? { type: "url", value: artifactUrl } : null;
-  // Two ways to name an artifact, and the artifact itself is one of them. A
-  // caller holding bytes nobody has published — a build output, a file off
+  const locator = purl
+    ? { type: "purl", value: purl }
+    : artifactUrl
+      ? { type: "url", value: artifactUrl }
+      : sha256
+        ? { type: "sha256", value: sha256 }
+        : null;
+  // Locators name a stored artifact, and the artifact itself is another way
+  // in. A caller holding bytes nobody has published — a build output, a file off
   // disk, something pulled from a mirror — has nothing to locate them by, and
   // asking them to publish it first in order to find out what it is would be
   // the wrong way round.
@@ -1299,7 +1322,7 @@ async function handleV1Analyze(request, env, ctx, url) {
     if (buffered.byteLength > 0) bytes = buffered;
   }
   if (!locator && !bytes) {
-    return v1Error(400, "missing_package", "Name an artifact with ?purl=, ?url=, or send it as the body.");
+    return v1Error(400, "missing_package", "Name an artifact with ?purl=, ?url=, or ?sha256=, or send it as the body.");
   }
   if (budget === null) {
     return v1Error(
@@ -1317,6 +1340,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   // The PURL rides along with an upload too: scan grafts the registry
   // provenance onto the report and echoes it in each finding's `pkg`.
   if (locator) query.push(`${locator.type}=${encodeURIComponent(locator.value)}`);
+  if (ctx.refresh) query.push("refresh=1");
   // Always sent, named or not. The answer is filed under the policy resolved
   // here, so leaving scan to apply a default of its own would file it under a
   // policy that is not the one it was produced with.
@@ -1348,7 +1372,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   // It used to be a bypass, which meant the policy this service documents most
   // loudly — `follow=none`, the one the proxy recipe tells every caller to
   // send — was the one policy that could never hit a cache in either direction.
-  if (locator && !bytes && !ctx.pin) {
+  if (locator && !bytes && !ctx.pin && !ctx.refresh) {
     const cache = await getCache(env);
     // Same ordering the lookup reads under: this policy, then every wider one
     // that already answers it. An analysis is the most expensive thing this

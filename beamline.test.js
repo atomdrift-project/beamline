@@ -3926,6 +3926,85 @@ test("v1 analyze: the artifact may be the body", async () => {
   }
 });
 
+test("v1 analyze: refresh=1 bypasses Beamline caches and refills the canonical SHA key", async () => {
+  const queries = [];
+  let generation = 0;
+  const scan = await mockBackend({
+    status: { state: "unknown" },
+    onAnalyzeQuery: (u) => queries.push(u.search),
+    analyzeStream: () => {
+      generation += 1;
+      return [JSON.stringify({
+        decision: "allow",
+        fires_at: -1,
+        sha256: HELLO_SHA,
+        engine_version: `test-${generation}`,
+        analyzed_at: `2026-09-09T00:00:0${generation}Z`,
+      })];
+    },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const firstCtx = waitCtx();
+    const first = await handle(
+      new Request(`http://beamline/v1/analyze?sha256=${HELLO_SHA}&refresh=1`, { method: "POST" }),
+      env,
+      firstCtx.ctx,
+    );
+    await first.text();
+    await firstCtx.flush();
+
+    const refreshCtx = waitCtx();
+    const refreshed = await handle(
+      new Request(`http://beamline/v1/analyze?sha256=${HELLO_SHA}&refresh=1`, { method: "POST" }),
+      env,
+      refreshCtx.ctx,
+    );
+    assert.equal(JSON.parse((await refreshed.text()).trim()).engine_version, "test-2");
+    await refreshCtx.flush();
+    assert.equal(scan.hits.analyze, 2);
+    assert.match(queries.at(-1), /[?&]refresh=1(?:&|$)/);
+
+    const refilled = await handle(
+      new Request(`http://beamline/v1/lookup?sha256=${HELLO_SHA}`),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(refilled.headers.get("X-Beamline-Source"), "cache");
+    assert.equal(JSON.parse((await refilled.text()).trim()).engine_version, "test-2");
+    assert.equal(scan.hits.analyze, 2);
+  } finally {
+    await scan.close();
+  }
+});
+
+test("v1 analyze: refresh accepts only a valid SHA-256 locator", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const bad = await handle(
+    new Request("http://beamline/v1/analyze?sha256=nope&refresh=1", { method: "POST" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(bad.status, 400);
+  assert.equal((await bad.json()).error.code, "invalid_sha256");
+
+  const missing = await handle(
+    new Request("http://beamline/v1/analyze?refresh=1", { method: "POST" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(missing.status, 400);
+  assert.equal((await missing.json()).error.code, "missing_sha256");
+
+  const unflagged = await handle(
+    new Request(`http://beamline/v1/analyze?sha256=${HELLO_SHA}`, { method: "POST" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(unflagged.status, 400);
+  assert.equal((await unflagged.json()).error.code, "refresh_required");
+});
+
 // The locator still rides along when both are sent: scan grafts the registry
 // provenance onto the report and echoes it in each finding's `pkg`.
 test("v1 analyze: an upload may still name the package", async () => {

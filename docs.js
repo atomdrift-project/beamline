@@ -175,6 +175,9 @@ function docsHtml(authRequired) {
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
         <p>Beamline fetches the exact URL and returns its SHA-256. The response includes a PURL when one is known.</p>
+        <h3 id="refresh-sample"><a class="heading-link" href="#refresh-sample">Refresh a stored sample</a></h3>
+        <div class="route-example"><code>POST /v1/analyze?sha256=…&amp;refresh=1</code></div>
+        <p>For a sample already held by Hopper, <code>refresh=1</code> skips Beamline's edge and KV cache reads. A current Scan-local verdict may answer immediately; otherwise Scan accepts Hopper's verdict only when it matches Scan's current traits version. If it does not, Scan fetches the sample and runs the normal analysis path. The result refills the ordinary caches, and <code>refresh</code> is not part of their key.</p>
         <h3 id="content-upload"><a class="heading-link" href="#content-upload">Upload bytes</a></h3>
         <div class="route-example"><code>POST /v1/analyze</code></div>
         <div class="runner" data-runner data-method="POST" data-stream data-upload data-path="/v1/analyze">
