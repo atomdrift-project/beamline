@@ -246,7 +246,12 @@ async function dispatch(request, env, ctx) {
   // over explicitly, still bound to the context that owns it. Every later
   // { ...ctx } spreads this plain object, where it is an own property.
   const host = ctx;
-  ctx = { ...ctx, rid, pin: cleanId(request.headers.get("x-beamline-pin")) || null };
+  ctx = {
+    ...ctx,
+    rid,
+    pin: cleanId(request.headers.get("x-beamline-pin")) || null,
+    filename: cleanFilename(request.headers.get("x-filename") || request.headers.get("x-file-name")),
+  };
   if (typeof host?.waitUntil === "function") ctx.waitUntil = (p) => host.waitUntil(p);
   if (request.signal && !ctx.signal) ctx.signal = request.signal;
 
@@ -3301,7 +3306,14 @@ function backendHeaders(token, ctx) {
   const tok = (token || "").trim();
   const headers = { "x-request-id": ctx.rid };
   if (tok) headers.authorization = `Bearer ${tok}`;
+  if (ctx.filename) headers["x-filename"] = ctx.filename;
   return headers;
+}
+
+function cleanFilename(raw) {
+  const value = String(raw || "").trim();
+  if (!value || value.length > 255 || /[\r\n]/.test(value)) return null;
+  return value;
 }
 
 // A PURL from a backend header, bounded before it can become a cache key.
