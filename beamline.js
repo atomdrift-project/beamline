@@ -674,13 +674,14 @@ function v1Unavailable(sha, locator, cause = null) {
 // document filed without saying which question it answers is a document that
 // will eventually answer the wrong one. Passing no policy builds the path scan
 // is asked on, which takes locators only.
-function v1CachePath(sha, locators, follow) {
+function v1CachePath(sha, locators, follow, full = false) {
   const query = [];
   if (sha) query.push(`sha256=${encodeURIComponent(sha)}`);
   for (const locator of locators || []) {
     query.push(`${locator.type}=${encodeURIComponent(locator.value)}`);
   }
   if (follow) query.push(`follow=${encodeURIComponent(follow)}`);
+  if (full) query.push("full=1");
   return `/v1/lookup?${query.join("&")}`;
 }
 
@@ -705,19 +706,19 @@ function v1CachePath(sha, locators, follow) {
 // every time it is read would refresh its TTL forever, and an entry that never
 // ages is pinned rather than cached. A verdict is allowed to go stale on
 // schedule.
-async function backfillDigestKey(env, cache, origin, body, follow) {
+async function backfillDigestKey(env, cache, origin, body, follow, full = false) {
   const sha = v1DecisionSha(body);
   if (!sha) return;
   const maxAge = v1MaxAge(env, body);
   if (!maxAge) return;
-  const path = v1CachePath(sha, [], follow);
+  const path = v1CachePath(sha, [], follow, full);
   const key = new Request(`${origin}${path}`);
   const existing = await cache.match(key).catch(() => null);
   // Only a decision is worth leaving alone. A miss cached under this digest is
   // the exact thing this write answers, and skipping the write on account of
   // one leaves the digest key saying "nobody has analyzed this" while the
   // locator key beside it holds the verdict.
-  if (existing && v1CachedVerdict(await existing.text().catch(() => null))) return;
+  if (existing && v1CachedAnalyzeAnswer(await existing.text().catch(() => null), full)) return;
   await cache.put(key, storedDocument(env, body));
   await kvPut(env, path, body);
   logLine("v1_cache_backfill", { key: "sha256", sha, follow, max_age: maxAge });
@@ -735,9 +736,9 @@ async function backfillDigestKey(env, cache, origin, body, follow) {
 // across policies would file a shallow answer where a caller asking the deeper
 // question reads, which is the same mistake as filing under a PURL nobody
 // typed — one name, two questions.
-function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl) {
+function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl, full = false) {
   const paths = new Set([requestedPath]);
-  if (locator) paths.add(v1CachePath(null, [locator], follow));
+  if (locator) paths.add(v1CachePath(null, [locator], follow, full));
   // The normalized spelling of the coordinate that was asked, as scan
   // reported it. Not a PURL somebody else chose - the same one, written the
   // one way the normalizer writes it, which is the only spelling every other
@@ -748,9 +749,9 @@ function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonic
   // `@v4.4.0%2Bincompatible` are one artifact by sha and were two entries
   // here, so the second spelling to arrive bought an analysis the first had
   // already paid for. Go pseudo-versions make that spelling common.
-  if (canonicalPurl) paths.add(v1CachePath(null, [{ type: "purl", value: canonicalPurl }], follow));
+  if (canonicalPurl) paths.add(v1CachePath(null, [{ type: "purl", value: canonicalPurl }], follow, full));
   const sha = v1DecisionSha(body);
-  if (sha) paths.add(v1CachePath(sha, [], follow));
+  if (sha) paths.add(v1CachePath(sha, [], follow, full));
   let row;
   try {
     row = JSON.parse(body);
@@ -759,17 +760,17 @@ function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonic
   }
   if (row && !Array.isArray(row) && typeof row === "object") {
     if (typeof row.purl === "string" && row.purl.trim()) {
-      paths.add(v1CachePath(null, [{ type: "purl", value: row.purl.trim() }], follow));
+      paths.add(v1CachePath(null, [{ type: "purl", value: row.purl.trim() }], follow, full));
     }
     if (typeof row.url === "string" && validArtifactUrl(row.url.trim())) {
-      paths.add(v1CachePath(null, [{ type: "url", value: row.url.trim() }], follow));
+      paths.add(v1CachePath(null, [{ type: "url", value: row.url.trim() }], follow, full));
     }
   }
   return [...paths].map((path) => new Request(`${origin}${path}`));
 }
 
-async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, follow, canonicalPurl) {
-  const keys = v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl);
+async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, follow, canonicalPurl, full = false) {
+  const keys = v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl, full);
   await Promise.all(
     keys.map(async (key) => {
       try {
@@ -791,7 +792,7 @@ function v1DecisionSha(body) {
   } catch {
     return null;
   }
-  const sha = row && typeof row === "object" ? row.sha256 : null;
+  const sha = row && typeof row === "object" ? (row.sha256 || shaFromEnvelope(row)) : null;
   return typeof sha === "string" && SHA_RE.test(sha) ? sha : null;
 }
 
@@ -1002,7 +1003,7 @@ async function nearestAnswer(candidates, load) {
   return fallback;
 }
 
-function v1DocumentBody(body) {
+function v1DocumentBody(body, full = false) {
   let row;
   try {
     row = JSON.parse(body);
@@ -1010,6 +1011,7 @@ function v1DocumentBody(body) {
     return null;
   }
   if (!row || typeof row !== "object") return null;
+  if (full) return isFullEnvelope(row) ? JSON.stringify(row) : null;
   if (Array.isArray(row)) {
     if (!row.every((item) => item && typeof item === "object")) return null;
     return JSON.stringify(row.map((item) => canonicalV1Row(item)));
@@ -1136,6 +1138,23 @@ function v1CachedVerdict(body) {
   return row;
 }
 
+function isFullEnvelope(row) {
+  return !!row && typeof row === "object" && !Array.isArray(row)
+    && !!row.ml && typeof row.ml === "object" && !Array.isArray(row.ml)
+    && typeof row.ml.eng === "string" && row.ml.eng.length > 0
+    && !!row.raw && typeof row.raw === "object" && !Array.isArray(row.raw);
+}
+
+function v1CachedAnalyzeAnswer(body, full = false) {
+  if (!full) return v1CachedVerdict(body);
+  try {
+    const row = JSON.parse(body);
+    return isFullEnvelope(row) ? row : null;
+  } catch {
+    return null;
+  }
+}
+
 // How long this answer may be cached. A body carrying any `unavailable` is not
 // cacheable at all; anything no engine produced is cacheable only briefly.
 //
@@ -1173,7 +1192,7 @@ function v1MaxAge(env, body) {
     const row = JSON.parse(body);
     const rows = Array.isArray(row) ? row : [row];
     if (rows.some((item) => item?.status === "unavailable" || item?.decision === "unavailable")) return 0;
-    if (rows.some((item) => item?.status !== "analyzed" || !item?.engine_version)) return V1_NO_ENGINE_MAX_AGE;
+    if (rows.some((item) => !isFullEnvelope(item) && (item?.status !== "analyzed" || !item?.engine_version))) return V1_NO_ENGINE_MAX_AGE;
   } catch {
     return V1_NO_ENGINE_MAX_AGE;
   }
@@ -1279,6 +1298,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   const sha256 = (url.searchParams.get("sha256") || "").trim().toLowerCase();
   const budgetRaw = url.searchParams.get("false_positive_budget");
   const budget = parseFalsePositiveBudget(budgetRaw);
+  const full = url.searchParams.get("full") === "1";
   const locatorCount = Number(Boolean(purl)) + Number(Boolean(artifactUrl)) + Number(Boolean(sha256));
   if (locatorCount > 1) {
     return v1Error(400, "multiple_locators", "Use ?purl=, ?url=, or ?sha256=, not more than one.");
@@ -1346,6 +1366,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   // provenance onto the report and echoes it in each finding's `pkg`.
   if (locator) query.push(`${locator.type}=${encodeURIComponent(locator.value)}`);
   if (ctx.refresh) query.push("refresh=1");
+  if (full) query.push("full=1");
   // Always sent, named or not. The answer is filed under the policy resolved
   // here, so leaving scan to apply a default of its own would file it under a
   // policy that is not the one it was produced with.
@@ -1356,6 +1377,7 @@ async function handleV1Analyze(request, env, ctx, url) {
     ...v1LocatorIds(ctx.rid, null, locator ? [locator] : []),
     bytes: bytes ? bytes.byteLength : undefined,
     follow: follow.value,
+    full: full || undefined,
   };
   const t0 = Date.now();
 
@@ -1390,27 +1412,27 @@ async function handleV1Analyze(request, env, ctx, url) {
     // holding.
     let hit = await nearestAnswer(candidates, async (policy) => {
       const found = await cache
-        .match(new Request(`${url.origin}${v1CachePath(null, [locator], policy)}`))
+        .match(new Request(`${url.origin}${v1CachePath(null, [locator], policy, full)}`))
         .catch(() => null);
       const text = found ? await found.text().catch(() => null) : null;
       return text ? { document: text, fromCache: true } : null;
     });
     if (!hit) {
       hit = await nearestAnswer(candidates, async (policy) => {
-        const text = await kvGet(env, v1CachePath(null, [locator], policy));
+        const text = await kvGet(env, v1CachePath(null, [locator], policy, full));
         return text ? { document: text, fromCache: false } : null;
       });
     }
     const document = hit ? hit.document : null;
     const served = hit ? hit.policy : follow.value;
-    const decided = document ? v1CachedVerdict(document) : null;
+    const decided = document ? v1CachedAnalyzeAnswer(document, full) : null;
     if (decided) {
       // Serving from cache used to warm nothing, because this path returns
       // before the write below ever runs. So a warm PURL key left the digest
       // key cold indefinitely: every caller holding only a hash paid a round
       // trip to learn something we were already holding, and answering them
       // never fixed it either.
-      const body = v1BudgetedBody(document, budget, locator);
+      const body = full ? document : v1BudgetedBody(document, budget, locator);
       // An answer that came from KV warms L0 under the key it was asked for,
       // exactly as the lookup does on its own KV hit.
       //
@@ -1425,14 +1447,14 @@ async function handleV1Analyze(request, env, ctx, url) {
         waitUntil(
           ctx,
           cache.put(
-            new Request(`${url.origin}${v1CachePath(null, [locator], served)}`),
+            new Request(`${url.origin}${v1CachePath(null, [locator], served, full)}`),
             storedDocument(env, document),
           ),
         );
       }
       // Filed at the digest under the policy that produced it, not the one that
       // asked, for the reason the lookup warms its own key that way.
-      waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document, served));
+      waitUntil(ctx, backfillDigestKey(env, cache, url.origin, document, served, full));
       logLine("v1_analyze", { src: hit.fromCache ? "cache" : "kv", status: 200, artifact_status: decided.status, follow: served, ms: Date.now() - t0, ...ids });
       // Answered in the shape this route always answers in: one NDJSON line,
       // no progress frames because there was no run to report progress about.
@@ -1506,6 +1528,7 @@ async function handleV1Analyze(request, env, ctx, url) {
       bytes,
       pass,
       cacheFollow,
+      full,
       sizeHint,
     );
     if (answered) return answered;
@@ -1539,7 +1562,7 @@ function v1UnavailableCause(env, ctx, pass) {
 
 // One pass over the fleet. Returns the response, or null when every worker
 // refused and the pass is worth making again.
-async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheFollow, sizeHint) {
+async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheFollow, full, sizeHint) {
   const workers = scanWorkers(env, ctx.pin);
   const hint = v1Hint(locator, bytes, sizeHint);
   let ranked = workers.length ? await rankWorkers(env, ctx, workers, ids, hint) : [];
@@ -1648,7 +1671,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
     // bounded Cache API / KV writes to waitUntil.
     const cacheDecision = cacheFollow
       ? (decided) => {
-          waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, decided, storedFollow, canonicalPurl));
+          waitUntil(ctx, cacheV1Decision(env, ctx, url.origin, locator, decided, storedFollow, canonicalPurl, full));
         }
       : null;
     const streamed = new Headers({
@@ -1689,7 +1712,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
       annotatedV1Stream(
         upstream.body,
         budget,
-        { requestId: ctx.rid, locator, startedAt: t0, ids, settled },
+        { requestId: ctx.rid, locator, startedAt: t0, ids, settled, full },
         cacheDecision,
         // Only the analyze path resumes. It is the only one that holds a stream
         // long enough for its worker to be taken away mid-answer — a lookup is
@@ -1792,9 +1815,9 @@ async function v1Resume(env, ctx, path, bytes, ids, locator, tried, sizeHint) {
 // Store a completed stream's decision where the cheap route will find it.
 // This function starts only after the decision arrives, so waitUntil covers
 // bounded cache writes rather than the analysis that produced them.
-async function cacheV1Decision(env, ctx, origin, locator, decided, follow, canonicalPurl) {
+async function cacheV1Decision(env, ctx, origin, locator, decided, follow, canonicalPurl, full = false) {
   const ids = v1LocatorIds(ctx.rid, null, locator ? [locator] : []);
-  const document = v1DocumentBody(decided);
+  const document = v1DocumentBody(decided, full);
   if (!document) {
     logLine("v1_cache_write", { stored: false, reason: "invalid_decision", ...ids });
     return;
@@ -1805,9 +1828,9 @@ async function cacheV1Decision(env, ctx, origin, locator, decided, follow, canon
     return;
   }
   const cache = await getCache(env);
-  const requestedPath = v1CachePath(null, locator ? [locator] : [], follow);
-  await cacheV1Aliases(env, cache, origin, requestedPath, locator, document, follow, canonicalPurl);
-  logLine("v1_cache_write", { stored: true, follow, max_age: maxAge, keys: v1CacheAliasPaths(origin, requestedPath, locator, document, follow, canonicalPurl).length, ...ids });
+  const requestedPath = v1CachePath(null, locator ? [locator] : [], follow, full);
+  await cacheV1Aliases(env, cache, origin, requestedPath, locator, document, follow, canonicalPurl, full);
+  logLine("v1_cache_write", { stored: true, follow, full: full || undefined, max_age: maxAge, keys: v1CacheAliasPaths(origin, requestedPath, locator, document, follow, canonicalPurl, full).length, ...ids });
 }
 
 // Add phase telemetry to the progress stream without changing the cached
@@ -2131,7 +2154,7 @@ function annotatedV1Lines(line, budget, meta, phase) {
 
   // A decision is the terminal event. Close the last reported phase in its own
   // frame so clients never have to infer completion from the decision shape.
-  if (Object.prototype.hasOwnProperty.call(row, "decision")) {
+  if (Object.prototype.hasOwnProperty.call(row, "decision") || (meta.full && isFullEnvelope(row))) {
     const done = phaseCompletion(meta, phase);
     return {
       lines: [...(done ? [JSON.stringify(done)] : []), budgetedV1Line(line, budget, meta.locator)],
@@ -3602,7 +3625,10 @@ function cacheId(req) {
 // read by their proxy and their browser, and a PURL is their dependency list.
 // clientScope() still stamps that, and is unchanged.
 function storedDocument(env, body) {
-  const canonical = v1DocumentBody(body) || body;
+  // Full envelopes are already canonical scan output. Running one through the
+  // compact decision normalizer would add `status` and `severity`, changing
+  // the payload between a fresh response and a cache hit.
+  const canonical = v1DocumentBody(body, true) || v1DocumentBody(body) || body;
   return new Response(canonical, {
     status: 200,
     headers: {

@@ -3,7 +3,7 @@
 //
 //   N=6 CONCURRENCY=2 BEAMLINE_URL=http://127.0.0.1:8080 node stress.js
 //
-// Feeds: npm replicate _changes, PyPI updates RSS, crates.io-index commits
+// Feeds: npm replicate _changes, PyPI updates RSS, crates.io recent updates
 // (sparse version lookup), Go module index.
 
 import { pathToFileURL } from "node:url";
@@ -287,37 +287,13 @@ async function fetchCrates(limit) {
 }
 
 async function crateNames(limit) {
-  try {
-    return await crateNamesFromIndex(limit);
-  } catch (err) {
-    process.stderr.write(`  cargo index: ${err.message}; falling back to crates.io recent-updates\n`);
-    return crateNamesFromApi(limit);
-  }
-}
-
-async function crateNamesFromIndex(limit) {
-  const resp = await get(
-    "https://api.github.com/repos/rust-lang/crates.io-index/commits?sha=master&per_page=100",
-    META_TIMEOUT_MS,
-    { accept: "application/vnd.github+json" },
-  );
-  const commits = await resp.json();
-  if (!Array.isArray(commits)) throw new Error("github commits: unexpected body");
-  const names = [];
-  const seen = new Set();
-  for (const c of commits) {
-    const subject = (c.commit && c.commit.message ? c.commit.message : "").split("\n")[0];
-    const { name, changed } = parseCratesIndexCommit(subject);
-    if (!changed || seen.has(name)) continue;
-    seen.add(name);
-    names.push(name);
-    if (names.length >= limit) break;
-  }
-  if (!names.length) throw new Error("no crate names in recent commits");
-  return names;
+  return crateNamesFromApi(limit);
 }
 
 async function crateNamesFromApi(limit) {
+  // crates.io is the source of truth for recently updated crates. Keeping
+  // discovery on this API avoids GitHub's unauthenticated index-commit rate
+  // limit; the sparse index below still supplies each crate's newest version.
   const resp = await get(`https://crates.io/api/v1/crates?sort=recent-updates&per_page=${Math.min(100, limit)}`, META_TIMEOUT_MS);
   const body = await resp.json();
   return (body.crates || []).map((c) => c.name).filter(Boolean).slice(0, limit);

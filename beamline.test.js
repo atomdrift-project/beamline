@@ -109,7 +109,7 @@ test("GET / serves the public API documentation", async () => {
   assert.match(body, /class="meanings"/);
   assert.match(body, /<code>status<\/code> describes whether Beamline has an assessment/);
   assert.match(body, /status: "analyzed"/);
-  assert.match(body, /only the terminal line containing <code>status<\/code> is the assessment/);
+  assert.match(body, /terminal line contains <code>status<\/code>, or <code>ml<\/code> and <code>raw<\/code> when <code>full=1<\/code>/);
   assert.match(body, /runner\.has-response/);
   assert.match(body, /runner\.hasAttribute\("data-stream"\) \? output\.scrollHeight : 0/);
   assert.match(body, /data-path="\/v1\/lookup\?url=/);
@@ -581,6 +581,57 @@ test("v1 analyze: follow is normalized and forwarded", async () => {
     assert.equal(res.status, 200);
     await res.text();
     assert.equal(forwarded, "dependencies,references,ci-actions");
+  } finally {
+    await scan.close();
+  }
+});
+
+test("v1 analyze: full=1 returns the scan envelope and uses a separate cache entry", async () => {
+  const purl = "pkg:npm/app@1.0.0";
+  const queries = [];
+  const envelope = {
+    status: "analyzed",
+    ml: { v: "7", eng: "2.9.1", lvl: -1, prob: 0, files: [], version: "test", analyzed_at: "2026-09-09T00:00:00Z" },
+    raw: { v: "8", files: [{ sha: HELLO_SHA, path: "app.tgz", traits: [] }] },
+  };
+  const compact = {
+    decision: "allow",
+    fires_at: -1,
+    purl,
+    sha256: HELLO_SHA,
+    engine_version: "2.9.1",
+    analyzed_at: "2026-09-09T00:00:00Z",
+  };
+  const scan = await mockBackend({
+    onAnalyzeQuery: (url) => queries.push(url.search),
+    analyzeStream: (url) => [JSON.stringify(url.searchParams.get("full") === "1" ? envelope : compact)],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ask = (full) => new Request(
+    `http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}${full ? "&full=1" : ""}`,
+    { method: "POST" },
+  );
+  try {
+    const compactCtx = waitCtx();
+    const firstCompact = await handle(ask(false), env, compactCtx.ctx);
+    assert.equal(JSON.parse((await firstCompact.text()).trim()).status, "analyzed");
+    await compactCtx.flush();
+
+    const fullCtx = waitCtx();
+    const firstFull = await handle(ask(true), env, fullCtx.ctx);
+    assert.deepEqual(JSON.parse((await firstFull.text()).trim()), envelope);
+    await fullCtx.flush();
+
+    const cachedFull = await handle(ask(true), env, noopCtx());
+    assert.equal(cachedFull.headers.get("x-beamline-source"), "cache");
+    assert.deepEqual(JSON.parse((await cachedFull.text()).trim()), envelope);
+
+    const cachedCompact = await handle(ask(false), env, noopCtx());
+    assert.equal(cachedCompact.headers.get("x-beamline-source"), "cache");
+    assert.equal(JSON.parse((await cachedCompact.text()).trim()).status, "analyzed");
+
+    assert.equal(scan.hits.analyze, 2, "full and compact responses shared a cache key");
+    assert.equal(queries.some((query) => /[?&]full=1(?:&|$)/.test(query)), true, "full=1 was not forwarded");
   } finally {
     await scan.close();
   }

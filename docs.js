@@ -189,6 +189,7 @@ function docsHtml(authRequired) {
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
         <p>Archives, binaries, and source are accepted. The default upload limit is 16 MiB.</p>
+        <p>Add <code>?full=1</code> to return <code>{status: "analyzed", ml, raw, llm?}</code> as the terminal line. The complete Scan envelope remains at the top level, with the same terminal status marker as the compact response. Full envelopes and compact decisions use separate cache entries.</p>
       </section>
 
       <section id="false-positive-budget"><h2><a class="heading-link" href="#false-positive-budget">False-positive budget</a></h2>
@@ -228,7 +229,7 @@ POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
           <li><code>status: "unanalyzed"</code> means nobody has analyzed the artifact; severity is <code>unknown</code>.</li>
           <li><code>status: "unavailable"</code> means Beamline could not answer; severity is <code>unknown</code>. <code>cause</code> says which outage it was: <code>saturated</code> and <code>mixed</code> are worth retrying with backoff, <code>unreachable</code> and <code>no_workers</code> are not.</li>
         </ul>
-        <p>For streaming analysis, only the terminal line containing <code>status</code> is the assessment. Other lines report progress. Retry if the stream ends without one.</p>
+        <p>For streaming analysis, the terminal line contains <code>status</code>, or <code>ml</code> and <code>raw</code> when <code>full=1</code>. Other lines report progress. Retry if the stream ends without a terminal line.</p>
         <p>A <code>{"state":"resumed"}</code> line means the scan worker was lost mid-run and Beamline moved the run to another one. It is progress, not an answer: keep reading. Phases restart after it; elapsed times do not go backwards.</p>
       </section>
 
