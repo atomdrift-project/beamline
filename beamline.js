@@ -301,6 +301,10 @@ async function dispatch(request, env, ctx) {
       if (request.method !== "GET") return methodNotAllowed("GET");
       return await handleV1Lookup(env, ctx, url);
     }
+    if (url.pathname === "/v1/flush") {
+      if (request.method !== "POST") return methodNotAllowed("POST");
+      return await handleV1Flush(env, ctx, url);
+    }
     if (url.pathname === "/_/routes") {
       if (request.method !== "GET") return methodNotAllowed("GET");
       return await handleRoutes(env, ctx, url);
@@ -309,7 +313,7 @@ async function dispatch(request, env, ctx) {
     // `not found` sends them hunting through the docs for a name they most
     // likely already had right — nearly every miss here is a dropped `/v1`.
     // Name the routes, and when the last segment is one of ours, say so.
-    const routes = ["/v1/lookup", "/v1/analyze"];
+    const routes = ["/v1/lookup", "/v1/analyze", "/v1/flush"];
     const tail = url.pathname.replace(/\/+$/, "");
     const guess = tail && routes.find((r) => r.endsWith(tail));
     return v1Error(
@@ -333,6 +337,11 @@ async function dispatch(request, env, ctx) {
 // caller is refused here for the same reason and with the same number rather
 // than discovering a second, smaller limit one hop in.
 const V1_MAX_KEYS = 50;
+// How many locators one flush may walk to. The graph is caller-influenced —
+// each document names the next — so it is bounded rather than trusted. An
+// artifact reaches its digest, its URL and its PURL, which is three; the room
+// above that is for a chain of spellings, not for an unbounded crawl.
+const V1_FLUSH_MAX_LOCATORS = 16;
 
 // How long a v1 answer stays in the edge cache.
 //
@@ -385,7 +394,7 @@ const SUSPICIOUS_LEVEL_CEILING = 3000;
 async function handleV1Lookup(env, ctx, url) {
   const budgetRaw = url.searchParams.get("false_positive_budget");
   const budget = parseFalsePositiveBudget(budgetRaw);
-  const purls = url.searchParams.getAll("purl").map((p) => p.trim()).filter(Boolean);
+  const purls = url.searchParams.getAll("purl").map((p) => normalizePurl(p)).filter(Boolean);
   const urls = url.searchParams.getAll("url").map((value) => value.trim()).filter(Boolean);
   const sha = (url.searchParams.get("sha256") || "").trim();
   const locators = urls.length ? urls.map((value) => ({ type: "url", value })) : purls.map((value) => ({ type: "purl", value }));
@@ -431,7 +440,7 @@ async function handleV1Lookup(env, ctx, url) {
   // `pin` exists to time a specific backend, so it reads no cache at all —
   // not this policy's, and not a wider one's.
   const candidates = ctx.pin ? [] : followCandidates(follow.value);
-  const hit = await nearestAnswer(candidates, async (policy) => {
+  const hit = await fullestAnswer(follow.value, candidates, async (policy) => {
     const found = await cache
       .match(new Request(`${url.origin}${v1CachePath(sha, locators, policy)}`))
       .catch(() => null);
@@ -462,7 +471,7 @@ async function handleV1Lookup(env, ctx, url) {
   }
 
   if (!ctx.pin) {
-    const stored = await nearestAnswer(candidates, async (policy) => {
+    const stored = await fullestAnswer(follow.value, candidates, async (policy) => {
       const document = await kvGet(env, v1CachePath(sha, locators, policy));
       return document ? { document } : null;
     });
@@ -929,22 +938,29 @@ function followSet(policy) {
   return new Set(String(policy).split(",").map((kind) => kind.trim()).filter(Boolean));
 }
 
-// The requested policy first, then every stored policy wide enough to answer
-// it, narrowest first. Nearest-answer-first matters: a caller asking
-// `follow=none` should not be handed `all`'s verdict while a `dependencies`
-// entry — which folded in less that the caller did not ask about — sits beside
-// it.
+// Every stored policy wide enough to answer the question, widest first.
+//
+// `follow` is a spend control, not a narrowing of the question. It caps what an
+// analysis may walk, and a caller who set it low was buying a cheaper run — not
+// asking to be told less about an artifact somebody else has already paid to
+// walk further. So when several stored answers all answer the question, the
+// fullest one wins. Its extra findings are the ones the cheap walk could never
+// have reached, `findings[].pkg` names the component each came from, and the
+// caller pays nothing for them.
+//
+// This orders how a decision is chosen, not how the reads are issued; those go
+// out together. See fullestAnswer.
 function followCandidates(policy) {
   const want = followSet(policy);
-  const wider = FOLLOW_POLICIES.filter((candidate) => {
-    if (candidate === policy) return false;
+  // FOLLOW_POLICIES runs narrowest first, so containment order reversed is
+  // widest first.
+  return FOLLOW_POLICIES.filter((candidate) => {
     const kinds = followSet(candidate);
     return kinds.size >= want.size && [...want].every((kind) => kinds.has(kind));
-  });
-  return [policy, ...wider];
+  }).reverse();
 }
 
-// The nearest candidate policy holding an answer, walked narrowest first.
+// The fullest candidate policy holding an answer.
 //
 // Only a decision may answer for a policy other than the one asked about. A
 // stored "we hold nothing" is not evidence a wider walk gathered — it is a
@@ -969,38 +985,62 @@ function followCandidates(policy) {
 // load answers with {document, ...} for one policy, or null. Whatever else it
 // carries comes back untouched, alongside the policy that answered.
 //
-// The policy the caller named is read alone, because it is the one that usually
-// answers and a hit there costs exactly one round trip. Only when it holds no
-// decision are the wider candidates read, and then all at once: they are
-// independent keys, so walking them in series bought nothing but their latency
-// added together. Measured on the fleet, the KV walk was the difference between
-// /lookup at 314ms and /analyze at 163ms — /lookup is the route built to miss,
-// so it paid for the whole walk almost every time.
+// Every candidate is read at once. They are independent keys, so walking them
+// in series bought nothing but their latency added together — measured on the
+// fleet, that walk was the difference between /lookup at 314ms and /analyze at
+// 163ms, /lookup being the route built to miss and so the one paying for the
+// whole walk almost every time.
 //
-// The order the answer is chosen in is unchanged, and has to be: narrowest
-// first, first decision wins, the caller's own non-decision as the fallback.
-// What changes is only when the reads are issued.
+// Reading all of them is also what widest-first requires: which policy answers
+// is not known until every key has been looked at, so there is no fast path to
+// take. That costs one batch of reads where a hit on the caller's own policy
+// used to cost a single read, and buys the fullest answer already paid for.
 //
-// A wider candidate holding a decision now costs the reads after it as well,
-// which the series walk would have skipped. That is the trade: a few more reads
-// on a path that was already the expensive one, against removing the round
-// trips that made it expensive.
-async function nearestAnswer(candidates, load) {
-  const [asked, ...wider] = candidates;
-  if (asked === undefined) return null;
+// `asked` is the policy the caller named, and only it may supply the fallback.
+// A non-decision — `unanalyzed`, `unavailable` — is a statement about one key at
+// one moment rather than evidence any walk gathered, so a wider candidate's
+// non-decision answers a question nobody asked.
+async function fullestAnswer(asked, candidates, load) {
+  if (!candidates.length) return null;
 
-  const first = await load(asked);
-  if (first && v1CachedVerdict(first.document)) return { ...first, policy: asked };
-  // Narrowest first, so this is the policy the caller named. A non-decision at
-  // any later candidate answers a question nobody asked.
-  const fallback = first ? { ...first, policy: asked } : null;
-  if (!wider.length) return fallback;
-
-  const rest = await Promise.all(wider.map((policy) => load(policy)));
-  for (const [index, found] of rest.entries()) {
-    if (found && v1CachedVerdict(found.document)) return { ...found, policy: wider[index] };
+  const found = await Promise.all(candidates.map((policy) => load(policy)));
+  let best = null;
+  let newest = null;
+  for (const [index, hit] of found.entries()) {
+    const verdict = hit && v1CachedVerdict(hit.document);
+    if (!verdict) continue;
+    // Candidates run widest first, so the first decision seen at a given engine
+    // is already the fullest one that engine produced. Only a newer engine
+    // displaces it.
+    if (best && !newerEngine(verdict.engine_version, newest)) continue;
+    best = { ...hit, policy: candidates[index] };
+    newest = verdict.engine_version;
   }
-  return fallback;
+  if (best) return best;
+
+  const mine = found[candidates.indexOf(asked)];
+  return mine ? { ...mine, policy: asked } : null;
+}
+
+// Is `a` a newer engine than `b`?
+//
+// Width picks the fullest answer; this keeps it from picking an archaeological
+// one. Nothing else in the walk looks at age, and KV holds a verdict for 90
+// days, so without this a `follow=all` entry an old engine wrote outranks a
+// verdict minutes old from the engine running now — which is precisely the
+// failure that sent `pkg:pypi/ddtrace@3.18.1` out as hostile on engine 2.8.0
+// while 2.11.0 had already scored it benign.
+//
+// Compared segment by segment as numbers, because `2.11.0` orders before
+// `2.8.0` under the string comparison a naive version of this would use.
+function newerEngine(a, b) {
+  const left = String(a || "").split(".");
+  const right = String(b || "").split(".");
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const step = (Number.parseInt(left[i], 10) || 0) - (Number.parseInt(right[i], 10) || 0);
+    if (step) return step > 0;
+  }
+  return false;
 }
 
 function v1DocumentBody(body, full = false) {
@@ -1104,6 +1144,18 @@ async function kvGet(env, path) {
 // Nothing is written without an expiry. `unanalyzed` keeps the short clock it has
 // at the edge, because it stops being true the moment anything analyzes the
 // artifact; a verdict keeps the long one.
+async function kvDelete(env, path) {
+  const kv = env && env.BEAMLINE_KV;
+  if (!kv || typeof kv.delete !== "function") return false;
+  try {
+    await kv.delete(await kvKey(path));
+    return true;
+  } catch (err) {
+    logLine("v1_kv_delete", { ok: false, err: errText(err) });
+    return false;
+  }
+}
+
 async function kvPut(env, path, body) {
   const kv = env && env.BEAMLINE_KV;
   if (!kv || typeof kv.put !== "function") return;
@@ -1278,6 +1330,146 @@ function v1Error(status, code, message) {
   });
 }
 
+// POST /v1/flush — forget everything cached about an artifact.
+//
+// The only operation here that removes rather than writes. Without it a stale
+// verdict could be displaced only by landing a newer one on the exact key a
+// caller would read, and an artifact does not have one key: it has one per
+// follow policy, per `full` variant, and per locator that names it. Correcting
+// a single PyPI sdist by hand took four attempts across two wrong keys before
+// this existed, and the write that finally worked went through X-Beamline-Pin,
+// which is a benchmarking lever rather than an invalidation one.
+//
+// Children are the point. A verdict names the other ways to reach the artifact
+// it describes — the digest it resolved to, the URL it was fetched from, the
+// PURL scan normalized it to — and those are separate entries that a flush of
+// the caller's own spelling would leave standing, holding exactly the answer
+// that was just dropped. So each document is read before it is deleted, the
+// locators inside it are queued, and the walk continues until nothing new
+// turns up. Bounded, because the graph is caller-influenced.
+async function handleV1Flush(env, ctx, url) {
+  const purl = normalizePurl(url.searchParams.get("purl"));
+  const artifactUrl = (url.searchParams.get("url") || "").trim();
+  const sha256 = (url.searchParams.get("sha256") || "").trim().toLowerCase();
+  const named = Number(Boolean(purl)) + Number(Boolean(artifactUrl)) + Number(Boolean(sha256));
+  if (named > 1) {
+    return v1Error(400, "multiple_locators", "Use ?purl=, ?url=, or ?sha256=, not more than one.");
+  }
+  if (!named) {
+    return v1Error(400, "missing_package", "Name an artifact with ?purl=, ?url=, or ?sha256=.");
+  }
+  if (sha256 && !SHA_RE.test(sha256)) {
+    return v1Error(400, "invalid_sha256", "sha256 must be 64 hexadecimal characters.");
+  }
+  if (artifactUrl && !validArtifactUrl(artifactUrl)) {
+    return v1Error(400, "invalid_url", "url must be an absolute http or https URL.");
+  }
+
+  const cache = await getCache(env);
+  const seen = new Set();
+  const locators = [];
+  let examined = 0;
+  let dropped = 0;
+  // Walked a generation at a time. Depth is unavoidable — a child is named by
+  // the document its parent was holding, so it cannot be known before that
+  // parent is read — but breadth is not: siblings are independent keys, and
+  // draining them one at a time would make a flush as many round trips deep as
+  // the artifact has spellings.
+  let frontier = [
+    purl
+      ? { type: "purl", value: purl }
+      : artifactUrl
+        ? { type: "url", value: artifactUrl }
+        : { type: "sha256", value: sha256 },
+  ];
+  while (frontier.length && seen.size < V1_FLUSH_MAX_LOCATORS) {
+    const wave = [];
+    for (const locator of frontier) {
+      const id = `${locator.type}=${locator.value}`;
+      if (seen.has(id) || seen.size >= V1_FLUSH_MAX_LOCATORS) continue;
+      seen.add(id);
+      wave.push({ locator, id });
+    }
+    if (!wave.length) break;
+
+    const walked = await Promise.all(wave.map(({ locator }) => dropLocator(env, cache, url.origin, locator)));
+    frontier = [];
+    for (const [index, result] of walked.entries()) {
+      examined += result.examined;
+      dropped += result.dropped;
+      locators.push({ locator: wave[index].id, dropped: result.dropped });
+      frontier.push(...result.children);
+    }
+  }
+
+  logLine("v1_flush", { rid: ctx.rid, locators: locators.length, examined, dropped });
+  return json({ status: "flushed", locators, keys_examined: examined, keys_dropped: dropped }, 200);
+}
+
+// Drop every key one locator can be filed under: both `full` shapes of every
+// follow policy. Issued together, because they are independent keys and a
+// series walk would be fourteen round trips deep for one spelling.
+async function dropLocator(env, cache, origin, locator) {
+  const paths = [];
+  for (const policy of FOLLOW_POLICIES) {
+    for (const full of [false, true]) {
+      paths.push(
+        locator.type === "sha256"
+          ? v1CachePath(locator.value, [], policy, full)
+          : v1CachePath(null, [locator], policy, full),
+      );
+    }
+  }
+  const held = await Promise.all(paths.map((path) => dropKey(env, cache, origin, path)));
+  const children = [];
+  let dropped = 0;
+  for (const document of held) {
+    if (!document) continue;
+    dropped += 1;
+    children.push(...locatorsIn(document));
+  }
+  return { examined: paths.length, dropped, children };
+}
+
+// Drop one key from both layers, returning whatever it held.
+//
+// Read and delete rather than delete alone: the document names the artifact's
+// other spellings, and dropping it without looking would strand them. KV is
+// consulted only when L0 holds nothing, because a key present in both has the
+// same document in each and the second read would buy nothing.
+async function dropKey(env, cache, origin, path) {
+  const request = new Request(`${origin}${path}`);
+  const hit = await cache.match(request).catch(() => null);
+  const cached = hit ? await hit.text().catch(() => null) : null;
+  const document = cached || (await kvGet(env, path));
+  await Promise.all([
+    typeof cache.delete === "function" ? cache.delete(request).catch(() => false) : false,
+    kvDelete(env, path),
+  ]);
+  return document;
+}
+
+// Every locator a stored answer names, so a flush can reach them too.
+function locatorsIn(body) {
+  let row;
+  try {
+    row = JSON.parse(body);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const item of Array.isArray(row) ? row : [row]) {
+    if (!item || typeof item !== "object") continue;
+    const purl = normalizePurl(item.purl);
+    if (purl && cleanPurl(purl)) out.push({ type: "purl", value: purl });
+    const artifactUrl = String(item.url || "").trim();
+    if (validArtifactUrl(artifactUrl)) out.push({ type: "url", value: artifactUrl });
+    const sha = String(item.sha256 || "").trim().toLowerCase();
+    if (SHA_RE.test(sha)) out.push({ type: "sha256", value: sha });
+  }
+  return out;
+}
+
 // POST /v1/analyze — analyze an artifact and stream the decision back.
 //
 // The body is passed through untouched, and that is the point. Scan answers
@@ -1293,7 +1485,7 @@ function v1Error(status, code, message) {
 // refusal is still something to route around rather than a decision already
 // half-delivered.
 async function handleV1Analyze(request, env, ctx, url) {
-  const purl = (url.searchParams.get("purl") || "").trim();
+  const purl = normalizePurl(url.searchParams.get("purl"));
   const artifactUrl = (url.searchParams.get("url") || "").trim();
   const sha256 = (url.searchParams.get("sha256") || "").trim().toLowerCase();
   const budgetRaw = url.searchParams.get("false_positive_budget");
@@ -1401,16 +1593,16 @@ async function handleV1Analyze(request, env, ctx, url) {
   // send — was the one policy that could never hit a cache in either direction.
   if (locator && !bytes && !ctx.pin && !ctx.refresh) {
     const cache = await getCache(env);
-    // Same ordering the lookup reads under: this policy, then every wider one
-    // that already answers it. An analysis is the most expensive thing this
-    // service does, so a wider answer already in hand is worth far more here
+    // Same ordering the lookup reads under: every policy wide enough to answer
+    // this one, widest first. An analysis is the most expensive thing this
+    // service does, so a fuller answer already in hand is worth even more here
     // than it is on the lookup.
     const candidates = followCandidates(follow.value);
     // A cached miss must not end this walk either, and here it is the most
     // expensive place it could: a miss filed under the narrow policy would send
     // us off to spend an analysis slot on a verdict a wider entry is already
     // holding.
-    let hit = await nearestAnswer(candidates, async (policy) => {
+    let hit = await fullestAnswer(follow.value, candidates, async (policy) => {
       const found = await cache
         .match(new Request(`${url.origin}${v1CachePath(null, [locator], policy, full)}`))
         .catch(() => null);
@@ -1418,7 +1610,7 @@ async function handleV1Analyze(request, env, ctx, url) {
       return text ? { document: text, fromCache: true } : null;
     });
     if (!hit) {
-      hit = await nearestAnswer(candidates, async (policy) => {
+      hit = await fullestAnswer(follow.value, candidates, async (policy) => {
         const text = await kvGet(env, v1CachePath(null, [locator], policy, full));
         return text ? { document: text, fromCache: false } : null;
       });
@@ -3344,6 +3536,35 @@ function cleanFilename(raw) {
 // unspellable one is either a request we cannot make or an entry nothing can
 // read back. Must look like a PURL, so a confused worker cannot file an
 // answer under something that is not a coordinate at all.
+// One coordinate, one spelling.
+//
+// The `pkg:` scheme is required by the PURL spec, and both it and the type are
+// case-insensitive there — so `pypi/x@1`, `pkg:pypi/x@1` and `pkg:PyPI/x@1`
+// name one artifact. Carried through as typed they were three cache entries:
+// measured live, a bare-spelled lookup for a coordinate somebody had already
+// asked prefixed missed L0 and KV both and paid a backend round trip for a
+// verdict we were already holding. Everything else here has always read a PURL
+// prefix-insensitively — purlNameVersion and purlType both strip it — so the
+// caller's literal text was the one place a spelling could still fork.
+//
+// Only the parts the spec calls case-insensitive are folded. Namespace, name
+// and version belong to the package manager, and folding those would merge
+// coordinates that really are distinct.
+//
+// Applied where the locator is parsed rather than where the key is built, so
+// the canonical spelling is also what reaches scan. A caller who writes `PKG:`
+// gets an answer instead of the 400 the raw text used to earn, and the PURL
+// echoed back is the canonical one rather than whatever they typed.
+function normalizePurl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  const rest = value.replace(/^pkg:/i, "");
+  const slash = rest.indexOf("/");
+  // Not a coordinate this can canonicalize. Hand it on and let validation say so.
+  if (slash < 1) return `pkg:${rest}`;
+  return `pkg:${rest.slice(0, slash).toLowerCase()}${rest.slice(slash)}`;
+}
+
 function cleanPurl(raw) {
   const value = String(raw || "").trim();
   if (!value || value.length > 512) return null;
@@ -3584,6 +3805,9 @@ function memoryCache() {
       map.set(id, row);
       return new Response(row.body, { status: row.status, headers: row.headers });
     },
+    async delete(req) {
+      return map.delete(cacheId(req));
+    },
     async put(req, res) {
       const cc = res.headers.get("cache-control") || "";
       // Refused here because Cloudflare refuses them there. A stand-in that is
@@ -3821,6 +4045,11 @@ export const _test = {
   CACHE_LAYERS,
   beamlineSource,
   followCandidates,
+  v1CachePath,
+  kvKey,
+  newerEngine,
+  normalizePurl,
+  locatorsIn,
   predictMs,
   hasHistory,
   jobMix,

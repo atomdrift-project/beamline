@@ -1,6 +1,7 @@
 # Beamline API
 
-Two routes. `/v1/lookup` reports what is already known; `/v1/analyze` finds out.
+Three routes. `/v1/lookup` reports what is already known; `/v1/analyze` finds
+out; `/v1/flush` forgets.
 
 `GET /` serves the API documentation.
 
@@ -14,6 +15,8 @@ POST /v1/analyze?url={url}                    exact URL; scan fetches and hashes
 POST /v1/analyze?sha256={64hex}&refresh=1     reconcile Hopper; analyze if stale
 POST /v1/analyze                              analysis slot; streams. The
                                               artifact may be the raw body
+POST /v1/flush?purl=|url=|sha256={64hex}      forget every cached answer for
+                                              one artifact
 
 GET  /healthz    (also /_/health)             liveness; no token required
 GET  /_/routes                                the router's own reasoning
@@ -65,11 +68,14 @@ $ curl 'https://api.atomdrift.com/v1/lookup?purl=npm/left-pad@1.3.0'
 }
 ```
 
-`purl` comes back exactly as you sent it, so a reply can be matched to the
-request that asked for it. We canonicalize before looking up — PyPI folds `.`
-and `_` to `-`, `pkg:` is optional — but you never have to know that to read
-your own answer. `sha256` is the identity; compare it when two spellings must
-be proven to be one package.
+`purl` comes back in its canonical spelling, which is the one you sent unless
+you spelled it another way. The `pkg:` prefix is optional and the scheme and
+type are case-insensitive, so `pypi/x@1`, `pkg:pypi/x@1` and `pkg:PyPI/x@1` are
+one coordinate, one cache entry, and one answer — reply and request match on
+the coordinate rather than on the characters. Namespace, name and version are
+left alone: those belong to the package manager, and folding them would merge
+packages that really are different. `sha256` is the identity; compare it when
+two spellings must be proven to be one package.
 
 Repeat `purl` to ask about several. One package answers with one object; a
 repeated parameter answers with a list, in the order asked. The shape follows
@@ -225,6 +231,41 @@ run already in progress rather than starting a second one.
 
 Analyses run to 30 minutes on the heaviest packages. The connection is simply
 held.
+
+## POST /v1/flush
+
+Drops every cached answer for one artifact. Name it with `?purl=`, `?url=`, or
+`?sha256=` — exactly one, the same locators `/v1/lookup` takes.
+
+```
+$ curl -X POST 'https://api.atomdrift.com/v1/flush?purl=pypi/ddtrace@3.18.1'
+{"status":"flushed",
+ "locators":[{"locator":"purl=pkg:pypi/ddtrace@3.18.1","dropped":2},
+             {"locator":"sha256=46b28db6…","dropped":1},
+             {"locator":"url=https://files.pythonhosted.org/…","dropped":1}],
+ "keys_examined":42,"keys_dropped":4}
+```
+
+Nothing is re-analyzed. The next `/v1/lookup` reports `unanalyzed` and the next
+`/v1/analyze` spends a slot.
+
+An artifact is not one cache entry. It has one per follow policy, one per
+response shape (`full=1` is stored separately), and one per name that reaches
+it. A flush clears all of them for the locator you named, then reads what it
+found: a stored verdict names the artifact's other names — the digest it
+resolved to, the URL it was fetched from, the PURL scan normalized it to — and
+those are cleared too, and so on until nothing new turns up. Without that a
+flush by PURL would leave the digest entry holding the answer just dropped, and
+the next caller with a lockfile hash would read it.
+
+`locators` lists every name reached and how many of its keys held something.
+`keys_examined` counts the keys looked at, `keys_dropped` those that held an
+answer. Flushing something never cached is a `200` with `keys_dropped: 0`:
+a flush is a statement about the state afterwards, so asking twice is not an
+error.
+
+The walk is bounded at 16 names. Reaching that bound is not reported as an
+error — it is not reachable by any artifact with a normal set of aliases.
 
 ## Status and severity
 
@@ -506,7 +547,7 @@ artifact and both be right — bytes that are clean, an install script that is
 not — so each is stored under the question it answers.
 
 The policies are ordered, though, and a stored answer is served for any
-question it contains. Read `follow` as a set of reference kinds: `none` is the
+question it contains — the fullest one we hold, not the closest match. Read `follow` as a set of reference kinds: `none` is the
 empty set, `all` is every kind, and an answer produced under one policy
 answers another exactly when its set contains the other's. So an `all` answer
 serves every question, a `none` question is served by any answer at all, and
@@ -520,6 +561,18 @@ The answer you get is the one that was measured, not a narrowed copy of it. Ask
 responsible. The alternative is re-running an analysis to be told something we
 already know. The reverse never happens: a narrow answer is never served for a
 wider question, because it did not look where that question points.
+
+`follow` is a spend control rather than a narrowing of the question. It caps
+what an analysis may walk; it does not ask to be told less about an artifact
+somebody has already paid to walk further. So when several stored answers all
+answer your question, the one that walked furthest wins, and you are not
+charged for the difference.
+
+Engine version outranks width. A verdict is kept for up to 90 days and
+detections ship several times a day, so between two stored answers the newer
+engine is served even when an older one looked wider — otherwise a stale `all`
+entry would outrank a verdict produced minutes ago. Width decides only among
+answers from the same engine.
 
 `X-Beamline-Follow` names the policy that answered whenever it is not the one
 you asked for. Its absence means you got an exact match.

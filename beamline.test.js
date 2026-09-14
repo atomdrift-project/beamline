@@ -93,7 +93,7 @@ test("GET / serves the public API documentation", async () => {
   assert.match(body, /<code>\?follow=references<\/code>/);
   assert.match(body, /downloads malware later/);
   assert.match(body, /mailto:support@isotope13\.ai/);
-  assert.equal((body.match(/class="new-label"/g) || []).length, 3);
+  assert.equal((body.match(/class="new-label"/g) || []).length, 4);
   assert.equal((body.match(/class="heading-link"/g) || []).length, (body.match(/<h[123](?:\s|>)/g) || []).length);
   assert.match(body, /href="#lookup-url"/);
   assert.match(body, /href="#content-upload"/);
@@ -826,30 +826,33 @@ test("v1 analyze: a wider policy's answer serves a narrower question", async () 
 // The ordering itself, exhaustively, because every cache decision below rests
 // on it. A policy is a set of reference kinds; a stored policy answers a
 // requested one exactly when its set contains the requested set.
-test("follow policies are ordered by containment, narrowest candidate first", () => {
+test("follow policies are ordered by containment, widest candidate first", () => {
   const { followCandidates } = _test;
 
-  // Every policy answers itself, and answers it first: the exact entry is
-  // always preferred to a wider one.
+  // Every policy answers itself, and answers it last: `follow` caps what an
+  // analysis may walk, so the fullest answer already stored wins and the
+  // caller's own entry is the floor rather than the preference.
   for (const policy of ["none", "dependencies", "references", "all"]) {
-    assert.equal(followCandidates(policy)[0], policy);
+    assert.equal(followCandidates(policy).at(-1), policy);
   }
 
   // `none` is answered by everything.
   assert.deepEqual(followCandidates("none"), [
-    "none",
-    "dependencies",
-    "references",
-    "dependencies,ci-actions",
-    "dependencies,references",
-    "all",
     "dependencies,references,ci-actions",
+    "all",
+    "dependencies,references",
+    "dependencies,ci-actions",
+    "references",
+    "dependencies",
+    "none",
   ]);
 
   // `all` is answered only by itself and by its long spelling. Two names for
   // one question, and each has to answer the other or a caller's choice of
   // spelling would decide whether they pay for an analysis.
-  assert.deepEqual(followCandidates("all"), ["all", "dependencies,references,ci-actions"]);
+  // Equal sets, so their order relative to each other decides nothing: whichever
+  // is read first holds the same answer. Both orderings below are the same list.
+  assert.deepEqual(followCandidates("all"), ["dependencies,references,ci-actions", "all"]);
   assert.deepEqual(followCandidates("dependencies,references,ci-actions"), [
     "dependencies,references,ci-actions",
     "all",
@@ -2642,10 +2645,23 @@ test("v1: KV is L1 behind Cache API and still applies the budget", async () => {
   const strict = await ask(25);
   assert.equal(strict.headers.get("x-beamline-source"), "kv");
   assert.equal((await strict.json()).severity, "suspicious");
+
+  // A cold lookup reads every candidate policy, not just the one asked for.
+  // Widest-first has no fast path: which stored answer is the fullest, and on
+  // the newest engine, is not known until all of them have been looked at. That
+  // is the standing cost of the ordering, so it is asserted rather than left to
+  // drift.
+  const cold = reads;
+  assert.equal(
+    cold,
+    _test.followCandidates("references").length,
+    "a cold lookup should read every candidate policy",
+  );
+
   const loose = await ask(1000);
   assert.equal(loose.headers.get("x-beamline-source"), "cache");
   assert.equal((await loose.json()).severity, "hostile");
-  assert.equal(reads, 1, "the L0 cache should shield KV after the first read");
+  assert.equal(reads, cold, "the L0 cache should shield KV after the first read");
   assert.equal(writes, 0, "a KV read should not refresh the stored value");
 });
 
@@ -4858,4 +4874,224 @@ test("v1 analyze: an abandoned run is filed apart from one somebody waited for",
   } finally {
     await scan.close();
   }
+});
+
+// --- freshness, spelling, and flush ----------------------------------------
+
+test("a newer engine outranks an older one, numerically", () => {
+  const { newerEngine } = _test;
+
+  // The comparison this replaced was lexical, which puts 2.11.0 before 2.8.0
+  // and would have served the older verdict forever.
+  assert.ok(newerEngine("2.11.0", "2.8.0"));
+  assert.ok(!newerEngine("2.8.0", "2.11.0"));
+  assert.ok(!newerEngine("2.11.0", "2.11.0"));
+  assert.ok(newerEngine("3.0.0", "2.99.99"));
+  assert.ok(newerEngine("2.11.1", "2.11.0"));
+  // A missing or unparseable engine is the oldest thing there is, never newer.
+  assert.ok(!newerEngine(null, "2.8.0"));
+  assert.ok(newerEngine("2.8.0", null));
+  assert.ok(!newerEngine(undefined, undefined));
+});
+
+test("a stale wider answer does not outrank a fresher narrow one", async () => {
+  const { v1CachePath, memoryCache } = _test;
+  const PURL = "pkg:pypi/stale@1.0.0";
+  const locator = { type: "purl", value: PURL };
+  const stored = (engine, fires) =>
+    JSON.stringify({
+      purl: PURL,
+      sha256: null,
+      severity: fires === -1 ? "benign" : "hostile",
+      fires_at: fires,
+      findings: [],
+      engine_version: engine,
+      analyzed_at: "2026-09-01T00:00:00Z",
+      status: "analyzed",
+    });
+  // Seeded directly, because this is a question about two keys that already
+  // hold answers. Scan is asked by locator alone and would hand back one
+  // document for both policies, which is no test at all.
+  const seed = async (cache, policy, document) =>
+    cache.put(
+      new Request(`http://beamline${v1CachePath(null, [locator], policy)}`),
+      new Response(document, { headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" } }),
+    );
+  const ask = async (env) => {
+    const res = await handle(new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(PURL)}&follow=references`), env, noopCtx());
+    assert.equal(res.headers.get("x-beamline-source"), "cache");
+    return res.json();
+  };
+
+  // The wide entry is what an old precache pass left behind; the narrow one is
+  // what the engine running now says. Serving the wider one here is the ddtrace
+  // failure exactly: 2.8.0 reported hostile while 2.11.0 had scored it benign.
+  const stale = testEnv(DEAD, { cache: memoryCache() });
+  await seed(stale.cache, "all", stored("2.8.0", 1));
+  await seed(stale.cache, "references", stored("2.11.0", -1));
+  const fresher = await ask(stale);
+  assert.equal(fresher.engine_version, "2.11.0", "an older engine's wider answer should not win");
+  assert.equal(fresher.fires_at, -1);
+
+  // With both on one engine, width decides — the answer that walked further is
+  // the fuller one, and it is free.
+  const equal = testEnv(DEAD, { cache: memoryCache() });
+  await seed(equal.cache, "all", stored("2.11.0", 1));
+  await seed(equal.cache, "references", stored("2.11.0", -1));
+  const wider = await ask(equal);
+  assert.equal(wider.fires_at, 1, "at one engine the fuller answer should win");
+
+  // And a newer wide entry still beats an older narrow one, so freshness is a
+  // tie-break on width rather than a replacement for it.
+  const newer = testEnv(DEAD, { cache: memoryCache() });
+  await seed(newer.cache, "all", stored("2.11.0", 1));
+  await seed(newer.cache, "references", stored("2.8.0", -1));
+  const widest = await ask(newer);
+  assert.equal(widest.engine_version, "2.11.0");
+  assert.equal(widest.fires_at, 1);
+});
+
+test("one coordinate is one cache key however it is spelled", async () => {
+  const { normalizePurl } = _test;
+
+  assert.equal(normalizePurl("pypi/x@1"), "pkg:pypi/x@1");
+  assert.equal(normalizePurl("pkg:pypi/x@1"), "pkg:pypi/x@1");
+  assert.equal(normalizePurl("pkg:PyPI/x@1"), "pkg:pypi/x@1");
+  assert.equal(normalizePurl("PKG:pypi/x@1"), "pkg:pypi/x@1");
+  assert.equal(normalizePurl("  pypi/x@1  "), "pkg:pypi/x@1");
+  // Namespace, name and version belong to the package manager. Folding their
+  // case would merge coordinates that really are different.
+  assert.equal(normalizePurl("pkg:npm/@Scope/Name@1.0.0"), "pkg:npm/@Scope/Name@1.0.0");
+  assert.equal(normalizePurl(""), "");
+
+  // And the keying that follows from it: asked one way, then the other, the
+  // second spelling must not reach the backend again.
+  const backend = await mockBackend({
+    v1: () => ({
+      decision: "allow",
+      purl: "pkg:pypi/spell@1.0.0",
+      sha256: null,
+      severity: "benign",
+      fires_at: -1,
+      findings: [],
+      engine_version: "2.11.0",
+      analyzed_at: "2026-09-01T00:00:00Z",
+    }),
+  });
+  const env = testEnv(backend.url);
+  const ask = async (spelling) => {
+    const ctx = waitCtx();
+    const res = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(spelling)}`),
+      env,
+      ctx.ctx,
+    );
+    await ctx.flush();
+    return res;
+  };
+  try {
+    await ask("pkg:pypi/spell@1.0.0");
+    const asked = backend.hits.v1;
+    for (const spelling of ["pypi/spell@1.0.0", "pkg:PYPI/spell@1.0.0", "PKG:pypi/spell@1.0.0"]) {
+      const res = await ask(spelling);
+      assert.equal(res.status, 200, `${spelling} should be a valid coordinate`);
+      assert.equal(res.headers.get("x-beamline-source"), "cache", `${spelling} missed the cache`);
+    }
+    assert.equal(backend.hits.v1, asked, "a respelling should not reach the backend");
+  } finally {
+    await backend.close();
+  }
+});
+
+test("flush drops every key an artifact is filed under, and its children", async () => {
+  const { v1CachePath, memoryCache, followCandidates } = _test;
+  const PURL = "pkg:pypi/flushme@1.0.0";
+  const SHA = "b".repeat(64);
+  const URL_ = "https://example.invalid/flushme-1.0.0.tar.gz";
+  // A verdict names the other ways to reach the artifact it describes. Those
+  // are the children: separate keys holding the same answer, which a flush of
+  // the caller's own spelling alone would leave standing.
+  const document = JSON.stringify({
+    purl: PURL,
+    url: URL_,
+    sha256: SHA,
+    severity: "hostile",
+    fires_at: 1,
+    findings: [],
+    engine_version: "2.8.0",
+    analyzed_at: "2026-09-01T00:00:00Z",
+    status: "analyzed",
+  });
+  const kv = new Map();
+  const env = testEnv(DEAD, {
+    cache: memoryCache(),
+    BEAMLINE_KV: {
+      async get(key) {
+        return kv.has(key) ? kv.get(key) : null;
+      },
+      async put(key, body) {
+        kv.set(key, body);
+      },
+      async delete(key) {
+        kv.delete(key);
+      },
+    },
+  });
+  const key = (path) => new Request(`http://beamline${path}`);
+  const paths = [
+    v1CachePath(null, [{ type: "purl", value: PURL }], "references"),
+    v1CachePath(null, [{ type: "purl", value: PURL }], "all"),
+    v1CachePath(null, [{ type: "purl", value: PURL }], "all", true),
+    v1CachePath(null, [{ type: "url", value: URL_ }], "none"),
+    v1CachePath(SHA, [], "references"),
+  ];
+  for (const path of paths) {
+    await env.cache.put(key(path), new Response(document, { headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" } }));
+  }
+  // One key lives only in KV, which is where a verdict outlives L0 — a flush
+  // that swept L0 alone would leave the 90-day copy behind it untouched.
+  const kvOnly = v1CachePath(null, [{ type: "url", value: URL_ }], "all");
+  kv.set(await _test.kvKey(kvOnly), document);
+
+  const res = await handle(new Request(`http://beamline/v1/flush?purl=${encodeURIComponent("pypi/flushme@1.0.0")}`, { method: "POST" }), env, noopCtx());
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.status, "flushed");
+
+  // Reached from the PURL alone: the digest and the URL were named by the
+  // document, not by the caller.
+  const reached = body.locators.map((l) => l.locator).sort();
+  assert.deepEqual(reached, [`purl=${PURL}`, `sha256=${SHA}`, `url=${URL_}`].sort());
+  assert.equal(body.keys_dropped, paths.length + 1, "every seeded key should have been dropped");
+  // Both `full` shapes of every policy, for each locator reached.
+  assert.equal(body.keys_examined, 3 * FOLLOW_SPELLINGS.length * 2);
+
+  for (const path of paths) {
+    assert.equal(await env.cache.match(key(path)), null, `${path} survived the flush`);
+  }
+  assert.equal(kv.size, 0, "KV should be empty after a flush");
+
+  // And the artifact really is forgotten: asking again reaches for a worker
+  // rather than answering from a layer.
+  const after = await handle(new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(PURL)}`), env, noopCtx());
+  assert.notEqual(after.headers.get("x-beamline-source"), "cache");
+  assert.equal(followCandidates("references").length > 1, true);
+});
+
+test("flush validates its locator and refuses a GET", async () => {
+  const env = testEnv(DEAD, { cache: _test.memoryCache() });
+  const flush = (query, method = "POST") =>
+    handle(new Request(`http://beamline/v1/flush${query}`, { method }), env, noopCtx());
+
+  assert.equal((await flush("", "GET")).status, 405);
+  assert.equal((await flush("")).status, 400);
+  assert.equal((await (await flush("")).json()).error.code, "missing_package");
+  assert.equal((await (await flush("?purl=pkg%3Apypi%2Fa%401&url=https%3A%2F%2Fe.invalid%2Fa")).json()).error.code, "multiple_locators");
+  assert.equal((await (await flush("?sha256=nothex")).json()).error.code, "invalid_sha256");
+  assert.equal((await (await flush("?url=notaurl")).json()).error.code, "invalid_url");
+  // Nothing cached is not an error: a flush is about the state afterwards, and
+  // asking twice should not start failing.
+  const empty = await flush(`?sha256=${"c".repeat(64)}`);
+  assert.equal(empty.status, 200);
+  assert.equal((await empty.json()).keys_dropped, 0);
 });

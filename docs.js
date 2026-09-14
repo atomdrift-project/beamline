@@ -111,7 +111,7 @@ function docsHtml(authRequired) {
   <div class="shell">
     <aside class="toc" aria-label="Contents">
       <div class="toc-label">On this page</div>
-      <a href="#start">Start here</a><a href="#lookup">Lookup</a><a href="#analyze">Analyze</a><a href="#false-positive-budget">False-positive budget</a><a href="#follow">Following references</a><a href="#response">Response</a><a href="#use-cases">Use cases</a><a href="#errors">Errors</a><a href="#support">Support</a>
+      <a href="#start">Start here</a><a href="#lookup">Lookup</a><a href="#analyze">Analyze</a><a href="#flush">Flush</a><a href="#false-positive-budget">False-positive budget</a><a href="#follow">Following references</a><a href="#response">Response</a><a href="#use-cases">Use cases</a><a href="#errors">Errors</a><a href="#support">Support</a>
     </aside>
     <main class="content">
       <section id="start">
@@ -127,6 +127,7 @@ function docsHtml(authRequired) {
         <table class="endpoint-table" aria-label="Endpoint summary"><thead><tr><th>Method</th><th>Route</th><th>Use it for</th></tr></thead><tbody>
           <tr><td>GET</td><td>/v1/lookup</td><td>Ask whether an artifact is already known.</td></tr>
           <tr><td>POST</td><td>/v1/analyze</td><td>Analyze a PURL, exact URL, or uploaded bytes.</td></tr>
+          <tr><td>POST</td><td>/v1/flush</td><td>Forget every cached answer for an artifact.</td></tr>
         </tbody></table>
         ${authRequired ? '<div class="note"><strong>Authentication is required.</strong> Send your key as <code>Authorization: Bearer …</code>.</div>' : ""}
       </section>
@@ -190,6 +191,16 @@ function docsHtml(authRequired) {
         </div>
         <p>Archives, binaries, and source are accepted. The default upload limit is 16 MiB.</p>
         <p>Add <code>?full=1</code> to return <code>{status: "analyzed", ml, raw, llm?}</code> as the terminal line. The complete Scan envelope remains at the top level, with the same terminal status marker as the compact response. Full envelopes and compact decisions use separate cache entries.</p>
+      </section>
+
+      <section id="flush"><h2><a class="heading-link" href="#flush">Flush <span class="new-label">New</span></a></h2>
+        <p><code>POST /v1/flush</code> drops every cached answer for one artifact. Name it with <code>?purl=</code>, <code>?url=</code>, or <code>?sha256=</code> — whichever you have. Nothing is re-analyzed; the next lookup or analyze starts from scratch.</p>
+        <div class="route-example"><code>POST /v1/flush?purl=…</code></div>
+        <div class="runner" data-runner data-method="POST" data-path="/v1/flush?purl=pkg%3Anpm%2Faxios%401.19.0">
+          <pre><code>curl -X POST \\
+  "https://api.isotope13.ai/v1/flush?purl=pkg%3Anpm%2Faxios%401.19.0"</code></pre></div>
+        <p>An artifact is filed under more than one key: one per <a href="#follow">follow policy</a>, one per response shape, and one per name that reaches it. A flush clears all of them, then follows the answers it found to the artifact's other names — its digest, its download URL, the PURL Scan normalized it to — and clears those too. The response reports what it reached.</p>
+        <p>Flushing something that was never cached is not an error. It returns <code>200</code> with <code>keys_dropped: 0</code>.</p>
       </section>
 
       <section id="false-positive-budget"><h2><a class="heading-link" href="#false-positive-budget">False-positive budget</a></h2>
