@@ -24,11 +24,18 @@ BEAMLINE_TOKEN ?=
 # environment-only: an unset value deliberately leaves the API open.
 HOPPER_TOKEN ?=
 SCAN_TOKEN ?=
+# CF_ZONE_ID names the zone the API hostname lives in, and CF_PURGE_TOKEN is
+# an API token holding only Cache Purge on that zone. Together they let
+# /v1/flush purge every data center rather than the one it ran in. Either
+# missing leaves the flush local, and the response says so.
+CF_ZONE_ID ?=
+CF_PURGE_TOKEN ?=
 # Exported so the deploy-cf recipe can pipe a value into wrangler without it
 # ever appearing in a command line, where ps would show it.
 export BEAMLINE_TOKEN
 export HOPPER_TOKEN
 export SCAN_TOKEN
+export CF_PURGE_TOKEN
 SCAN_RETRIES ?=
 KV_NAMESPACE ?= beamline
 
@@ -120,6 +127,7 @@ kv-create:
 #   SCAN_URL=https://scan-a.example,https://scan-b.example make deploy-cf
 # Backend credentials are uploaded as Worker secrets after the deploy:
 #   SCAN_TOKEN       # beamline -> scan
+#   CF_PURGE_TOKEN   # beamline -> Cloudflare zone purge, for /v1/flush
 # BEAMLINE_TOKEN is intentionally not read from ~/.tok or uploaded here. Set
 # it explicitly in the environment if client authentication is wanted.
 define put_secret
@@ -161,6 +169,7 @@ endef
 deploy-cf:
 	@test -n "$(SCAN_URL)" || { echo "SCAN_URL is required"; exit 1; }
 	@test -n "$(KV)" || { echo "KV is required (Cloudflare KV namespace ID)"; exit 1; }
-	KV="$(KV)" SCAN_URL="$(SCAN_URL)" WRANGLER="$(WRANGLER)" node scripts/deploy-cf.mjs
+	KV="$(KV)" SCAN_URL="$(SCAN_URL)" CF_ZONE_ID="$(CF_ZONE_ID)" WRANGLER="$(WRANGLER)" node scripts/deploy-cf.mjs
 	$(call sync_client_token)
 	$(call put_secret,SCAN_TOKEN,scan)
+	$(call put_secret,CF_PURGE_TOKEN,cf-purge)

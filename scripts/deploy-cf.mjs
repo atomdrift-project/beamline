@@ -6,6 +6,7 @@ import path from "node:path";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const kv = (process.env.KV || "").trim();
 const scanUrl = (process.env.SCAN_URL || "").trim();
+const zoneId = (process.env.CF_ZONE_ID || "").trim();
 const wrangler = (process.env.WRANGLER || "wrangler@4.124.0").trim();
 
 if (!/^[0-9a-f]{32}$/i.test(kv)) {
@@ -14,6 +15,10 @@ if (!/^[0-9a-f]{32}$/i.test(kv)) {
 }
 if (!scanUrl) {
   console.error("SCAN_URL is required.");
+  process.exit(2);
+}
+if (zoneId && !/^[0-9a-f]{32}$/i.test(zoneId)) {
+  console.error("CF_ZONE_ID must be a 32-character Cloudflare zone ID.");
   process.exit(2);
 }
 
@@ -31,6 +36,7 @@ writeFileSync(configPath, generated.replace('main = "beamline.js"', `main = ${JS
 
 try {
   const deployArgs = ["--yes", wrangler, "deploy", "--config", configPath, "--var", `SCAN_URL:${scanUrl}`];
+  if (zoneId) deployArgs.push("--var", `CF_ZONE_ID:${zoneId}`);
   if (process.env.DRY_RUN === "1") deployArgs.push("--dry-run");
   const result = spawnSync(
     "npx",

@@ -342,6 +342,9 @@ const V1_MAX_KEYS = 50;
 // artifact reaches its digest, its URL and its PURL, which is three; the room
 // above that is for a chain of spellings, not for an unbounded crawl.
 const V1_FLUSH_MAX_LOCATORS = 16;
+// The zone purge API takes at most this many URLs per call.
+const CF_PURGE_BATCH = 30;
+const CF_PURGE_TIMEOUT_MS = 10000;
 
 // How long a v1 answer stays in the edge cache.
 //
@@ -1368,8 +1371,11 @@ async function handleV1Flush(env, ctx, url) {
   const cache = await getCache(env);
   const seen = new Set();
   const locators = [];
+  const keys = [];
   let examined = 0;
   let dropped = 0;
+  let edge = 0;
+  let kv = 0;
   // Walked a generation at a time. Depth is unavoidable — a child is named by
   // the document its parent was holding, so it cannot be known before that
   // parent is read — but breadth is not: siblings are independent keys, and
@@ -1397,13 +1403,83 @@ async function handleV1Flush(env, ctx, url) {
     for (const [index, result] of walked.entries()) {
       examined += result.examined;
       dropped += result.dropped;
+      edge += result.edge;
+      kv += result.kv;
       locators.push({ locator: wave[index].id, dropped: result.dropped });
       frontier.push(...result.children);
+      keys.push(...result.keys);
     }
   }
 
-  logLine("v1_flush", { rid: ctx.rid, locators: locators.length, examined, dropped });
-  return json({ status: "flushed", locators, keys_examined: examined, keys_dropped: dropped }, 200);
+  const purge = await purgeZone(env, ctx, keys);
+  logLine("v1_flush", { rid: ctx.rid, locators: locators.length, examined, dropped, edge, kv, purge });
+  if (purge === "failed") {
+    return v1Error(
+      502,
+      "purge_failed",
+      "This data center and KV were cleared, but the zone purge did not go through; other data centers may still hold the old answer. Retry.",
+    );
+  }
+  // One entry per layer a verdict can live in, in the order a lookup reads
+  // them. `edge` is this data center's Cache API alone; `zone` is every other
+  // data center, reached by URL, so it counts keys purged rather than found.
+  const caches = {
+    edge: { dropped: edge },
+    kv: { dropped: kv },
+    zone: { purge, purged: purge === "ok" ? keys.length : 0 },
+  };
+  return json({ status: "flushed", caches, locators, keys_examined: examined, keys_dropped: dropped }, 200);
+}
+
+// Every data center, not just this one.
+//
+// cache.delete() removes an entry from the colo that ran the flush and from
+// nowhere else: the Cache API does not replicate, so every other colo that has
+// served this artifact keeps its own copy for the rest of VERDICT_MAX_AGE. The
+// zone purge API is what reaches them. Entries are keyed on ordinary URLs under
+// this deployment's origin, so purge-by-URL is enough, and it is the one purge
+// shape every plan has. Every examined key is sent, not only those this colo
+// held: the colo that matters is the one that answered somebody else.
+//
+// Unconfigured is not a failure. `node local.js` has no edge cache to purge,
+// and a deployment without the secrets is exactly as flushed as it was before
+// this existed. The caller can see which it got.
+async function purgeZone(env, ctx, urls) {
+  const zone = (env.CF_ZONE_ID || "").trim();
+  const token = (env.CF_PURGE_TOKEN || "").trim();
+  if (!zone || !token) return "unconfigured";
+  const batches = [];
+  for (let i = 0; i < urls.length; i += CF_PURGE_BATCH) batches.push(urls.slice(i, i + CF_PURGE_BATCH));
+  const endpoint = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(zone)}/purge_cache`;
+  const results = await Promise.all(
+    batches.map(async (files) => {
+      try {
+        return await fetchTimeout(
+          endpoint,
+          {
+            method: "POST",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+            body: JSON.stringify({ files }),
+          },
+          CF_PURGE_TIMEOUT_MS,
+          ctx,
+          async (res) => {
+            const body = await res.json().catch(() => null);
+            const ok = res.ok && body && body.success === true;
+            if (!ok) {
+              const errors = (body && body.errors) || [];
+              logLine("v1_purge", { rid: ctx.rid, ok: false, status: res.status, urls: files.length, err: JSON.stringify(errors) });
+            }
+            return ok;
+          },
+        );
+      } catch (err) {
+        logLine("v1_purge", { rid: ctx.rid, ok: false, urls: files.length, err: errText(err) });
+        return false;
+      }
+    }),
+  );
+  return results.every(Boolean) ? "ok" : "failed";
 }
 
 // Drop every key one locator can be filed under: both `full` shapes of every
@@ -1423,30 +1499,35 @@ async function dropLocator(env, cache, origin, locator) {
   const held = await Promise.all(paths.map((path) => dropKey(env, cache, origin, path)));
   const children = [];
   let dropped = 0;
-  for (const document of held) {
-    if (!document) continue;
+  let edge = 0;
+  let kv = 0;
+  for (const key of held) {
+    edge += Number(key.edge);
+    kv += Number(key.kv);
+    if (!key.document) continue;
     dropped += 1;
-    children.push(...locatorsIn(document));
+    children.push(...locatorsIn(key.document));
   }
-  return { examined: paths.length, dropped, children };
+  return { examined: paths.length, dropped, edge, kv, children, keys: paths.map((path) => `${origin}${path}`) };
 }
 
-// Drop one key from both layers, returning whatever it held.
+// Drop one key from both layers, returning whatever it held and which layer
+// held it.
 //
 // Read and delete rather than delete alone: the document names the artifact's
-// other spellings, and dropping it without looking would strand them. KV is
-// consulted only when L0 holds nothing, because a key present in both has the
-// same document in each and the second read would buy nothing.
+// other spellings, and dropping it without looking would strand them. Both
+// layers are read, in parallel, because the answer reports each one — a key
+// present in both holds the same document in each, so the second read buys
+// nothing for the walk, only for the accounting.
 async function dropKey(env, cache, origin, path) {
   const request = new Request(`${origin}${path}`);
-  const hit = await cache.match(request).catch(() => null);
+  const [hit, stored] = await Promise.all([cache.match(request).catch(() => null), kvGet(env, path)]);
   const cached = hit ? await hit.text().catch(() => null) : null;
-  const document = cached || (await kvGet(env, path));
   await Promise.all([
     typeof cache.delete === "function" ? cache.delete(request).catch(() => false) : false,
     kvDelete(env, path),
   ]);
-  return document;
+  return { document: cached || stored, edge: Boolean(cached), kv: Boolean(stored) };
 }
 
 // Every locator a stored answer names, so a flush can reach them too.

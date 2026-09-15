@@ -240,6 +240,9 @@ Drops every cached answer for one artifact. Name it with `?purl=`, `?url=`, or
 ```
 $ curl -X POST 'https://api.atomdrift.com/v1/flush?purl=pypi/ddtrace@3.18.1'
 {"status":"flushed",
+ "caches":{"edge":{"dropped":4},
+           "kv":{"dropped":4},
+           "zone":{"purge":"ok","purged":42}},
  "locators":[{"locator":"purl=pkg:pypi/ddtrace@3.18.1","dropped":2},
              {"locator":"sha256=46b28db6…","dropped":1},
              {"locator":"url=https://files.pythonhosted.org/…","dropped":1}],
@@ -260,12 +263,31 @@ the next caller with a lockfile hash would read it.
 
 `locators` lists every name reached and how many of its keys held something.
 `keys_examined` counts the keys looked at, `keys_dropped` those that held an
-answer. Flushing something never cached is a `200` with `keys_dropped: 0`:
-a flush is a statement about the state afterwards, so asking twice is not an
-error.
+answer in any layer. `caches` says the same per layer, in the order a lookup
+reads them: `edge` is the Cache API in the data center that answered the
+flush, `kv` is Workers KV, and `zone` is every other data center. The first two
+count keys that held an answer and were dropped. The zone is reached by URL
+without looking, so it counts keys purged. Flushing something never cached is
+a `200` with `keys_dropped: 0`: a flush is a statement about the state
+afterwards, so asking twice is not an error.
 
 The walk is bounded at 16 names. Reaching that bound is not reported as an
 error — it is not reachable by any artifact with a normal set of aliases.
+
+A flush runs in one Cloudflare data center, and the edge cache does not
+replicate: deleting an entry there leaves every other data center's copy in
+place. So after clearing its own layers a flush asks the zone purge API to drop
+every key it examined from all of them. `caches.zone.purge` reports how that
+went. `ok` means every data center is clear. `unconfigured` means the deployment has no
+purge credential and only the data center that answered was cleared, which is
+what a local `node local.js` always says. A purge that fails is a `502` with
+`purge_failed`: KV and the local cache are already clear, so retrying costs
+one more purge and nothing else.
+
+Workers KV caches reads for a minute per data center. A data center that read
+the old verdict just before the flush may serve it for up to that minute, and
+may refile it in its edge cache from that read. Flush twice, a minute apart,
+when that window matters.
 
 ## Status and severity
 
@@ -497,8 +519,8 @@ is unreachable.
 
 ## Caching
 
-A verdict is immutable for the engine that produced it and is cached for an
-hour. Not knowing is cached for a minute — it stops being true the moment
+A verdict is immutable for the engine that produced it and is cached for
+three days (`VERDICT_MAX_AGE`). Not knowing is cached for a minute — it stops being true the moment
 anything analyzes the artifact. `unavailable` is never cached; it describes this
 moment's reachability.
 

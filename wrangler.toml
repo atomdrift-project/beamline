@@ -45,8 +45,9 @@ SCAN_TIMEOUT_MS = "1800000"
 #
 # Detections ship several times a day, so this is deliberately not the lever for
 # picking them up — three days of L0 would sit in front of any of them. Purging
-# the artifacts a new detection actually changes is, and until that exists a
-# re-score is visible only to callers whose colo has not cached the verdict.
+# the artifacts a new detection actually changes is: POST /v1/flush, which
+# clears every data center when CF_ZONE_ID and CF_PURGE_TOKEN are deployed and
+# only the one it ran in otherwise.
 VERDICT_MAX_AGE = "259200"
 # How long a verdict stays in Workers KV, the layer behind it. Measured from the
 # write; a read does not extend it. Written without an expiry a verdict is

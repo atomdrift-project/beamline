@@ -2995,6 +2995,8 @@ function testEnv(url, extra = {}) {
     // Carried through because it decides two things at once: whether a request
     // is authenticated at all, and what cache scope the answer goes out with.
     BEAMLINE_TOKEN: extra.BEAMLINE_TOKEN,
+    CF_ZONE_ID: extra.CF_ZONE_ID,
+    CF_PURGE_TOKEN: extra.CF_PURGE_TOKEN,
     HOPPER_POLL_MS: extra.HOPPER_POLL_MS ?? "10",
     SCAN_TIMEOUT_MS: extra.SCAN_TIMEOUT_MS ?? "2000",
     MAX_BYTES: extra.MAX_BYTES,
@@ -5057,6 +5059,13 @@ test("flush drops every key an artifact is filed under, and its children", async
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.status, "flushed");
+  // Per layer: five keys were seeded in L0 and one only in KV. No zone
+  // credential in this env, so it is honest about having cleared one colo.
+  assert.deepEqual(body.caches, {
+    edge: { dropped: paths.length },
+    kv: { dropped: 1 },
+    zone: { purge: "unconfigured", purged: 0 },
+  });
 
   // Reached from the PURL alone: the digest and the URL were named by the
   // document, not by the caller.
@@ -5076,6 +5085,64 @@ test("flush drops every key an artifact is filed under, and its children", async
   const after = await handle(new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(PURL)}`), env, noopCtx());
   assert.notEqual(after.headers.get("x-beamline-source"), "cache");
   assert.equal(followCandidates("references").length > 1, true);
+});
+
+test("flush purges every examined key from the zone, and reports a purge that failed", async () => {
+  const { v1CachePath } = _test;
+  const SHA = "d".repeat(64);
+  const document = JSON.stringify({ sha256: SHA, ml: { lvl: 1, eng: "e" }, fires_at: 0 });
+  const zone = "0123456789abcdef0123456789abcdef";
+  const env = testEnv(DEAD, { cache: _test.memoryCache(), CF_ZONE_ID: zone, CF_PURGE_TOKEN: "purge-token" });
+  await env.cache.put(
+    new Request(`http://beamline${v1CachePath(SHA, [], "references")}`),
+    new Response(document, { headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" } }),
+  );
+
+  const calls = [];
+  let answer = () => new Response(JSON.stringify({ success: true, errors: [], result: {} }), { status: 200 });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return answer();
+  };
+  try {
+    const res = await handle(new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body.caches, {
+      edge: { dropped: 1 },
+      kv: { dropped: 0 },
+      zone: { purge: "ok", purged: body.keys_examined },
+    });
+
+    // One locator, both `full` shapes of every policy: examined, not dropped,
+    // is what goes to the zone — the copy that matters is in another colo.
+    const files = calls.flatMap((c) => JSON.parse(c.init.body).files);
+    assert.equal(files.length, body.keys_examined);
+    assert.ok(files.includes(`http://beamline${v1CachePath(SHA, [], "references")}`));
+    assert.ok(files.every((f) => f.startsWith("http://beamline/")));
+    for (const c of calls) {
+      assert.equal(c.url, `https://api.cloudflare.com/client/v4/zones/${zone}/purge_cache`);
+      assert.equal(c.init.method, "POST");
+      assert.equal(c.init.headers.authorization, "Bearer purge-token");
+      assert.ok(JSON.parse(c.init.body).files.length <= 30, "the purge API takes at most 30 URLs per call");
+    }
+
+    // A refusal is the caller's to see, because half a flush is not a flush.
+    answer = () => new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }), { status: 403 });
+    const denied = await handle(new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
+    assert.equal(denied.status, 502);
+    assert.equal((await denied.json()).error.code, "purge_failed");
+
+    // So is a network that never answered.
+    answer = () => {
+      throw new TypeError("fetch failed");
+    };
+    const dark = await handle(new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
+    assert.equal(dark.status, 502);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test("flush validates its locator and refuses a GET", async () => {
