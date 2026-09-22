@@ -7,6 +7,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const kv = (process.env.KV || "").trim();
 const scanUrl = (process.env.SCAN_URL || "").trim();
 const zoneId = (process.env.CF_ZONE_ID || "").trim();
+// The namespace dash writes customer tokens into. Optional: without it
+// beamline serves exactly what it served before customers existed.
+const dashKv = (process.env.DASH_KV || "").trim();
 const wrangler = (process.env.WRANGLER || "wrangler@4.124.0").trim();
 
 if (!/^[0-9a-f]{32}$/i.test(kv)) {
@@ -21,6 +24,10 @@ if (zoneId && !/^[0-9a-f]{32}$/i.test(zoneId)) {
   console.error("CF_ZONE_ID must be a 32-character Cloudflare zone ID.");
   process.exit(2);
 }
+if (dashKv && !/^[0-9a-f]{32}$/i.test(dashKv)) {
+  console.error("DASH_KV must be a 32-character Cloudflare KV namespace ID.");
+  process.exit(2);
+}
 
 const source = readFileSync(path.join(root, "wrangler.toml"), "utf8");
 if (/^\[\[kv_namespaces\]\]/m.test(source)) {
@@ -31,7 +38,8 @@ if (/^\[\[kv_namespaces\]\]/m.test(source)) {
 const tempDir = mkdtempSync(path.join(root, ".wrangler-deploy-"));
 const configPath = path.join(tempDir, "wrangler.toml");
 const main = path.relative(tempDir, path.join(root, "beamline.js")).replaceAll("\\", "/");
-const generated = `${source.trimEnd()}\n\n[[kv_namespaces]]\nbinding = "BEAMLINE_KV"\nid = ${JSON.stringify(kv)}\n`;
+let generated = `${source.trimEnd()}\n\n[[kv_namespaces]]\nbinding = "BEAMLINE_KV"\nid = ${JSON.stringify(kv)}\n`;
+if (dashKv) generated += `\n[[kv_namespaces]]\nbinding = "DASH_KV"\nid = ${JSON.stringify(dashKv)}\n`;
 writeFileSync(configPath, generated.replace('main = "beamline.js"', `main = ${JSON.stringify(main)}`));
 
 try {

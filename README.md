@@ -58,8 +58,18 @@ cost. Every terminal verdict is filed under it, cached or scanned; an
 `unavailable` is under neither, because timing it would measure how quickly
 beamline gave up rather than how long anything took.
 
-No `indexes`. The only high-cardinality field would be the artifact, and a PURL
-is the caller's dependency list.
+The blobs above are unchanged. What a customer's request adds is an `index`,
+and only an index: the org. Analytics Engine samples per index, so without one
+a customer doing millions of lookups samples away a customer doing hundreds,
+and the quiet one's dashboard draws a graph made of two surviving rows.
+Filtering is all anyone does with the org — `WHERE index1 =` is how that is
+spelled — so a blob carrying the same value would be a column nothing reads. Our own operational tokens are deliberately
+left unindexed — they are not a customer, and filing a precache pass under an
+org would put our load in someone's usage graph.
+
+The artifact is still not in the dataset. A PURL is the caller's dependency
+list; an opaque 26-character org id is not, and it is only ever read back
+filtered to the org that owns it.
 
 The optional Workers KV L1 namespace is titled `beamline` by default. Run
 `make kv-create`, then deploy by passing its returned ID as `KV`:
@@ -70,8 +80,29 @@ KV=<namespace-id> SCAN_URL=… make deploy-cf
 
 The deploy recipe turns that ID into the `BEAMLINE_KV` binding for Wrangler.
 
+## Customers
+
+Beamline does not own customers; [dash](https://dash.isotope13.io) does. Dash
+writes `tok:<token>` into its own KV namespace when a customer mints or revokes
+one, and beamline reads it — nothing here writes it. Pass that namespace's id
+as `DASH_KV` to `make deploy-cf` and a bearer token resolves to an org and a
+tier, which is what puts a customer's requests in their own usage graph and
+puts their requests in their own usage graph. Omit it and beamline is exactly
+what it was before customers existed.
+
+Rules delivery is not here. It lives in `iso13/rules`, behind
+`updates.isotope13.ai`, reading this same token namespace — a separate Worker
+so that streaming tarballs out of a bucket cannot take down the verdict API.
+
+The lookup is cached at the edge for 60 seconds, so that is the revocation
+latency: a token deleted in the dashboard keeps working in whichever colos
+already hold it, for up to a minute.
+
 `BEAMLINE_TOKEN` is optional client policy: pass it in the environment to
-require a bearer token, or omit it to leave the API open. `HOPPER_TOKEN` and
+require a bearer token, or omit it to leave the API open. It is separate from
+customer tokens, which are always honoured: turning on customer tokens does not
+close an open API, and a deployment that sets `BEAMLINE_TOKEN` is still closed
+to everyone who is not a customer. `HOPPER_TOKEN` and
 `SCAN_TOKEN` are backend credentials; those may still come from the first
 non-empty line of `~/.tok/<service>`. The deploy recipe uploads backend
 credentials only, so a local token file cannot accidentally turn on client

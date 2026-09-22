@@ -93,6 +93,8 @@ test("GET / serves the public API documentation", async () => {
   assert.match(body, /<code>\?follow=references<\/code>/);
   assert.match(body, /downloads malware later/);
   assert.match(body, /mailto:support@isotope13\.ai/);
+  // Bump this when a badge is added or retired — it is here so a stale "New"
+  // on a two-year-old section gets noticed.
   assert.equal((body.match(/class="new-label"/g) || []).length, 4);
   assert.equal((body.match(/class="heading-link"/g) || []).length, (body.match(/<h[123](?:\s|>)/g) || []).length);
   assert.match(body, /href="#lookup-url"/);
@@ -134,31 +136,13 @@ test("BEAMLINE_TOKEN accepts a comma-separated list", () => {
   assert.deepEqual(_test.tokenList(""), []);
 });
 
-
-
-
-
-
 test("/_/health answers alongside /healthz", async () => {
   const res = await handle(new Request("http://beamline/_/health"), {}, {});
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { status: "ok" });
 });
 
-
-
-
-
 const DEAD = "http://127.0.0.1:1";
-
-
-
-
-
-
-
-
-
 
 test("unknown route is 404 and names the routes", async () => {
   const res = await handle(new Request("http://beamline/nope"), {}, {});
@@ -167,8 +151,6 @@ test("unknown route is 404 and names the routes", async () => {
   assert.equal(error.code, "no_such_route");
   assert.match(error.message, /\/v1\/lookup and \/v1\/analyze/);
 });
-
-
 
 // The mistake a first-time caller actually makes. `curl /lookup?purl=...` is
 // the right question at the wrong path, and a bare "not found" sends them
@@ -183,15 +165,11 @@ test("a dropped version prefix says so", async () => {
   }
 });
 
-
-
 test("the documentation page ignores query parameters", async () => {
   const res = await handle(new Request("http://beamline/?purl=pkg:npm/left-pad@1.3.0"), {}, {});
   assert.equal(res.status, 200);
   assert.match(await res.text(), /Find 0-day malware in the software supply chain/);
 });
-
-
 
 // Every knob is read from the environment at the point of use, so a typo in a
 // deploy becomes a silently different timeout rather than a startup failure.
@@ -215,8 +193,6 @@ test("a breaker gives a recovered worker its record back", async () => {
   for (let i = 0; i < _test.BREAKER_FAILS - 1; i++) c.fail();
   assert.equal(c.open(), false, "a success cleared the count");
 });
-
-
 
 // A server's own counters describe the server, not the machine it is on.
 //
@@ -254,8 +230,6 @@ test("occupancy sees the machine, not just the server", () => {
   assert.equal(_test.occupancy({ slots: 16, slots_free: 16, in_flight: 0, load1: 0, physical_cpus: 16 }), 0);
 });
 
-
-
 // Busy and broken wear the same answer and are not the same claim.
 //
 // A worker that refuses has told us it has capacity and is using it; a slot
@@ -286,8 +260,6 @@ test("a fleet that is merely full is waited on, not given up on", async () => {
   }
 });
 
-
-
 // And a refusal is not a fault: a worker answering "at capacity" promptly and
 // correctly is the opposite of what a breaker exists to detect. Counting it
 // took healthy workers out of the pool exactly when the fleet could least
@@ -310,8 +282,6 @@ test("being at capacity does not trip a worker's breaker", async () => {
     await full.close();
   }
 });
-
-
 
 // A worker with two lookups behind it must still be reachable.
 //
@@ -346,8 +316,6 @@ test("a thin lookup average still beats an analysis average", () => {
   assert.equal(_test.predictMs(none, hint, mix), _test.UNKNOWN_JOB_MS);
 });
 
-
-
 // The tie band decides when two workers are close enough that picking the
 // nominally-faster one is noise-chasing, and jitter should break the tie
 // instead. A flat 250ms was a fair description of that for analyses and wider
@@ -370,8 +338,6 @@ test("a tie is proportional to what is being compared", () => {
   assert.equal(_test.tiedEst(18375, 19375), false, "the capacity term must survive");
 });
 
-
-
 // Never the configured order: that sent 390 of 390 lookups to the slowest
 // worker in the fleet while the fastest sat idle.
 test("an unranked lookup still moves around the fleet", () => {
@@ -383,8 +349,6 @@ test("an unranked lookup still moves around the fleet", () => {
   // a failed leader still falls through to the others.
   assert.deepEqual([..._test.rotate(fleet)].sort(), [...fleet].sort());
 });
-
-
 
 // A breaker steers traffic to a healthier worker. When every worker is tripped
 // there is no healthier worker and nothing left to steer, so emptying the pool
@@ -435,8 +399,6 @@ test("a pin selects one worker and nothing else", () => {
   assert.deepEqual(_test.scanWorkers(env, "nope.test"), []);
 });
 
-
-
 // The budget has to exceed the longest a healthy worker can legitimately take,
 // which scan sets, not us: it allows each corpus address 2s before trying the
 // next, so a worker with a replica down spends two seconds before it starts
@@ -449,8 +411,6 @@ test("a worker gets longer to answer than scan gives its corpus", () => {
   );
 });
 
-
-
 test("numEnv keeps a bad knob from becoming a bad default", () => {
   const k = "SCAN_TIMEOUT_MS";
   assert.equal(_test.numEnv({}, k, 1000), 1000);
@@ -461,27 +421,6 @@ test("numEnv keeps a bad knob from becoming a bad default", () => {
   assert.equal(_test.numEnv({ [k]: "20" }, k, 1000), 20);
   assert.equal(_test.BREAKER_FAILS, 5);
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // A caller whose connection drops has not withdrawn the question. Beamline
 // hands the analysis to waitUntil precisely so it outlives them, so whoever
@@ -499,7 +438,6 @@ test("numEnv keeps a bad knob from becoming a bad default", () => {
 // would open the breaker of whichever worker drew the heaviest samples first,
 // and a fleet-wide slow patch would take every worker out at once — the same
 // inversion that 429 caused before it was excluded.
-
 
 // The wait is bounded by the caller's budget, not handed a fresh one at every
 // ceiling: a worker that never files a verdict must still give up and say so.
@@ -2853,14 +2791,6 @@ test("v1: a failing worker falls through to a healthy one", async () => {
   }
 });
 
-
-
-
-
-
-
-
-
 test("hits carry the byte offset and line the match fired on", () => {
   const envl = {
     ml: { lvl: 3, eng: "2.8.0" },
@@ -2912,12 +2842,6 @@ test("an inherited finding is not repeated as its own hit", () => {
   assert.equal(view.hits[0].file, "lib/install.js", "the member that actually matched");
   assert.equal(view.hits[0].off, 512);
 });
-
-
-
-
-
-
 
 test("customer view is sha/purl/lvl/eng plus at most three notable hits", () => {
   const envl = {
@@ -3062,7 +2986,7 @@ function waitCtx() {
   };
 }
 
-function mockBackend(opts) {
+async function mockBackend(opts) {
   const hits = {
     bloom: 0,
     sample: 0,
@@ -3211,7 +3135,8 @@ function mockBackend(opts) {
       send(res, 500, { error: String(err) });
     }
   });
-  return listen(server).then(({ url, close }) => ({ url, close, hits, results, auths }));
+  const { url, close } = await listen(server);
+  return { url, close, hits, results, auths };
 }
 
 function sendAnalyze(res, out) {
@@ -3270,11 +3195,6 @@ function statsFor({ slots = 8, free = 8, inFlight = 0, ms = 1000, bySize = {}, .
     ...rest,
   };
 }
-
-
-
-
-
 
 test("/_/routes dry-runs the real ranking, per size bucket", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
@@ -3346,7 +3266,6 @@ test("/_/routes is behind the token gate", async () => {
   const res = await handle(new Request("http://beamline/_/routes"), env, waitCtx().ctx);
   assert.equal(res.status, 401, "the route names every worker and its load");
 });
-
 
 test("occupancy scales the estimate; queue depth is still not added to it", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
@@ -3504,8 +3423,6 @@ test("a nearly-full worker loses to a roomier one that is slower on paper", asyn
   }
 });
 
-
-
 test("/_/routes ages stats against a clock read after they are refreshed", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
   const scan = await mockBackend({ stats: statsFor({ ms: 1000 }) });
@@ -3582,11 +3499,6 @@ test("a class a worker has never handled falls back to its own average", async (
   }
 });
 
-
-
-
-
-
 test("one unlucky sample does not brand a worker slow", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
   // Exactly the shape seen live after a restart: the fast worker had finished
@@ -3660,8 +3572,6 @@ test("a worker that cannot be polled never outranks one that can", async () => {
     await Promise.all([hopper.close(), silent.close(), honest.close()]);
   }
 });
-
-
 
 test("the estimate prefers a worker's windowed p80 over its lifetime mean", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
@@ -3761,7 +3671,6 @@ test("a worker publishing no window still routes on its mean", async () => {
   }
 });
 
-
 test("beamline reads the exact shape scan publishes", async () => {
   const hopper = await mockBackend({ bloom: "unknown" });
   // Verbatim from scan's recent_json(): {samples, p80_ms, mean_ms}. This is the
@@ -3802,16 +3711,6 @@ test("beamline reads the exact shape scan publishes", async () => {
     await Promise.all([hopper.close(), w.close()]);
   }
 });
-
-
-
-
-
-
-
-
-
-
 
 // The breaker is shared machinery: it survived the legacy routes but every test
 // that exercised it went through them. A worker answering 5xx must be taken out
@@ -5162,3 +5061,144 @@ test("flush validates its locator and refuses a GET", async () => {
   assert.equal(empty.status, 200);
   assert.equal((await empty.json()).keys_dropped, 0);
 });
+
+// ─── Customer tokens, per-org telemetry, and the rules channel ───────────
+//
+// Beamline learns who is calling from the namespace dash writes. These assert
+// the two halves of that separately: admission (who gets served) and
+// attribution (whose graph the request lands in), because a token that works
+// but is filed under nobody is a customer with an empty dashboard.
+
+function dashKV(rows = {}) {
+  return {
+    reads: 0,
+    async get(key) {
+      this.reads += 1;
+      return rows[key] ?? null;
+    },
+  };
+}
+
+const CUSTOMER = "i13_krypton85_h7q3mx2p9wkd4rz8bn5tvcyfd0";
+
+test("a customer token is admitted where a bare request is not", async () => {
+  const kv = dashKV({ [`tok:${CUSTOMER}`]: JSON.stringify({ oid: "7k3mq9x2wd4prz8bn5tvcyfl0e", tier: "business" }) });
+  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", DASH_KV: kv };
+
+  const anon = await handle(new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0"), env, {});
+  assert.equal(anon.status, 401);
+
+  // Not a 401 is the assertion. What it answers depends on the dead backend.
+  const customer = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", {
+      headers: { authorization: `Bearer ${CUSTOMER}` },
+    }),
+    env,
+    {},
+  );
+  assert.notEqual(customer.status, 401);
+
+  // And a token shaped like ours but not in the namespace is still nobody.
+  const forged = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", {
+      headers: { authorization: "Bearer i13_cobalt60_00000000000000000000000000" },
+    }),
+    env,
+    {},
+  );
+  assert.equal(forged.status, 401);
+});
+
+test("a token that cannot be one of dash's is never spent as a KV read", async () => {
+  const kv = dashKV();
+  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", DASH_KV: kv };
+  for (const bogus of ["hunter2", "Bearer", "i13_x", "../../etc/passwd", "i13_krypton85_SHOUTING0000000000000000"]) {
+    await handle(
+      new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", {
+        headers: { authorization: `Bearer ${bogus}` },
+      }),
+      env,
+      {},
+    );
+  }
+  assert.equal(kv.reads, 0, "an open API would pay for a KV read on every scan otherwise");
+});
+
+test("our own token is admitted and deliberately not filed under any org", async () => {
+  const points = [];
+  const kv = dashKV();
+  const env = {
+    ...testEnv("http://unused"),
+    BEAMLINE_TOKEN: "ops-secret",
+    DASH_KV: kv,
+    BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
+  };
+  const res = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", {
+      headers: { authorization: "Bearer ops-secret" },
+    }),
+    env,
+    {},
+  );
+  assert.notEqual(res.status, 401);
+  assert.equal(kv.reads, 0, "one of ours is recognized before the namespace is consulted");
+  // No index means no org: our own load must not appear in a customer's graph.
+  assert.equal(points[0].indexes, undefined);
+  assert.equal(points[0].blobs.length, 6, "an operational request writes the dataset's original shape");
+});
+
+test("a customer's request is filed under their org, and indexed by it", async () => {
+  const points = [];
+  const oid = "7k3mq9x2wd4prz8bn5tvcyfl0e";
+  const env = {
+    ...testEnv("http://unused"),
+    DASH_KV: dashKV({ [`tok:${CUSTOMER}`]: JSON.stringify({ oid, tier: "oem" }) }),
+    BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
+  };
+  await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", {
+      headers: { authorization: `Bearer ${CUSTOMER}` },
+    }),
+    env,
+    {},
+  );
+  assert.equal(points.length, 1);
+  // The org is an index and nothing else — it is only ever read back as
+  // `WHERE index1 =`, and without it one busy customer samples a quiet one out
+  // of the data entirely.
+  assert.deepEqual(points[0].indexes, [oid]);
+  // The dataset's own shape is untouched: same six blobs, in the same places.
+  assert.equal(points[0].blobs.length, 6);
+  assert.equal(points[0].blobs[0], "lookup");
+});
+
+test("a namespace that cannot be read does not take the API down", async () => {
+  const broken = {
+    async get() {
+      throw new Error("kv is having a day");
+    },
+  };
+  // Open deployment: the customer falls back to anonymous and is still served.
+  const open = { ...testEnv("http://unused"), DASH_KV: broken };
+  const res = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", {
+      headers: { authorization: `Bearer ${CUSTOMER}` },
+    }),
+    open,
+    {},
+  );
+  assert.notEqual(res.status, 500);
+
+  // Gated deployment: the same failure is a 401, not a 500. The customer is
+  // told to check their key rather than shown an outage that is ours.
+  const gated = { ...open, BEAMLINE_TOKEN: "ops-secret" };
+  const refused = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", {
+      headers: { authorization: `Bearer ${CUSTOMER}` },
+    }),
+    gated,
+    {},
+  );
+  assert.equal(refused.status, 401);
+});
+

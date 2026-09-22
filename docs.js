@@ -383,6 +383,11 @@ POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
 </html>`;
 }
 
+/**
+ * @param {boolean} [authRequired=false] - whether the deployment gates its API,
+ *   which decides what the page tells a reader about sending a key
+ * @returns {Response}
+ */
 export function docsResponse(authRequired = false) {
   return new Response(docsHtml(authRequired), {
     status: 200,

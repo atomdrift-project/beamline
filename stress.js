@@ -106,9 +106,7 @@ async function main() {
   }
 
   process.stderr.write(
-    `beamline ${beamlineUrl}\nscan     ${scanUrl}\n` +
-    (hopperUrl ? `hopper   ${hopperUrl}\n` : "") +
-      `${popular ? "popular" : `N=${n}`}${samples ? ` SAMPLES=${samples}` : ""}${repeat > 1 ? ` REPEAT=${repeat}` : ""} concurrency=${concurrency} route=${stressRoute}\n`,
+    `beamline ${beamlineUrl}\nscan     ${scanUrl}\n${hopperUrl ? `hopper   ${hopperUrl}\n` : ""}${popular ? "popular" : `N=${n}`}${samples ? ` SAMPLES=${samples}` : ""}${repeat > 1 ? ` REPEAT=${repeat}` : ""} concurrency=${concurrency} route=${stressRoute}\n`,
   );
   await pingBackends();
   // Before the volume pass: the shapes it cannot reach, checked once.
@@ -143,7 +141,7 @@ async function main() {
   for (const err of feedErrors) {
     process.stderr.write(`feed error: ${err.message || err}\n`);
   }
-  let jobs = mixJobs(groups, samples || Infinity);
+  const jobs = mixJobs(groups, samples || Infinity);
   if (!jobs.length) {
     process.stderr.write("no PURLs collected\n");
     process.exit(1);
@@ -208,7 +206,8 @@ async function pingBackends() {
   if (scanUrl) {
     try {
       const auth = scanToken ? { authorization: `Bearer ${scanToken}` } : {};
-      const info = await get(`${scanUrl}/_/info`, 4000, auth).then((r) => r.json());
+      const resp = await get(`${scanUrl}/_/info`, 4000, auth);
+      const info = await resp.json();
       process.stderr.write(`scan     version=${info.version || "?"} slots=${info.slots ?? "?"}\n`);
     } catch {
       // info is optional
@@ -252,7 +251,8 @@ async function fetchNpm(limit) {
   for (const name of names) {
     if (jobs.length >= limit) break;
     try {
-      const meta = await get(`https://registry.npmjs.org/${encodeNpmName(name)}`, META_TIMEOUT_MS).then((r) => r.json());
+      const packument = await get(`https://registry.npmjs.org/${encodeNpmName(name)}`, META_TIMEOUT_MS);
+      const meta = await packument.json();
       const version = meta["dist-tags"]?.latest || meta.version;
       if (!version) continue;
       jobs.push(job("npm", npmPurl(meta.name || name, version)));
@@ -264,7 +264,8 @@ async function fetchNpm(limit) {
 }
 
 async function fetchPypi(limit) {
-  const xml = await get("https://pypi.org/rss/updates.xml", META_TIMEOUT_MS).then((r) => r.text());
+  const feed = await get("https://pypi.org/rss/updates.xml", META_TIMEOUT_MS);
+  const xml = await feed.text();
   return parsePypiRss(xml)
     .slice(0, limit)
     .map((p) => job("pypi", pypiPurl(p.name, p.version)));
@@ -314,10 +315,11 @@ async function cratesSparseNewestVersion(name) {
 
 async function fetchGo(limit) {
   for (let i = 0; i < GO_WINDOWS_MS.length; i++) {
-    const w = GO_WINDOWS_MS[i];
-    const since = new Date(Date.now() - w).toISOString();
+    const span = GO_WINDOWS_MS[i];
+    const since = new Date(Date.now() - span).toISOString();
     const url = `https://index.golang.org/index?since=${encodeURIComponent(since)}&limit=${limit * 4}`;
-    const text = await get(url, META_TIMEOUT_MS).then((r) => r.text());
+    const index = await get(url, META_TIMEOUT_MS);
+    const text = await index.text();
     const rows = parseGoIndex(text);
     if (rows.length >= limit || i === GO_WINDOWS_MS.length - 1) {
       const uniq = [];
@@ -774,6 +776,7 @@ function logRow(r) {
   let extra = r.status === 200 ? `lvl=${r.lvl}${r.why ? " why" : ""}` : `${r.status} ${r.error || r.state || ""}`;
   if (r.artifactStatus) extra = `${r.artifactStatus} ${extra}`;
   if (r.frames !== undefined) extra += ` frames=${r.frames}${r.firstMs ? ` first=${r.firstMs}ms` : ""}`;
+  if (r.worker) extra += ` worker=${r.worker}`;
   if (r.requestId) extra += ` request_id=${r.requestId}`;
   if (r.lastState || r.lastPhase) extra += ` last=${r.lastState || "?"}${r.lastPhase ? `:${r.lastPhase}` : ""}`;
   if (r.sha) extra += ` sha=${String(r.sha).slice(0, 12)}`;
@@ -887,7 +890,7 @@ function printReport(rows, summary, feedErrors) {
   if (summary.bugs.length) {
     process.stdout.write("bugs\n");
     for (const r of summary.bugs) {
-      process.stdout.write(`  ${r.status} ${r.error || r.state || ""}  ${r.purl}${r.issues && r.issues.length ? "  [" + r.issues.join("; ") + "]" : ""}\n`);
+      process.stdout.write(`  ${r.status} ${r.error || r.state || ""}  ${r.purl}${r.issues && r.issues.length ? `  [${r.issues.join("; ")}]` : ""}\n`);
     }
   }
   if (feedErrors.length) process.stdout.write(`feed errors: ${feedErrors.length}\n`);

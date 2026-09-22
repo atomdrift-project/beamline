@@ -11,6 +11,10 @@ import { join } from "node:path";
 
 // The first non-empty line, trimmed. A missing file is normal: the service may
 // not require a token.
+/**
+ * @param {string} service - the basename under ~/.tok
+ * @returns {string} the first non-empty line, or "" when there is no such file
+ */
 export function readToken(service) {
   try {
     return (

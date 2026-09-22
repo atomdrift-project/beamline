@@ -65,12 +65,13 @@ const headers = TOKEN ? { authorization: `Bearer ${TOKEN}` } : {};
 
 // Seeded so a run can be repeated against the same assignment. mulberry32:
 // small, uniform enough to split a few dozen PURLs into two arms.
-function rng(state) {
+function rng(seed) {
+  let state = seed | 0;
   return () => {
     state = (state + 0x6d2b79f5) | 0;
-    let t = Math.imul(state ^ (state >>> 15), 1 | state);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
+    mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
   };
 }
 
@@ -146,7 +147,8 @@ function stats(rows) {
   };
 }
 
-const plan = await fetch(`${BEAMLINE}/_/routes?size=none`, { headers }).then((r) => r.json());
+const routes = await fetch(`${BEAMLINE}/_/routes?size=none`, { headers });
+const plan = await routes.json();
 const workers = plan.workers.filter((w) => w.breaker === "closed").map((w) => w.worker);
 if (!workers.length) {
   console.error("no workers with a closed breaker");

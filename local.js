@@ -15,16 +15,30 @@ const MAX_BYTES = Number(process.env.MAX_BYTES) || 16 * 1024 * 1024;
 // memory ceiling — 512MB at the defaults. Raise them together, or not at all.
 const MAX_INFLIGHT = Number(process.env.MAX_INFLIGHT) || 32;
 
-// Every knob beamline.js reads, so a local run is tunable the same way a
-// deployed Worker is. Anything absent falls back to the built-in default.
+// Every knob beamline.js reads from the environment, so a local run is tunable
+// the same way a deployed Worker is. Anything absent falls back to the built-in
+// default.
+//
+// Not here, and deliberately: BEAMLINE_KV, DASH_KV and BEAMLINE_AE are Worker
+// bindings with no local equivalent, and CF_ZONE_ID / CF_PURGE_TOKEN purge a
+// zone cache this process does not sit behind — /v1/flush reports that as
+// `unconfigured` rather than pretending.
 const TUNABLES = [
   "SCAN_URL",
   "BEAMLINE_TOKEN",
+  "SCAN_TOKEN",
   "MAX_BYTES",
   "SCAN_TIMEOUT_MS",
-  "SCAN_TOKEN",
   "SCAN_RETRIES",
   "SCAN_RETRY_BASE_MS",
+  "SCAN_STREAM_IDLE_MS",
+  "SCAN_STREAM_STALL_MS",
+  "SCAN_STREAM_RESUMES",
+  "SCAN_ORPHAN_MS",
+  "VERDICT_MAX_AGE",
+  "KV_MAX_AGE",
+  "PYPI_URL",
+  "NPM_REGISTRY_URL",
 ];
 
 const env = Object.fromEntries(TUNABLES.map((k) => [k, process.env[k] || ""]));

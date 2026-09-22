@@ -38,6 +38,9 @@ export SCAN_TOKEN
 export CF_PURGE_TOKEN
 SCAN_RETRIES ?=
 KV_NAMESPACE ?= beamline
+# The dash namespace, read-only from here: it is how a customer's bearer token
+# resolves to an org and a tier. `make -C ../../iso13/dash kv-create` prints it.
+DASH_KV ?=
 
 .PHONY: lint test stress-test pop-test kv-create deploy-cf
 
@@ -169,7 +172,7 @@ endef
 deploy-cf:
 	@test -n "$(SCAN_URL)" || { echo "SCAN_URL is required"; exit 1; }
 	@test -n "$(KV)" || { echo "KV is required (Cloudflare KV namespace ID)"; exit 1; }
-	KV="$(KV)" SCAN_URL="$(SCAN_URL)" CF_ZONE_ID="$(CF_ZONE_ID)" WRANGLER="$(WRANGLER)" node scripts/deploy-cf.mjs
+	KV="$(KV)" DASH_KV="$(DASH_KV)" SCAN_URL="$(SCAN_URL)" CF_ZONE_ID="$(CF_ZONE_ID)" WRANGLER="$(WRANGLER)" node scripts/deploy-cf.mjs
 	$(call sync_client_token)
 	$(call put_secret,SCAN_TOKEN,scan)
 	$(call put_secret,CF_PURGE_TOKEN,cf-purge)

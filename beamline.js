@@ -115,6 +115,173 @@ const ORPHAN_BUDGET_MS = 600_000;
 // let one sick worker disable scanning altogether.
 const scanBreakers = new Map();
 
+// ------------------------------------------------------------------ shapes ---
+//
+// The object bags that travel between the functions below, named once. `stats`
+// alone appears in a dozen signatures, and a shape described twice is a shape
+// that eventually disagrees with itself.
+
+/**
+ * A customer, as the dash namespace records them.
+ * @typedef {object} Org
+ * @property {string} oid
+ * @property {string} tier
+ */
+
+/**
+ * A bearer token resolved to whoever holds it. `known` decides admission;
+ * `org` decides attribution, and the two are deliberately separable.
+ * @typedef {object} Caller
+ * @property {string} token
+ * @property {boolean} known - one of ours, or a live customer token
+ * @property {Org|null} org - null for anonymous callers and for our own tokens
+ */
+
+/**
+ * Beamline's own request context, built by dispatch() over the runtime's.
+ * @typedef {object} Ctx
+ * @property {string} rid
+ * @property {Org|null} org
+ * @property {string|null} pin - X-Beamline-Pin: force one worker
+ * @property {string|null} filename
+ * @property {boolean} refresh
+ * @property {(promise: Promise<unknown>) => void} [waitUntil]
+ * @property {AbortSignal} [signal]
+ */
+
+/**
+ * How the caller named the artifact.
+ * @typedef {object} Locator
+ * @property {"purl"|"url"|"sha256"} type
+ * @property {string} value
+ */
+
+/**
+ * What every log line and outbound request carries, so one request can be
+ * followed across both services.
+ * @typedef {object} Ids
+ * @property {string} rid
+ * @property {string} [sha256]
+ * @property {string} [purl]
+ * @property {string} [url]
+ * @property {number} [bytes]
+ * @property {string} [follow]
+ * @property {boolean} [full]
+ */
+
+/**
+ * What the router is being asked to find a worker for. An absent field is
+ * absent evidence rather than a zero: no `bytes` means the size is unknown,
+ * and a null Hint means the request named no cost class at all.
+ * @typedef {object} Hint
+ * @property {string} [purl]
+ * @property {number} [bytes]
+ * @property {boolean} [upload] - the caller sent the artifact in the body
+ * @property {boolean} [lookup] - an index probe, not an analysis
+ */
+
+/**
+ * One cost class's timings, as scan publishes them.
+ * @typedef {object} Bucket
+ * @property {number} [avg_ms] - lifetime mean
+ * @property {number} [jobs] - completions behind that mean
+ * @property {{p80_ms?: number, samples?: number}} [recent] - the hour window
+ */
+
+/**
+ * One worker's /_/stats. Every field is optional: an older worker publishes
+ * fewer of them, and a missing field means no evidence rather than a zero.
+ * @typedef {object} ScanStats
+ * @property {boolean} [ready]
+ * @property {boolean} [overloaded]
+ * @property {number} [slots]
+ * @property {number} [slots_free]
+ * @property {number} [in_flight]
+ * @property {number} [background_in_flight] - cores the pull worker holds
+ * @property {number} [physical_cpus]
+ * @property {number} [load1]
+ * @property {number} [cpu_busy_cores] - preferred over load1; see machineBusy
+ * @property {number} [max_upload_mb]
+ * @property {{max?: number, in_use?: number}} [whale_slots]
+ * @property {number} [avg_job_ms]
+ * @property {number} [avg_job_samples]
+ * @property {Bucket} [recent]
+ * @property {Object<string, Bucket>} [avg_job_ms_by_type]
+ * @property {Object<string, Bucket>} [avg_job_ms_by_size]
+ * @property {Object<string, Bucket>} [avg_job_ms_by_size_idle] - uncontended
+ * @property {number} [avg_lookup_us]
+ * @property {number} [avg_lookup_ms]
+ * @property {number} [lookup_samples]
+ * @property {Bucket} [recent_lookup]
+ */
+
+/**
+ * A worker scored for one request. Mutable by design: rankPool caps `est` for
+ * a starved worker and records that it did so.
+ * @typedef {object} RankedWorker
+ * @property {string} base - the worker's URL
+ * @property {ScanStats|null} stats - null means polled and unanswered
+ * @property {number} i - the operator's configured order, the last tiebreak
+ * @property {number} est - predicted milliseconds
+ * @property {boolean} known - whether `est` rests on anything measured
+ * @property {string|null} [why] - why it is unroutable, or null if it is not
+ * @property {number} r - jitter, to damp herding between equals
+ * @property {boolean} [starved]
+ */
+
+/**
+ * Everything one analyze pass needs, settled once per request. Only the tally
+ * changes between passes, and that travels beside this rather than in it.
+ * @typedef {object} Job
+ * @property {URL} url
+ * @property {Locator|null} locator
+ * @property {string} path - the path asked of a worker
+ * @property {number} budget - false_positive_budget
+ * @property {string|null} busy - host already analyzing this artifact
+ * @property {Ids} ids
+ * @property {number} t0 - when the request arrived
+ * @property {ArrayBuffer|null} bytes - an uploaded artifact
+ * @property {boolean} full
+ * @property {number|null} sizeHint
+ * @property {string|null} cacheFollow - the policy an answer may be filed
+ *   under, and null where nothing may be
+ */
+
+/**
+ * Why the workers declined this pass, read to decide whether another is worth
+ * making. Filled in by v1Dispatch as it walks the fleet.
+ * @typedef {object} Pass
+ * @property {number} busy - refused with capacity in use
+ * @property {number} broken - unreachable, or answering with a fault
+ */
+
+/**
+ * What the annotating stream needs in order to label frames it did not write.
+ * @typedef {object} StreamMeta
+ * @property {string} requestId
+ * @property {Locator|null} locator
+ * @property {number} startedAt
+ * @property {Ids} ids
+ * @property {(outcome: {finisher: string|null, orphaned: boolean}) => void} [settled]
+ * @property {boolean} full
+ */
+
+/**
+ * The phase clock, carried across a handover and mutated in place as frames
+ * arrive. `floor` is what keeps elapsed times monotonic when a replacement
+ * worker starts counting from its own zero.
+ * @typedef {object} Phase
+ * @property {string|null} name
+ * @property {number} startedElapsed
+ * @property {number} lastElapsed
+ * @property {number} floor
+ * @property {number} changedAt
+ */
+
+// The Cloudflare module-worker contract: the runtime imports this module's
+// default export and calls `.fetch` on it. It is the one default export in the
+// tree, and it is not ours to rename — `handle` beside it is the named entry
+// point everything else in this repo imports.
 export default {
   fetch(request, env, ctx) {
     return handle(request, env, ctx);
@@ -126,12 +293,74 @@ export default {
 // when the client asked for gzip, and gzipped with no `Content-Encoding` at all
 // when it asked for identity. `node local.js` has no edge in front of it, so it
 // does its own compression.
+/**
+ * The one entry point. Both `node local.js` and the Worker call this.
+ * @param {Request} request
+ * @param {Record<string, unknown>} env - Worker bindings and tunables
+ * @param {{waitUntil?: (p: Promise<unknown>) => void, signal?: AbortSignal}} ctx
+ * @returns {Promise<Response>}
+ */
 export async function handle(request, env, ctx) {
   const started = Date.now();
-  const response = await dispatch(request, env, ctx);
-  recordRequest(env, request, response, Date.now() - started);
+  // Who is calling, resolved once. Two things need it and they must not be
+  // able to disagree: dispatch decides what this caller may read, and
+  // recordRequest files the datapoint under the org that read it.
+  const caller = await identify(request, env);
+  const response = await dispatch(request, env, ctx, caller);
+  recordRequest(env, request, response, Date.now() - started, caller);
   return response;
 }
+
+// A bearer token, resolved to whoever it belongs to.
+//
+// Three outcomes. A token in BEAMLINE_TOKEN is ours — the stress harness, the
+// precache pass, an operator — and is deliberately anonymous: it is not a
+// customer, and filing its traffic under an org would put our own load in
+// someone's usage graph. A token in the dash namespace is a customer, and
+// carries the org and the tier it was minted with. Anything else is neither,
+// and whether that is allowed through is the gate's business, not ours.
+//
+// The namespace is written only by dash and read only here. The cache TTL is
+// therefore the revocation latency: a token deleted in the dashboard keeps
+// working in whichever colos already hold it, for up to this long.
+const TOKEN_CACHE_TTL_S = 60;
+
+/**
+ * @param {Request} request
+ * @param {Record<string, unknown>} env
+ * @returns {Promise<Caller>} never rejects; an unreadable namespace is anonymous
+ */
+async function identify(request, env) {
+  const bearer = /^Bearer\s+(\S+)/i.exec((request.headers.get("authorization") || "").trim());
+  const token = bearer ? bearer[1] : "";
+  const ours = tokenList(env?.BEAMLINE_TOKEN);
+  if (token && ours.some((t) => tokenEq(token, t))) return { token, known: true, org: null };
+
+  // Shape-checked before it is spent as a key. A token that cannot be one of
+  // ours is a scan for an open API, and every one of those would otherwise be
+  // a KV read we pay for.
+  const kv = env?.DASH_KV;
+  if (token && kv && CUSTOMER_TOKEN_RE.test(token)) {
+    try {
+      const raw = await kv.get(`tok:${token}`, { cacheTtl: TOKEN_CACHE_TTL_S });
+      if (raw) {
+        const row = JSON.parse(raw);
+        if (row?.oid) return { token, known: true, org: { oid: String(row.oid), tier: String(row.tier || "free") } };
+      }
+    } catch (err) {
+      // A namespace that cannot be read must not take the API down with it.
+      // The caller falls through to the static gate, which on a deployment
+      // that has one means a 401 and on an open one means service as usual.
+      logLine("token_lookup_failed", { err: errText(err) });
+    }
+  }
+  return { token, known: false, org: null };
+}
+
+// What dash mints: `i13_<nuclide>_<26 base32>`. Matched loosely enough to
+// survive dash adding a nuclide and tightly enough that an arbitrary header
+// never becomes a KV key.
+const CUSTOMER_TOKEN_RE = /^i13_[a-z]+[0-9]*_[0-9a-z]{26}$/;
 
 // One datapoint per request, written from the response the caller actually got.
 //
@@ -145,7 +374,15 @@ export async function handle(request, env, ctx) {
 // disagree with what the caller saw is worse than no metric: it is the one that
 // gets believed. This also means every route is covered by construction —
 // there is no second place to remember.
-function recordRequest(env, request, response, ms) {
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Request} request
+ * @param {Response|null} response - what the caller actually got
+ * @param {number} ms
+ * @param {Caller} [caller]
+ * @returns {void}
+ */
+function recordRequest(env, request, response, ms, caller) {
   if (!response) return;
   const url = new URL(request.url);
   // Named, not derived from the path: a 404 on /v1/anything would otherwise
@@ -158,7 +395,7 @@ function recordRequest(env, request, response, ms) {
   // measures what the caller waited before hearing anything — the number that
   // decides whether a proxy in the middle cuts the connection. What the run
   // cost is ROUTE_VERDICT, written when the assessment goes out.
-  writePoint(env, route, response.headers, ecosystemOf(url), response.status, ms);
+  writePoint(env, route, response.headers, ecosystemOf(url), response.status, ms, caller?.org?.oid);
 }
 
 // The route a completed analysis is filed under, beside the `analyze` point
@@ -192,17 +429,36 @@ const ROUTE_ORPHAN = "analyze:orphan";
 // can disagree with what the caller saw is worse than no metric, it is the one
 // that gets believed. It also means a new route is covered by construction.
 //
-// Deliberately no `indexes`. The only high-cardinality field here is the
-// artifact, and a PURL is the caller's dependency list — the same knowledge
-// `cacheScope` marks private on an authenticated deployment. It does not belong
-// in an analytics dataset by default; the ecosystem is enough to tell npm from
-// crates without naming anyone's packages.
-function writePoint(env, route, headers, ecosystem, status, ms) {
+// The artifact is still not in here. A PURL is the caller's dependency list —
+// the same knowledge `clientScope` marks private on an authenticated deployment
+// — and the ecosystem is enough to tell npm from crates without naming
+// anyone's packages.
+//
+// The org is not a blob either. It is an index, and only an index: Analytics
+// Engine samples per index, so indexing the org is what stops a customer doing
+// millions of lookups from sampling a customer doing hundreds down to nothing
+// — without it the quiet customer's dashboard would draw a graph made of one
+// or two surviving rows. Filtering is all anyone does with it, `WHERE index1 =`
+// is how that is spelled, and a blob carrying the same value would be a column
+// nothing reads. So the shape of this dataset is unchanged; it has gained a
+// way to be sliced, not a field.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {string} route - a named route, never one derived from the path
+ * @param {Headers} headers - the response's, read for X-Beamline-Source
+ * @param {string} ecosystem
+ * @param {number} status
+ * @param {number} ms
+ * @param {string} [oid] - the org to index under; omitted leaves it unindexed
+ * @returns {void}
+ */
+function writePoint(env, route, headers, ecosystem, status, ms, oid) {
   // Absent locally (`node local.js`) and in tests, and `writeDataPoint` is
   // fire-and-forget: it returns void, never throws, and must not be awaited.
   const ae = env?.BEAMLINE_AE;
   if (typeof ae?.writeDataPoint !== "function") return;
   const source = headers.get("X-Beamline-Source") || "";
+  const org = String(oid || "");
   ae.writeDataPoint({
     blobs: [
       route,
@@ -212,6 +468,11 @@ function writePoint(env, route, headers, ecosystem, status, ms) {
       ecosystem,
       String(status),
     ],
+    // Only when there is an org to file under. An unattributed request — an
+    // open deployment, one of our own tokens — is left out rather than
+    // gathered under an empty string, which would become the busiest index in
+    // the dataset and sample every real customer against it.
+    ...(org ? { indexes: [org] } : {}),
     // `layer` carries -1 when nothing answered, matching what poppy records: a
     // request that reached no layer is not a shallow one, and averaging it as
     // zero would report the fleet at its cheapest exactly when it is down.
@@ -225,8 +486,15 @@ function ecosystemOf(url) {
   return purlType(url.searchParams.get("purl") || "");
 }
 
-
-async function dispatch(request, env, ctx) {
+/**
+ * @param {Request} request
+ * @param {Record<string, unknown>} env
+ * @param {{waitUntil?: (p: Promise<unknown>) => void, signal?: AbortSignal}} host
+ *   the runtime's context; beamline builds its own {@link Ctx} over it
+ * @param {Caller} caller
+ * @returns {Promise<Response>}
+ */
+async function dispatch(request, env, host, caller) {
   // One id for the whole request, logged on every line and sent to scan, so a
   // slow lookup can be followed across both services. A caller
   // may bring its own; it reaches our logs and outbound headers, so it is
@@ -245,21 +513,23 @@ async function dispatch(request, env, ctx) {
   // does nothing, so the cache never populates and nothing says why. Carry it
   // over explicitly, still bound to the context that owns it. Every later
   // { ...ctx } spreads this plain object, where it is an own property.
-  const host = ctx;
-  ctx = {
-    ...ctx,
+  const url = new URL(request.url);
+  const ctx = {
+    ...host,
     rid,
+    // The customer this request belongs to, or null for an anonymous caller on
+    // an open deployment and for our own operational tokens. Read by the
+    // telemetry writes deep in the analyze path.
+    org: caller?.org || null,
     pin: cleanId(request.headers.get("x-beamline-pin")) || null,
     filename: cleanFilename(request.headers.get("x-filename") || request.headers.get("x-file-name")),
+    // A refresh is a cache-read policy, not part of an artifact's identity. It
+    // therefore bypasses Beamline's Cache API/KV reads while retaining the
+    // ordinary canonical key for the result Scan returns and we write back.
+    refresh: url.searchParams.get("refresh") === "1",
   };
-  if (typeof host?.waitUntil === "function") ctx.waitUntil = (p) => host.waitUntil(p);
+  if (typeof host?.waitUntil === "function") ctx.waitUntil = (promise) => host.waitUntil(promise);
   if (request.signal && !ctx.signal) ctx.signal = request.signal;
-
-  const url = new URL(request.url);
-  // A refresh is a cache-read policy, not part of an artifact's identity. It
-  // therefore bypasses Beamline's Cache API/KV reads while retaining the
-  // ordinary canonical key for the result Scan returns and we write back.
-  ctx.refresh = url.searchParams.get("refresh") === "1";
   // /_/health is the name every service in this stack answers to; /healthz
   // stays because the Makefile and the stress harness probe it.
   if (url.pathname === "/healthz" || url.pathname === "/_/health") {
@@ -275,13 +545,14 @@ async function dispatch(request, env, ctx) {
     return docsResponse(Boolean((env.BEAMLINE_TOKEN || "").trim()));
   }
 
-  const allowed = tokenList(env.BEAMLINE_TOKEN);
-  if (allowed.length) {
-    const bearer = /^Bearer\s+(\S+)/i.exec((request.headers.get("authorization") || "").trim());
-    const got = bearer ? bearer[1] : "";
-    if (!allowed.some((t) => tokenEq(got, t))) {
-      return v1Error(401, "unauthorized", "Send your API key as `Authorization: Bearer <key>`.");
-    }
+  // identify() has already decided whether this token is one of ours or a
+  // customer's. The gate is what that means: a recognized token is always
+  // admitted, and an unrecognized one is refused only where the deployment
+  // asked for a gate at all. So turning on customer tokens does not close an
+  // open API, and a deployment that sets BEAMLINE_TOKEN is still closed to
+  // everyone who is not a customer.
+  if (!caller?.known && tokenList(env.BEAMLINE_TOKEN).length) {
+    return v1Error(401, "unauthorized", "Send your API key as `Authorization: Bearer <key>`.");
   }
 
   // Named after the token gate, because a pin spends a scan slot on demand.
@@ -764,12 +1035,7 @@ function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonic
   if (canonicalPurl) paths.add(v1CachePath(null, [{ type: "purl", value: canonicalPurl }], follow, full));
   const sha = v1DecisionSha(body);
   if (sha) paths.add(v1CachePath(sha, [], follow, full));
-  let row;
-  try {
-    row = JSON.parse(body);
-  } catch {
-    row = null;
-  }
+  const row = parseJson(body);
   if (row && !Array.isArray(row) && typeof row === "object") {
     if (typeof row.purl === "string" && row.purl.trim()) {
       paths.add(v1CachePath(null, [{ type: "purl", value: row.purl.trim() }], follow, full));
@@ -781,6 +1047,10 @@ function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonic
   return [...paths].map((path) => new Request(`${origin}${path}`));
 }
 
+// Writes every alias, and answers with how many there were. The count is for
+// the log line at the one call site that logs: building the key set a second
+// time to count it re-parsed the document and could disagree with what was
+// actually written.
 async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, follow, canonicalPurl, full = false) {
   const keys = v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl, full);
   await Promise.all(
@@ -794,16 +1064,33 @@ async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, 
       }
     }),
   );
+  return keys.length;
+}
+
+// A stored or streamed body, parsed. Everything here is handed JSON that came
+// from a cache, a worker, or a stream line, and every one of them treats text
+// that will not parse as text that is not a document — so the judgement is made
+// once, here, rather than in a try block per reader, each free to drift.
+function parseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+// A body's rows, one shape. A single locator is answered with an object and
+// several with an array, and every reader below asks the same question of each
+// row — so both arrive as a list. A body that will not parse yields one empty
+// row, which answers nothing, which is what an unreadable body should say.
+function rowsIn(body) {
+  const row = parseJson(body);
+  return Array.isArray(row) ? row : [row];
 }
 
 // The digest a decision names, when it names a well-formed one.
 function v1DecisionSha(body) {
-  let row;
-  try {
-    row = JSON.parse(body);
-  } catch {
-    return null;
-  }
+  const row = parseJson(body);
   const sha = row && typeof row === "object" ? (row.sha256 || shaFromEnvelope(row)) : null;
   return typeof sha === "string" && SHA_RE.test(sha) ? sha : null;
 }
@@ -825,6 +1112,12 @@ function validArtifactUrl(value) {
   }
 }
 
+/**
+ * @param {string} rid
+ * @param {string|null} sha
+ * @param {Locator[]} [locators] - only the first is named; a batch logs one
+ * @returns {Ids}
+ */
 function v1LocatorIds(rid, sha, locators) {
   const first = locators?.[0];
   return {
@@ -868,6 +1161,12 @@ const DEFAULT_FOLLOW = {
 // Every request resolves to a policy, named or not, because the answer is
 // stored under a key that carries it: a request whose policy we could not name
 // would be one whose answer we could not file.
+/**
+ * @param {URLSearchParams} searchParams
+ * @param {"purl"|"url"|"sha256"|"bytes"} kind - how the artifact was named,
+ *   which is what decides the default
+ * @returns {{value: string}|{error: string}} one or the other, never both
+ */
 function parseFollow(searchParams, kind) {
   const values = searchParams.getAll("follow");
   if (!values.length) return { value: DEFAULT_FOLLOW[kind] };
@@ -1003,6 +1302,14 @@ function followCandidates(policy) {
 // A non-decision — `unanalyzed`, `unavailable` — is a statement about one key at
 // one moment rather than evidence any walk gathered, so a wider candidate's
 // non-decision answers a question nobody asked.
+/**
+ * @template {{document: string}} T
+ * @param {string} asked - the policy the caller named; only it may fall back
+ * @param {string[]} candidates - widest first
+ * @param {(policy: string) => Promise<T|null>} load - reads one policy's key
+ * @returns {Promise<(T & {policy: string})|null>} whatever `load` returned,
+ *   untouched, beside the policy that answered
+ */
 async function fullestAnswer(asked, candidates, load) {
   if (!candidates.length) return null;
 
@@ -1047,12 +1354,7 @@ function newerEngine(a, b) {
 }
 
 function v1DocumentBody(body, full = false) {
-  let row;
-  try {
-    row = JSON.parse(body);
-  } catch {
-    return null;
-  }
+  const row = parseJson(body);
   if (!row || typeof row !== "object") return null;
   if (full) return isFullEnvelope(row) ? JSON.stringify(row) : null;
   if (Array.isArray(row)) {
@@ -1067,12 +1369,7 @@ function canonicalV1Row(row) {
 }
 
 function v1BudgetedBody(body, budget, locator, legacyCachedUnknown = false) {
-  let row;
-  try {
-    row = JSON.parse(body);
-  } catch {
-    return null;
-  }
+  const row = parseJson(body);
   if (!row || typeof row !== "object") return null;
   // `unknown` was scan's old wire name for `unanalyzed`. Translate it only on
   // cache reads so entries written before the rename remain useful. A live
@@ -1144,9 +1441,6 @@ async function kvGet(env, path) {
   }
 }
 
-// Nothing is written without an expiry. `unanalyzed` keeps the short clock it has
-// at the edge, because it stops being true the moment anything analyzes the
-// artifact; a verdict keeps the long one.
 async function kvDelete(env, path) {
   const kv = env && env.BEAMLINE_KV;
   if (!kv || typeof kv.delete !== "function") return false;
@@ -1159,6 +1453,9 @@ async function kvDelete(env, path) {
   }
 }
 
+// Nothing is written without an expiry. `unanalyzed` keeps the short clock it has
+// at the edge, because it stops being true the moment anything analyzes the
+// artifact; a verdict keeps the long one.
 async function kvPut(env, path, body) {
   const kv = env && env.BEAMLINE_KV;
   if (!kv || typeof kv.put !== "function") return;
@@ -1181,12 +1478,7 @@ async function kvPut(env, path, body) {
 // derived level exists to paper over stays open forever. An engine is what
 // separates a measurement from a citation, so that is what is checked.
 function v1CachedVerdict(body) {
-  let row;
-  try {
-    row = JSON.parse(body);
-  } catch {
-    return null;
-  }
+  const row = parseJson(body);
   if (!row || typeof row !== "object" || Array.isArray(row)) return null;
   if (row.status !== "analyzed" && !(row.decision === "allow" || row.decision === "block")) return null;
   if (!row.engine_version) return null;
@@ -1202,12 +1494,8 @@ function isFullEnvelope(row) {
 
 function v1CachedAnalyzeAnswer(body, full = false) {
   if (!full) return v1CachedVerdict(body);
-  try {
-    const row = JSON.parse(body);
-    return isFullEnvelope(row) ? row : null;
-  } catch {
-    return null;
-  }
+  const row = parseJson(body);
+  return isFullEnvelope(row) ? row : null;
 }
 
 // How long this answer may be cached. A body carrying any `unavailable` is not
@@ -1227,13 +1515,15 @@ function v1CachedAnalyzeAnswer(body, full = false) {
 // of them unreachable makes the whole reply one this service should not rest
 // on - to cache, or to stop asking on.
 function v1OutageBody(body) {
-  try {
-    const row = JSON.parse(body);
-    const rows = Array.isArray(row) ? row : [row];
-    return rows.some((item) => item?.status === "unavailable" || item?.decision === "unavailable");
-  } catch {
-    return false;
-  }
+  return rowsIn(body).some(isOutage);
+}
+
+// One row saying the fleet could not find out, in either spelling scan has
+// used for it. Named once because two readers ask it — a body carrying one is
+// not an answer to relay and not an answer to cache — and a predicate spelled
+// out twice is a predicate that eventually says two things.
+function isOutage(row) {
+  return row?.status === "unavailable" || row?.decision === "unavailable";
 }
 
 // How long this document may be held, in seconds.
@@ -1243,14 +1533,9 @@ function v1OutageBody(body) {
 // artifact, an outage describes only this moment — and neither is a deployment
 // choice. How long a settled verdict is worth keeping is.
 function v1MaxAge(env, body) {
-  try {
-    const row = JSON.parse(body);
-    const rows = Array.isArray(row) ? row : [row];
-    if (rows.some((item) => item?.status === "unavailable" || item?.decision === "unavailable")) return 0;
-    if (rows.some((item) => !isFullEnvelope(item) && (item?.status !== "analyzed" || !item?.engine_version))) return V1_NO_ENGINE_MAX_AGE;
-  } catch {
-    return V1_NO_ENGINE_MAX_AGE;
-  }
+  const rows = rowsIn(body);
+  if (rows.some(isOutage)) return 0;
+  if (rows.some((item) => !isFullEnvelope(item) && (item?.status !== "analyzed" || !item?.engine_version))) return V1_NO_ENGINE_MAX_AGE;
   return numEnv(env, "VERDICT_MAX_AGE", V1_VERDICT_MAX_AGE);
 }
 
@@ -1485,6 +1770,14 @@ async function purgeZone(env, ctx, urls) {
 // Drop every key one locator can be filed under: both `full` shapes of every
 // follow policy. Issued together, because they are independent keys and a
 // series walk would be fourteen round trips deep for one spelling.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Cache} cache
+ * @param {string} origin
+ * @param {Locator} locator
+ * @returns {Promise<{examined: number, dropped: number, edge: number,
+ *   kv: number, children: Locator[], keys: string[]}>}
+ */
 async function dropLocator(env, cache, origin, locator) {
   const paths = [];
   for (const policy of FOLLOW_POLICIES) {
@@ -1519,6 +1812,13 @@ async function dropLocator(env, cache, origin, locator) {
 // layers are read, in parallel, because the answer reports each one — a key
 // present in both holds the same document in each, so the second read buys
 // nothing for the walk, only for the accounting.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Cache} cache
+ * @param {string} origin
+ * @param {string} path
+ * @returns {Promise<{document: string|null, edge: boolean, kv: boolean}>}
+ */
 async function dropKey(env, cache, origin, path) {
   const request = new Request(`${origin}${path}`);
   const [hit, stored] = await Promise.all([cache.match(request).catch(() => null), kvGet(env, path)]);
@@ -1531,15 +1831,13 @@ async function dropKey(env, cache, origin, path) {
 }
 
 // Every locator a stored answer names, so a flush can reach them too.
+/**
+ * @param {string} body
+ * @returns {Locator[]}
+ */
 function locatorsIn(body) {
-  let row;
-  try {
-    row = JSON.parse(body);
-  } catch {
-    return [];
-  }
   const out = [];
-  for (const item of Array.isArray(row) ? row : [row]) {
+  for (const item of rowsIn(body)) {
     if (!item || typeof item !== "object") continue;
     const purl = normalizePurl(item.purl);
     if (purl && cleanPurl(purl)) out.push({ type: "purl", value: purl });
@@ -1741,7 +2039,7 @@ async function handleV1Analyze(request, env, ctx, url) {
       // the same time. Written anyway: the series is every answer this route
       // gave, and one missing its cheap half would read as a fleet that only
       // ever scans.
-      writePoint(env, ROUTE_VERDICT, answered, ecosystemOf(url), 200, Date.now() - t0);
+      writePoint(env, ROUTE_VERDICT, answered, ecosystemOf(url), 200, Date.now() - t0, ctx.org?.oid);
       return new Response(`${body.trimEnd()}\n`, { status: 200, headers: answered });
     }
     // Why we are about to spend an analysis slot. Without this a cache that
@@ -1783,27 +2081,38 @@ async function handleV1Analyze(request, env, ctx, url) {
   // against the same clock the analysis itself is promised, and a broken one
   // keeps the short budget.
   const busyDeadline = t0 + numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS) * BUSY_BUDGET_SHARE;
+  // A pass that never reached a verdict is worth making again: a 5xx, a 429 at
+  // capacity, an edge timeout at 120s, a dropped connection — none of those are
+  // answers, and a moment later they may not hold. A rejection is an answer
+  // (bad bytes, unsupported type), and v1Dispatch returns those rather than
+  // null, so repeating one never burns a slot.
+  //
+  // Retrying is safe because scan de-duplicates by sha and purl across isolates:
+  // a retry joins the analysis already running rather than starting a second one,
+  // which is what makes retrying an edge timeout worth doing at all.
+  // Everything a pass needs, settled once. Each attempt asks the same question
+  // of a different worker, so the only thing that changes between them is the
+  // tally it fills in.
+  const job = {
+    url,
+    locator,
+    path,
+    budget,
+    busy,
+    ids,
+    t0,
+    bytes,
+    full,
+    sizeHint,
+    // Which policy an answer may be filed under, and null where nothing may be:
+    // an upload has no locator to file one against.
+    cacheFollow: locator && !bytes ? follow.value : null,
+  };
   let last = null;
   for (let attempt = 0; ; attempt++) {
     const pass = { busy: 0, broken: 0 };
     last = pass;
-    const cacheFollow = locator && !bytes ? follow.value : null;
-    const answered = await v1Dispatch(
-      env,
-      ctx,
-      url,
-      locator,
-      path,
-      budget,
-      busy,
-      ids,
-      t0,
-      bytes,
-      pass,
-      cacheFollow,
-      full,
-      sizeHint,
-    );
+    const answered = await v1Dispatch(env, ctx, job, pass);
     if (answered) return answered;
     const stillWorthOffering = pass.busy > 0 && Date.now() < busyDeadline;
     if ((attempt >= tries && !stillWorthOffering) || !scanWorkers(env, ctx.pin).length) break;
@@ -1835,7 +2144,16 @@ function v1UnavailableCause(env, ctx, pass) {
 
 // One pass over the fleet. Returns the response, or null when every worker
 // refused and the pass is worth making again.
-async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, bytes, pass, cacheFollow, full, sizeHint) {
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {Job} job
+ * @param {Pass} pass - filled in as the fleet is walked
+ * @returns {Promise<Response|null>} null when every worker refused and the
+ *   pass is worth making again
+ */
+async function v1Dispatch(env, ctx, job, pass) {
+  const { url, locator, path, budget, busy, ids, t0, bytes, cacheFollow, full, sizeHint } = job;
   const workers = scanWorkers(env, ctx.pin);
   const hint = v1Hint(locator, bytes, sizeHint);
   let ranked = workers.length ? await rankWorkers(env, ctx, workers, ids, hint) : [];
@@ -1970,7 +2288,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
       // ROUTE_VERDICT answers "how long until the caller had an answer". Orphans
       // are the longest runs there are — they are the ones whose caller gave up
       // — so folding them in would bias exactly the tail that gets read.
-      writePoint(env, orphaned ? ROUTE_ORPHAN : ROUTE_VERDICT, credited, ecosystemOf(url), 200, took);
+      writePoint(env, orphaned ? ROUTE_ORPHAN : ROUTE_VERDICT, credited, ecosystemOf(url), 200, took, ctx.org?.oid);
       // Also a log line, because Workers Logs is the other place these are read
       // and it indexes the fields it is given. Same numbers, same names.
       logLine("v1_analyze_verdict", {
@@ -1992,7 +2310,7 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
         // over in milliseconds, and a failed one is simply retried.
         {
           base,
-          resume: (tried) => v1Resume(env, ctx, path, bytes, ids, locator, tried, sizeHint),
+          resume: (tried) => v1Resume(env, ctx, job, tried),
           idleMs: numEnv(env, "SCAN_STREAM_IDLE_MS", STREAM_IDLE_MS),
           stallMs: numEnv(env, "SCAN_STREAM_STALL_MS", STREAM_STALL_MS),
           limit: numEnv(env, "SCAN_STREAM_RESUMES", STREAM_RESUMES),
@@ -2032,7 +2350,15 @@ async function v1Dispatch(env, ctx, url, locator, path, budget, busy, ids, t0, b
 // A 429 here is not worth waiting on. The caller is mid-stream and holding a
 // budget the queueing logic upstream never got to reason about, so a full
 // worker is simply skipped in favour of one with room.
-async function v1Resume(env, ctx, path, bytes, ids, locator, tried, sizeHint) {
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {Job} job
+ * @param {Set<string>} tried - workers this stream has already been on
+ * @returns {Promise<{body: ReadableStream, base: string}|null>}
+ */
+async function v1Resume(env, ctx, job, tried) {
+  const { path, bytes, ids, locator, sizeHint } = job;
   // An aborted request has nobody left to finish the analysis for, and every
   // fetch below would be made with a signal that is already tripped.
   if (clientAborted(ctx)) return null;
@@ -2102,8 +2428,8 @@ async function cacheV1Decision(env, ctx, origin, locator, decided, follow, canon
   }
   const cache = await getCache(env);
   const requestedPath = v1CachePath(null, locator ? [locator] : [], follow, full);
-  await cacheV1Aliases(env, cache, origin, requestedPath, locator, document, follow, canonicalPurl, full);
-  logLine("v1_cache_write", { stored: true, follow, full: full || undefined, max_age: maxAge, keys: v1CacheAliasPaths(origin, requestedPath, locator, document, follow, canonicalPurl, full).length, ...ids });
+  const keys = await cacheV1Aliases(env, cache, origin, requestedPath, locator, document, follow, canonicalPurl, full);
+  logLine("v1_cache_write", { stored: true, follow, full: full || undefined, max_age: maxAge, keys, ...ids });
 }
 
 // Add phase telemetry to the progress stream without changing the cached
@@ -2116,6 +2442,19 @@ async function cacheV1Decision(env, ctx, origin, locator, decided, follow, canon
 // currently serving it, how long silence may last before that worker is taken
 // for gone, how many handovers are allowed, and a callback that produces a
 // replacement body. Omitted, the stream behaves as it always did.
+/**
+ * @param {ReadableStream} stream - the worker's NDJSON
+ * @param {number} budget - false_positive_budget, applied to each decision
+ * @param {StreamMeta} meta
+ * @param {((decision: string) => void)|null} [onDecision] - fires once, on the
+ *   terminal frame, before the caller can cancel
+ * @param {{base: string, resume: (tried: Set<string>) => Promise<{body: ReadableStream, base: string}|null>,
+ *          idleMs: number, stallMs: number, limit: number}|null} [resume]
+ *   omitted, the stream behaves as it did before handovers existed
+ * @param {{register: (p: Promise<unknown>) => void, budgetMs: number}|null} [orphan]
+ *   omitted, a stream the caller abandons is simply dropped
+ * @returns {ReadableStream}
+ */
 function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = null, orphan = null) {
   const encoder = new TextEncoder();
   let decoder = new TextDecoder();
@@ -2410,18 +2749,25 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   });
 }
 
+/**
+ * @param {string} line - one NDJSON frame, without its newline
+ * @param {number} budget
+ * @param {StreamMeta} meta
+ * @param {Phase} phase - advanced in place
+ * @returns {{lines: string[], decision: string|null, refused?: boolean}}
+ */
 function annotatedV1Lines(line, budget, meta, phase) {
-  let row;
-  try {
-    row = JSON.parse(line);
-  } catch {
-    return { lines: [line], decision: null };
-  }
+  const row = parseJson(line);
+  // Not a frame we can read: pass it through as it arrived. budgetedV1Line
+  // leaves anything it cannot parse alone, so text that is not JSON at all and
+  // JSON that is not an object take the same road out.
   if (!row || typeof row !== "object" || Array.isArray(row)) {
     return { lines: [budgetedV1Line(line, budget, meta.locator)], decision: null };
   }
 
-  const reported = finiteMs(row.elapsed_ms);
+  // A worker's own clock for this frame, when it sent a usable one.
+  const sent = Number(row.elapsed_ms);
+  const reported = Number.isFinite(sent) && sent >= 0 ? sent : null;
   const totalElapsed = reported == null ? phase.lastElapsed : reported + phase.floor;
   if (Number.isFinite(totalElapsed)) phase.lastElapsed = totalElapsed;
 
@@ -2461,6 +2807,14 @@ function annotatedV1Lines(line, budget, meta, phase) {
   return { lines: rows, decision: null };
 }
 
+/**
+ * @param {object} row - the worker's frame, carried through
+ * @param {StreamMeta} meta
+ * @param {Phase} phase
+ * @param {"started"|"running"|"completed"} state
+ * @param {number} elapsed
+ * @returns {object}
+ */
 function phaseFrame(row, meta, phase, state, elapsed) {
   const frame = {
     ...row,
@@ -2477,6 +2831,13 @@ function phaseFrame(row, meta, phase, state, elapsed) {
   return frame;
 }
 
+/**
+ * Close the phase in flight, and clear it. Null when none was open.
+ * @param {StreamMeta} meta
+ * @param {Phase} phase - cleared in place
+ * @param {number} [elapsed]
+ * @returns {object|null}
+ */
 function phaseCompletion(meta, phase, elapsed = phase.lastElapsed) {
   if (!phase.name) return null;
   const frame = phaseFrame(
@@ -2494,19 +2855,12 @@ function phaseCompletion(meta, phase, elapsed = phase.lastElapsed) {
   return frame;
 }
 
-function finiteMs(value) {
-  const n = Number(value);
-  return Number.isFinite(n) && n >= 0 ? n : null;
-}
-
 function budgetedV1Line(line, budget, locator) {
   if (!line.includes('"decision"')) return line;
   const body = v1BudgetedBody(line, budget, locator);
   return body || line;
 }
 
-// One worker's answer. An empty `bloom` means it could not give one, so the
-// race keeps waiting on whoever is left.
 // Which worker is already analyzing this artifact, if any.
 //
 // A worker mid-analysis attaches a second request for the same key to the run
@@ -2519,6 +2873,13 @@ function budgetedV1Line(line, budget, locator) {
 // Costs one index-speed request per worker, and only on the analyze path — the
 // path that is about to spend orders of magnitude more than that. A worker that
 // cannot answer is simply not the one running it.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {Locator} input
+ * @param {Ids} ids
+ * @returns {Promise<string|null>} the host already analyzing this, if any
+ */
 async function runningWorker(env, ctx, input, ids) {
   const workers = scanWorkers(env, ctx.pin);
   const keys = [];
@@ -2534,6 +2895,14 @@ async function runningWorker(env, ctx, input, ids) {
   return busy?.worker || null;
 }
 
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string} path
+ * @param {string} base
+ * @returns {Promise<{worker: string, state: string, elapsed_ms: number}|null>}
+ *   never rejects
+ */
 async function statusAsk(env, ctx, path, base) {
   const worker = hostOf(base);
   try {
@@ -2556,14 +2925,6 @@ async function statusAsk(env, ctx, path, base) {
     return null;
   }
 }
-// A scan that never reached a verdict is worth asking again: a 5xx, a 429 at
-// capacity, an edge timeout at 120s, a dropped connection — none of those are
-// answers, and a moment later they may not hold. A rejection is an answer
-// (bad bytes, unsupported type), so repeating it would only burn a slot.
-//
-// Retrying is safe because scan de-duplicates by sha and purl across isolates:
-// a retry joins the analysis already running rather than starting a second one,
-// which is what makes retrying an edge timeout worth doing at all.
 // ---------------------------------------------------------------- routing ---
 //
 // Which scan worker should go first — and only that. One worker is asked at a
@@ -2658,6 +3019,11 @@ const CAPACITY_WEIGHT = 1.0;
 // worker looked emptiest at the poll: run 5 (2026-09-06, concurrency 8) sent
 // them in runs of four and five and stacked three big wheels on a 4-core box
 // in two minutes. Counting our own dispatches is what the next poll will show.
+/**
+ * @param {ScanStats|null} stats
+ * @param {number} [pending=0] - dispatches since those stats were polled
+ * @returns {number} busy in units of the worker's own capacity, 0 when unknown
+ */
 function occupancy(stats, pending = 0) {
   const slots = Number(stats?.slots);
   if (!Number.isFinite(slots) || slots <= 0) return 0;
@@ -2688,6 +3054,10 @@ const HOST_PRESSURE_LIMIT = 1;
 // one for the same work and were the first excluded on every I/O burst.
 // Both are thread counts against physical cores, deliberately: SMT siblings
 // add contention, not capacity, once every core is fed.
+/**
+ * @param {ScanStats|null} stats
+ * @returns {number} cores working, from cpu_busy_cores or load1
+ */
 function machineBusy(stats) {
   // `null` is scan saying "not yet" (one poll old, or no counters here) and
   // must not read as zero busy cores: Number(null) is 0.
@@ -2704,6 +3074,11 @@ function machineBusy(stats) {
 // makes subtracting it safe: it can never exceed what is sheddable, and the
 // remainder is work that stays when a request lands. A server too old to
 // report the field is judged on the whole load, as before.
+/**
+ * @param {ScanStats|null} stats
+ * @returns {number} load per core that stays when a request lands, 0 when
+ *   the worker is too old to report its cores
+ */
 function foregroundPressure(stats) {
   const cpus = Number(stats?.physical_cpus);
   if (!Number.isFinite(cpus) || cpus <= 0) return 0;
@@ -2734,11 +3109,16 @@ const isolateBorn = Date.now();
 // milliseconds since each pool entry was last dispatched to; a worker never
 // dispatched to counts from the isolate's birth, so a cold isolate probes
 // nobody for its first five minutes rather than everybody at once.
+/**
+ * @param {RankedWorker[]} pool - favourite first; index 0 is never probed
+ * @param {number[]} ages - milliseconds since each entry was dispatched to
+ * @returns {number} index into `pool`, or -1
+ */
 function probeIndex(pool, ages) {
   for (let i = 1; i < pool.length; i++) {
-    const w = pool[i];
-    if (w.stats == null) continue;
-    if ((w.stats.slots_free ?? 1) <= 0) continue;
+    const candidate = pool[i];
+    if (candidate.stats == null) continue;
+    if ((candidate.stats.slots_free ?? 1) <= 0) continue;
     if (ages[i] >= STARVE_PROBE_MS) return i;
   }
   return -1;
@@ -2747,6 +3127,11 @@ function probeIndex(pool, ages) {
 // The estimate a starved worker competes with: its own, unless that is worse
 // than the fleet's median, in which case the median. Pure; rankPool applies
 // it to workers past STARVE_PROBE_MS.
+/**
+ * @param {number} own - the starved worker's own estimate
+ * @param {number[]} fleetEsts - every estimate we have evidence for
+ * @returns {number} the lower of `own` and the fleet median
+ */
 function starvedEstimate(own, fleetEsts) {
   const known = [...fleetEsts].sort((a, b) => a - b);
   if (known.length < 2) return own;
@@ -2762,10 +3147,6 @@ function dispatchAge(base, now) {
 // isolate gets a warm estimate from the first poll instead of routing blind
 // until it has seen enough traffic to learn.
 const statsCache = new Map();
-
-function statsPolledAt(base) {
-  return statsCache.get(base)?.at ?? null;
-}
 
 // When this isolate last dispatched to each worker, newest last. Read by
 // `pendingSince` for the occupancy term; see `occupancy`.
@@ -2787,6 +3168,13 @@ function noteDispatch(base, now = Date.now()) {
 // neither side, and the router read a worker as one slot emptier than it was —
 // an undercount, which is the direction that sends more work to a box already
 // holding some. The cost of being wrong the other way is one slot of caution.
+/**
+ * @param {string} base
+ * @param {number|null} at - when the stats were polled
+ * @param {number} [now]
+ * @returns {number} dispatches this isolate made that the worker's own
+ *   in_flight cannot yet have counted
+ */
 function pendingSince(base, at, now = Date.now()) {
   const log = dispatchLog.get(base);
   if (!log || at == null) return 0;
@@ -2800,6 +3188,14 @@ const sizeCache = new Map();
 const SIZE_CACHE_MAX = 4096;
 const SIZE_LOOKUP_MS = 1_500;
 
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string} purl
+ * @param {Ids} ids
+ * @returns {Promise<number|null>} bytes, or null where the registry will
+ *   not say; never rejects
+ */
 async function registrySize(env, ctx, purl, ids) {
   const hit = sizeCache.get(purl);
   if (hit !== undefined) return hit;
@@ -2815,6 +3211,10 @@ async function registrySize(env, ctx, purl, ids) {
   return size;
 }
 
+/**
+ * @param {string} purl
+ * @returns {{type: string, name: string, version: string}|null}
+ */
 function purlNameVersion(purl) {
   const rest = String(purl || "").replace(/^pkg:/i, "");
   const slash = rest.indexOf("/");
@@ -2903,7 +3303,13 @@ function sizeBucket(bytes) {
 // is routed on no evidence rather than excluded, because "I could not ask" is
 // not the same as "it is unhealthy" — the circuit breaker already owns that.
 
-
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string} base
+ * @returns {Promise<ScanStats|null>} null means asked and unanswered, which
+ *   is not the same as unhealthy
+ */
 async function scanStats(env, ctx, base) {
   const now = Date.now();
   const hit = statsCache.get(base);
@@ -2940,6 +3346,13 @@ async function scanStats(env, ctx, base) {
 // one worker being slow at *large archives*, not slow in general — a scalar
 // average would have branded it slow for every small package too, and sent
 // those somewhere worse.
+/**
+ * @param {ScanStats|null} stats
+ * @param {Hint|null} hint - null when the request named no cost class
+ * @param {Map<string, number>|null} mix - the fleet's job distribution
+ * @param {number} [pending=0]
+ * @returns {number} milliseconds
+ */
 function predictMs(stats, hint, mix, pending = 0) {
   if (!stats) return UNKNOWN_JOB_MS;
   // Order matters. When a class was named but this worker has never done one,
@@ -2972,26 +3385,35 @@ function predictMs(stats, hint, mix, pending = 0) {
 const BIG_JOB_BYTES = 8 << 20;
 const WHALE_THREADS_MAX = 16;
 
-function whaleThreads(stats) {
-  const cpus = Number(stats?.physical_cpus);
-  if (!Number.isFinite(cpus) || cpus <= 0) return WHALE_THREADS_MAX;
-  return Math.min(WHALE_THREADS_MAX, Math.max(2, Math.floor(cpus / 4)));
-}
-
+/**
+ * @param {ScanStats|null} stats
+ * @param {Hint|null} hint
+ * @returns {number} 1 when the artifact is not a whale, else the ratio of
+ *   the largest whale pool to this worker's
+ */
 function whaleSlowdown(stats, hint) {
   if (!(hint?.bytes > BIG_JOB_BYTES)) return 1;
-  return WHALE_THREADS_MAX / whaleThreads(stats);
+  const cpus = Number(stats?.physical_cpus);
+  // A worker too old to report its cores is assumed to have the whole pool,
+  // which costs it no penalty rather than inventing one for it.
+  if (!Number.isFinite(cpus) || cpus <= 0) return 1;
+  return WHALE_THREADS_MAX / Math.min(WHALE_THREADS_MAX, Math.max(2, Math.floor(cpus / 4)));
 }
 
 // The routing hint for one request: the package it names and, when known
 // before dispatch, how big it is.
+/**
+ * @param {Locator|null} locator
+ * @param {ArrayBuffer|null} bytes
+ * @param {number|null} sizeHint
+ * @returns {Hint}
+ */
 function v1Hint(locator, bytes, sizeHint) {
   const hint = locator?.type === "purl" ? { purl: locator.value } : {};
   if (bytes) hint.upload = true;
   if (sizeHint != null) hint.bytes = sizeHint;
   return hint;
 }
-
 
 // This worker's average for the cost class the request falls in, or null when
 // it has never done one.
@@ -3005,6 +3427,10 @@ function v1Hint(locator, bytes, sizeHint) {
 // the size of the artifact and three orders of magnitude cheaper than an
 // analysis. Reported in microseconds because a healthy probe rounds to 0ms, and
 // a routing signal that is always zero is no signal.
+/**
+ * @param {ScanStats|null} stats
+ * @returns {number|null} milliseconds, or null with nothing measured
+ */
 function lookupMsOf(stats) {
   if (!stats) return null;
   const windowed = recentMs(stats.recent_lookup);
@@ -3027,12 +3453,22 @@ function lookupMsOf(stats) {
 
 // Whether this worker's lookup estimate rests on enough samples to be trusted
 // for tie-breaking, as opposed to merely being the best number available.
+/**
+ * @param {ScanStats|null} stats
+ * @returns {boolean}
+ */
 function lookupIsSettled(stats) {
   if (!stats) return false;
   if (recentMs(stats.recent_lookup) != null) return true;
   return stats.lookup_samples != null && stats.lookup_samples >= MIN_CLASS_SAMPLES;
 }
 
+/**
+ * @param {ScanStats} stats
+ * @param {Hint|null} hint
+ * @returns {number|null} milliseconds, or null where this worker has never
+ *   done one of these
+ */
 function classMs(stats, hint) {
   if (hint == null) return null;
   // The cheap-source race asks the index, not the analyzer. Predicting it from
@@ -3070,6 +3506,10 @@ function classMs(stats, hint) {
 // Both floor themselves at MIN_CLASS_SAMPLES, so a thin bucket reads as no
 // answer rather than a confident wrong one — except an empty one, which reads
 // as no answer at all.
+/**
+ * @param {Bucket|null|undefined} bucket
+ * @returns {number|null}
+ */
 function bucketMs(bucket) {
   if (!bucket) return null;
   const windowed = recentMs(bucket.recent);
@@ -3094,6 +3534,10 @@ function bucketMs(bucket) {
 // goes to the front and fills its window in MIN_CLASS_SAMPLES jobs. That is the
 // probe, and it is self-limiting: hasHistory() still reads false, so it ranks
 // without earning the jitter kept for workers we trust.
+/**
+ * @param {{samples?: number}|null|undefined} recent
+ * @returns {boolean} true only for a window that exists and holds nothing
+ */
 function emptyWindow(recent) {
   return !!recent && recent.samples === 0;
 }
@@ -3107,6 +3551,10 @@ function emptyWindow(recent) {
 // live, mean-based estimates were out by roughly 10x against observed medians.
 // And a mean over a sample count keeps reporting an incident long after it
 // ends, where an hour-long window forgets on a clock.
+/**
+ * @param {{p80_ms?: number, samples?: number}|null|undefined} recent
+ * @returns {number|null}
+ */
 function recentMs(recent) {
   if (!recent || recent.p80_ms == null) return null;
   if (recent.samples != null && recent.samples < MIN_CLASS_SAMPLES) return null;
@@ -3115,6 +3563,10 @@ function recentMs(recent) {
 
 // The lifetime mean, for a worker that has not been upgraded to publish a
 // window yet. Same sample floor: one job is a story, not a statistic.
+/**
+ * @param {Bucket|null|undefined} bucket
+ * @returns {number|null}
+ */
 function meanMs(bucket) {
   if (!bucket || bucket.avg_ms == null) return null;
   if (bucket.jobs != null && bucket.jobs < MIN_CLASS_SAMPLES) return null;
@@ -3123,6 +3575,10 @@ function meanMs(bucket) {
 
 // The worker's blended average, if it rests on enough completions to mean
 // something. Same threshold, same reason.
+/**
+ * @param {ScanStats} stats
+ * @returns {number|null}
+ */
 function blendedMs(stats) {
   const windowed = recentMs(stats.recent);
   if (windowed != null) return windowed;
@@ -3148,6 +3604,11 @@ function blendedMs(stats) {
 // Renormalized over the buckets a worker has actually seen, so a worker with no
 // large-file history is judged on the sizes it can speak to rather than being
 // credited with a zero.
+/**
+ * @param {ScanStats} stats
+ * @param {Map<string, number>|null} mix
+ * @returns {number|null}
+ */
 function mixedMs(stats, mix) {
   if (!mix) return null;
   let weighted = 0;
@@ -3162,6 +3623,10 @@ function mixedMs(stats, mix) {
 }
 
 // The fleet's job distribution across size buckets: the shared yardstick above.
+/**
+ * @param {(ScanStats|null)[]} all
+ * @returns {Map<string, number>|null} size bucket to completion count
+ */
 function jobMix(all) {
   const mix = new Map();
   for (const stats of all) {
@@ -3180,6 +3645,12 @@ function jobMix(all) {
 // number: every worker tied at 5000ms, ranked at random, and the second arm
 // held 3750ms behind a coin toss. Answering /_/stats is not the same as having
 // something to say.
+/**
+ * @param {ScanStats|null} stats
+ * @param {Hint|null} hint
+ * @param {Map<string, number>|null} mix
+ * @returns {boolean}
+ */
 function hasHistory(stats, hint, mix) {
   if (!stats) return false;
   if (hint?.lookup) return lookupIsSettled(stats);
@@ -3193,6 +3664,13 @@ function hasHistory(stats, hint, mix) {
 // These are not preferences. A worker missing 7z returns a weaker verdict on a
 // DMG rather than a slower one — and being weaker, it is also faster, so a
 // purely latency-ranked router would actively prefer it.
+/**
+ * @param {ScanStats|null} stats
+ * @param {number|null} sizeHint
+ * @param {boolean} [upload=false] - whether the caller sent the bytes
+ * @returns {string|null} why this worker cannot serve, or null if it can;
+ *   null stats means unknown, which the breaker owns rather than this
+ */
 function capability(stats, sizeHint, upload = false) {
   if (!stats) return null; // unknown: let the breaker decide, not a guess
   if (stats.ready === false) return "not ready";
@@ -3301,6 +3779,10 @@ function rotate(workers) {
 // operator's own order when we have none. Jitter without that last guard is a
 // coin toss dressed up as a decision — and it makes a worker that should be
 // draining out of the pool accumulate its failures at random.
+/**
+ * @param {RankedWorker[]} ranked
+ * @returns {string[]} worker base URLs, best first
+ */
 function byEst(ranked) {
   return [...ranked]
     .sort((x, y) => {
@@ -3347,6 +3829,13 @@ function byEst(ranked) {
 // What it must never do is take the configured order. That is what it did
 // before, and it sent 390 of 390 lookups to the slowest worker in the fleet
 // while the fastest sat idle.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string[]} workers
+ * @param {Ids} ids
+ * @returns {Promise<string[]>} base URLs, best first
+ */
 async function lookupOrder(env, ctx, workers, ids) {
   if (workers.length < 2) return workers;
   if (!workers.every((base) => cachedStats(base) !== undefined)) {
@@ -3371,6 +3860,15 @@ async function lookupOrder(env, ctx, workers, ids) {
   return order;
 }
 
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string[]} workers
+ * @param {Hint|null} hint
+ * @param {boolean} [probe=false] - allow a starved worker to be promoted
+ * @returns {Promise<{pool: RankedWorker[], excluded: RankedWorker[],
+ *   informed: boolean, probed: string|undefined, starved: string|undefined}>}
+ */
 async function rankPool(env, ctx, workers, hint, probe = false) {
   const polled = await Promise.all(
     workers.map(async (base, i) => ({ base, i, stats: await scanStats(env, ctx, base) })),
@@ -3382,7 +3880,7 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
     base,
     stats,
     i,
-    est: predictMs(stats, hint, mix, pendingSince(base, statsPolledAt(base))),
+    est: predictMs(stats, hint, mix, pendingSince(base, statsCache.get(base)?.at ?? null)),
     known: hasHistory(stats, hint, mix),
     why: capability(stats, hint?.bytes ?? null, hint?.upload === true),
     r: Math.random(),
@@ -3399,12 +3897,12 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
     const now = Date.now();
     const known = scored.filter((w) => w.stats != null && w.known).map((w) => w.est).sort((a, b) => a - b);
     if (known.length > 1) {
-      for (const w of scored) {
-        if (w.stats == null || dispatchAge(w.base, now) < STARVE_PROBE_MS) continue;
-        const capped = starvedEstimate(w.est, known);
-        if (capped < w.est) {
-          w.est = capped;
-          w.starved = true;
+      for (const candidate of scored) {
+        if (candidate.stats == null || dispatchAge(candidate.base, now) < STARVE_PROBE_MS) continue;
+        const capped = starvedEstimate(candidate.est, known);
+        if (capped < candidate.est) {
+          candidate.est = capped;
+          candidate.starved = true;
         }
       }
     }
@@ -3448,11 +3946,11 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
   let probed;
   if (probe && pool.length > 1) {
     const now = Date.now();
-    const i = probeIndex(pool, pool.map((w) => dispatchAge(w.base, now)));
-    if (i > 0) {
-      const [w] = pool.splice(i, 1);
-      pool.unshift(w);
-      probed = hostOf(w.base);
+    const promote = probeIndex(pool, pool.map((worker) => dispatchAge(worker.base, now)));
+    if (promote > 0) {
+      const [starving] = pool.splice(promote, 1);
+      pool.unshift(starving);
+      probed = hostOf(starving.base);
     }
   }
   const starved = scored.filter((w) => w.starved).map((w) => hostOf(w.base));
@@ -3465,6 +3963,14 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
   };
 }
 
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string[]} workers
+ * @param {Ids} ids
+ * @param {Hint|null} hint
+ * @returns {Promise<string[]>} base URLs, best first
+ */
 async function rankWorkers(env, ctx, workers, ids, hint) {
   const ranked = await rankPool(env, ctx, workers, hint, true);
   logLine("scan_route", {
@@ -3533,16 +4039,16 @@ async function handleRoutes(env, ctx, url) {
   }
 
   const routes = [];
-  for (const c of classes) {
+  for (const costClass of classes) {
     if (!live.length) {
-      routes.push({ class: c.name, kind: c.kind, dispatch: [], note: "every worker's breaker is open" });
+      routes.push({ class: costClass.name, kind: costClass.kind, dispatch: [], note: "every worker's breaker is open" });
       continue;
     }
-    const ranked = await rankPool(env, ctx, live, c.hint);
+    const ranked = await rankPool(env, ctx, live, costClass.hint);
     routes.push({
-      class: c.name,
-      kind: c.kind,
-      size_bytes: c.bytes,
+      class: costClass.name,
+      kind: costClass.kind,
+      size_bytes: costClass.bytes,
       informed: ranked.informed,
       // The order a dispatch would try, favourite first. One worker is asked at
       // a time and the next is reached only when the one before it refuses or
@@ -3581,11 +4087,11 @@ async function handleRoutes(env, ctx, url) {
 
 // Bytes, or a human size like "10mb". Returns null on anything else.
 function parseSize(raw) {
-  const m = /^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$/i.exec(raw);
-  if (!m) return null;
-  const scale = { b: 1, kb: 1 << 10, mb: 1 << 20, gb: 1 << 30 }[(m[2] || "b").toLowerCase()];
-  const n = Number(m[1]) * scale;
-  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+  const match = /^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$/i.exec(raw);
+  if (!match) return null;
+  const scale = { b: 1, kb: 1 << 10, mb: 1 << 20, gb: 1 << 30 }[(match[2] || "b").toLowerCase()];
+  const bytes = Number(match[1]) * scale;
+  return Number.isFinite(bytes) && bytes >= 0 ? Math.round(bytes) : null;
 }
 // Exponential with full jitter, capped: a burst of waiters on the same sample
 // spreads out instead of retrying in lockstep.
@@ -3594,14 +4100,13 @@ function backoff(base, attempt, cap) {
   return ceiling <= base ? base : base + Math.random() * (ceiling - base);
 }
 
+// What every outbound request to a scan worker carries. There is one backend,
+// so there is one of these: the indirection this used to have existed for a
+// second credential that no longer has a service behind it.
 function scanHeaders(env, ctx) {
-  return backendHeaders(env.SCAN_TOKEN, ctx);
-}
-
-function backendHeaders(token, ctx) {
-  const tok = (token || "").trim();
+  const token = (env.SCAN_TOKEN || "").trim();
   const headers = { "x-request-id": ctx.rid };
-  if (tok) headers.authorization = `Bearer ${tok}`;
+  if (token) headers.authorization = `Bearer ${token}`;
   if (ctx.filename) headers["x-filename"] = ctx.filename;
   return headers;
 }
@@ -3612,11 +4117,6 @@ function cleanFilename(raw) {
   return value;
 }
 
-// A PURL from a backend header, bounded before it can become a cache key.
-// Length-capped and ASCII-only: a key is a URL we build, and an unbounded or
-// unspellable one is either a request we cannot make or an entry nothing can
-// read back. Must look like a PURL, so a confused worker cannot file an
-// answer under something that is not a coordinate at all.
 // One coordinate, one spelling.
 //
 // The `pkg:` scheme is required by the PURL spec, and both it and the type are
@@ -3646,6 +4146,11 @@ function normalizePurl(raw) {
   return `pkg:${rest.slice(0, slash).toLowerCase()}${rest.slice(slash)}`;
 }
 
+// A PURL from a backend header, bounded before it can become a cache key.
+// Length-capped and ASCII-only: a key is a URL we build, and an unbounded or
+// unspellable one is either a request we cannot make or an entry nothing can
+// read back. Must look like a PURL, so a confused worker cannot file an
+// answer under something that is not a coordinate at all.
 function cleanPurl(raw) {
   const value = String(raw || "").trim();
   if (!value || value.length > 512) return null;
@@ -3664,58 +4169,21 @@ function clientAborted(ctx) {
   return !!(ctx && ctx.signal && ctx.signal.aborted);
 }
 
-function tokenEq(a, b) {
-  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
-  let x = 0;
-  for (let i = 0; i < a.length; i++) x |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return x === 0;
+// Constant-time for equal-length strings: a token check that returns early on
+// the first wrong character tells an attacker how much of a prefix they have.
+function tokenEq(left, right) {
+  if (typeof left !== "string" || typeof right !== "string" || left.length !== right.length) return false;
+  let differing = 0;
+  for (let i = 0; i < left.length; i++) differing |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  return differing === 0;
 }
 
-// Scan's lookup answers in the same shape we serve, so the body passes
-// through untouched but for `bloom`, which is our upstream's business and not
-// part of this API. Never re-derive it through customerView: there is no
-// envelope here to derive from.
-function verdictResponse(env, verdict, input, maxAge) {
-  const view = {};
-  for (const [k, v] of Object.entries(verdict)) {
-    if (k !== "bloom" && v !== null && v !== undefined) view[k] = v;
-  }
-  // Benign artifacts routinely carry notable findings, and scan stores them.
-  // `hits` is documented as present only when `lvl != -1`, so drop them here
-  // the way customerView does on every other path — one artifact must not
-  // change shape depending on which layer answered.
-  if (view.lvl === -1) delete view.hits;
-  if (!view.sha && input.sha) view.sha = input.sha;
-  if (!view.purl && input.purl) view.purl = input.purl;
-  const headers = {
-    "content-type": "application/json",
-    "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
-    "x-beamline-source": "scan:analysis",
-  };
-  if (view.sha) headers["x-sha256"] = view.sha;
-  return new Response(JSON.stringify(view), { status: 200, headers });
-}
-
-function bloomStub(env, sha, purl) {
-  return envelopeResponse(env, { ml: { lvl: -1, eng: "beamline" } }, sha, "scan:bloom", 3600, null, purl);
-}
-
-function envelopeResponse(env, envelope, sha, source, maxAge, totalMs, purl) {
-  const view = customerView(envelope, sha, purl);
-  const headers = {
-    "content-type": "application/json",
-    "cache-control": `${cacheScope(env)}, max-age=${maxAge}`,
-    "x-beamline-source": source,
-  };
-  if (view.sha) headers["x-sha256"] = view.sha;
-  if (totalMs != null && totalMs !== "") headers["x-total-ms"] = String(totalMs);
-  return new Response(JSON.stringify(view), { status: 200, headers });
-}
-
-// Authenticated answers are private to everything between us and the client.
-// Our own cache is a different matter. The scope a client's copy carries is
-// restored independently from the copy stored in the edge cache.
 // What a v1 answer tells the caller about holding it.
+//
+// `private` on a deployment with a token, because this header travels: the
+// caller's proxy and browser both read it, and a PURL is their dependency list.
+// The copy we put in caches.default is marked separately and deliberately
+// differently — see storedDocument.
 //
 // One rule, because it was two: this said `public` with no max-age for an
 // uncacheable answer while `v1Body` said `no-store` for the same thing, and a
@@ -3724,11 +4192,8 @@ function envelopeResponse(env, envelope, sha, source, maxAge, totalMs, purl) {
 // earned a TTL is ever in the cache to be re-served, which is exactly how two
 // spellings of one rule survive long enough to diverge.
 function clientScope(env, maxAge) {
-  return maxAge ? `${cacheScope(env)}, max-age=${maxAge}` : "no-store";
-}
-
-function cacheScope(env) {
-  return (env.BEAMLINE_TOKEN || "").trim() ? "private" : "public";
+  if (!maxAge) return "no-store";
+  return `${(env.BEAMLINE_TOKEN || "").trim() ? "private" : "public"}, max-age=${maxAge}`;
 }
 
 function customerView(envelope, sha, purl) {
@@ -3751,36 +4216,36 @@ function customerView(envelope, sha, purl) {
 function llmWhy(llm) {
   if (!llm) return "";
   if (typeof llm === "string") return llm.trim();
-  const s = llm.interpretation || llm.why || "";
-  return typeof s === "string" ? s.trim() : "";
+  const text = llm.interpretation || llm.why || "";
+  return typeof text === "string" ? text.trim() : "";
 }
 
 function topHits(raw, purl) {
   const files = (raw && (raw.files || raw.fs)) || [];
   const rows = [];
   const seen = new Set();
-  for (const f of files) {
-    const traits = (f && (f.traits || f.findings)) || [];
-    const file = hitFile(f && f.path);
-    const ident = identPkg(f);
-    for (const t of traits) {
-      const crit = Number(t && t.crit);
-      const id = t && t.id;
+  for (const entry of files) {
+    const traits = (entry && (entry.traits || entry.findings)) || [];
+    const file = hitFile(entry && entry.path);
+    const ident = identPkg(entry);
+    for (const trait of traits) {
+      const crit = Number(trait && trait.crit);
+      const id = trait && trait.id;
       if (!id || !Number.isFinite(crit) || crit < HIT_MIN_CRIT) continue;
       // Native matches only. A finding with `from` is the same match reported
       // again on an enclosing archive — the member's own copy carries the real
       // path and offset, and we walk every file — or a cross-file composite,
       // which has no single place to point at.
-      if (Array.isArray(t.from) && t.from.length) continue;
-      const pkg = (t.dep && t.dep.locator) || purl || ident || "";
+      if (Array.isArray(trait.from) && trait.from.length) continue;
+      const pkg = (trait.dep && trait.dep.locator) || purl || ident || "";
       const key = `${id}\0${file}\0${pkg}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const hit = { id, crit };
-      if (t.desc) hit.desc = t.desc;
+      if (trait.desc) hit.desc = trait.desc;
       if (file) hit.file = file;
       if (pkg) hit.pkg = pkg;
-      const at = hitLocation(f, id, t);
+      const at = hitLocation(entry, id, trait);
       if (at.off != null) hit.off = at.off;
       if (at.line != null) hit.line = at.line;
       rows.push(hit);
@@ -3796,10 +4261,10 @@ function topHits(raw, purl) {
 // A report whose context was trimmed falls back to the finding's own first
 // evidence span, which locates it without naming a line.
 function hitLocation(file, id, trait) {
-  for (const w of (file && file.ctx) || []) {
-    for (const n of (w && w.n) || []) {
-      if (n && n.i === id) {
-        return { off: num(n.o), line: num(w.line) };
+  for (const context of (file && file.ctx) || []) {
+    for (const note of (context && context.n) || []) {
+      if (note && note.i === id) {
+        return { off: num(note.o), line: num(context.line) };
       }
     }
   }
@@ -3807,16 +4272,16 @@ function hitLocation(file, id, trait) {
   return { off: Array.isArray(span) ? num(span[0]) : null, line: null };
 }
 
-function num(v) {
-  return Number.isFinite(Number(v)) ? Number(v) : null;
+function num(value) {
+  return Number.isFinite(Number(value)) ? Number(value) : null;
 }
 
 function hitFile(path) {
   if (!path) return "";
-  let p = String(path);
-  if (p.includes("!!")) p = p.split("!!").pop();
-  else if (p.includes("!")) p = p.split("!").pop();
-  return p.replace(/^\/+/, "") || "";
+  let inner = String(path);
+  if (inner.includes("!!")) inner = inner.split("!!").pop();
+  else if (inner.includes("!")) inner = inner.split("!").pop();
+  return inner.replace(/^\/+/, "") || "";
 }
 
 function identPkg(f) {
@@ -3834,6 +4299,16 @@ function shaFromEnvelope(body) {
 // `read` runs inside the timeout and the client's abort, because a backend
 // that sends headers promptly can still stall mid-body. Nothing may touch the
 // Response after fetchTimeout returns.
+/**
+ * @template T
+ * @param {string} url
+ * @param {RequestInit} opts
+ * @param {number} ms
+ * @param {Ctx|null} ctx - null opts out of the caller's abort
+ * @param {(resp: Response) => Promise<T>} read - runs inside the timeout;
+ *   nothing may touch the Response after this returns
+ * @returns {Promise<T>}
+ */
 async function fetchTimeout(url, opts, ms, ctx, read) {
   const ac = new AbortController();
   const outer = ctx && ctx.signal;
@@ -3842,11 +4317,11 @@ async function fetchTimeout(url, opts, ms, ctx, read) {
   }
   const onAbort = () => ac.abort();
   if (outer) outer.addEventListener("abort", onAbort, { once: true });
-  const t = setTimeout(() => ac.abort(), ms);
+  const timer = setTimeout(() => ac.abort(), ms);
   try {
     return await read(await fetch(url, { ...opts, signal: ac.signal }));
   } finally {
-    clearTimeout(t);
+    clearTimeout(timer);
     if (outer) outer.removeEventListener("abort", onAbort);
   }
 }
@@ -3871,6 +4346,13 @@ async function getCache(env) {
   return getCache.memory;
 }
 
+/**
+ * Stands in for caches.default off Cloudflare, refusing exactly what the
+ * real one refuses so a test cannot pass on a more permissive stub.
+ * @returns {{match: (req: Request|string) => Promise<Response|null>,
+ *   delete: (req: Request|string) => Promise<boolean>,
+ *   put: (req: Request|string, res: Response) => Promise<void>}}
+ */
 function memoryCache() {
   const map = new Map();
   return {
@@ -3890,13 +4372,13 @@ function memoryCache() {
       return map.delete(cacheId(req));
     },
     async put(req, res) {
-      const cc = res.headers.get("cache-control") || "";
+      const control = res.headers.get("cache-control") || "";
       // Refused here because Cloudflare refuses them there. A stand-in that is
       // more permissive than the real cache proves nothing: the analyze path
       // stored `private` for as long as it existed and every test passed.
-      if (/(^|,\s*)(private|no-store|no-cache)\b/.test(cc)) return;
-      const m = /max-age=(\d+)/.exec(cc);
-      const maxAge = m ? Number(m[1]) : 3600;
+      if (/(^|,\s*)(private|no-store|no-cache)\b/.test(control)) return;
+      const match = /max-age=(\d+)/.exec(control);
+      const maxAge = match ? Number(match[1]) : 3600;
       while (map.size >= MEMORY_CACHE_MAX) map.delete(map.keys().next().value);
       map.set(cacheId(req), {
         body: await res.clone().arrayBuffer(),
@@ -3943,20 +4425,20 @@ function storedDocument(env, body) {
   });
 }
 
-function waitUntil(ctx, p) {
-  const q = Promise.resolve(p).catch((err) => {
+function waitUntil(ctx, promise) {
+  const guarded = Promise.resolve(promise).catch((err) => {
     logLine("wait_error", { err: errText(err) });
   });
-  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(q);
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(guarded);
 }
 function numEnv(env, key, fallback) {
   if (!env || env[key] == null || env[key] === "") return fallback;
-  const n = Number(env[key]);
-  return Number.isFinite(n) && n >= 0 ? n : fallback;
+  const value = Number(env[key]);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
-function cleanId(s) {
-  return String(s || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 64);
+function cleanId(raw) {
+  return String(raw || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 64);
 }
 
 function errText(err) {
@@ -3974,8 +4456,8 @@ function logLine(event, fields) {
   if (logLine.mute) return;
   try {
     const row = { event };
-    for (const k of Object.keys(fields || {})) {
-      if (fields[k] !== undefined) row[k] = fields[k];
+    for (const key of Object.keys(fields || {})) {
+      if (fields[key] !== undefined) row[key] = fields[key];
     }
     console.log(STRUCTURED_LOGS ? row : JSON.stringify(row));
   } catch {
@@ -3994,11 +4476,9 @@ function breakerFor(base) {
 
 // SCAN_URL is one URL or a comma-separated list of interchangeable workers.
 function urlList(raw) {
-  return tokenList(raw).map(trimSlash).filter(Boolean);
+  return tokenList(raw).map((base) => base.replace(/\/+$/, "")).filter(Boolean);
 }
 
-// Workers worth asking right now. Empty means every one of them is tripped,
-// and the caller should fail fast rather than pile on.
 // The workers worth trying, healthiest first.
 //
 // A tripped breaker steers traffic to a healthier worker. When every worker is
@@ -4039,6 +4519,10 @@ function hostOf(base) {
   }
 }
 
+/**
+ * @returns {{ok: () => void, fail: () => void, open: () => boolean,
+ *   reset: () => void}}
+ */
 function makeBreaker() {
   let fails = 0;
   let openUntil = 0;
@@ -4095,18 +4579,14 @@ function sleep(ms, ctx) {
   if (outer && outer.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
   return new Promise((resolve, reject) => {
     const settle = (fn, arg) => {
-      clearTimeout(t);
+      clearTimeout(timer);
       if (outer) outer.removeEventListener("abort", onAbort);
       fn(arg);
     };
     const onAbort = () => settle(reject, new DOMException("Aborted", "AbortError"));
-    const t = setTimeout(() => settle(resolve), ms);
+    const timer = setTimeout(() => settle(resolve), ms);
     if (outer) outer.addEventListener("abort", onAbort, { once: true });
   });
-}
-
-function trimSlash(s) {
-  return String(s || "").replace(/\/+$/, "");
 }
 
 export const _test = {
@@ -4139,8 +4619,6 @@ export const _test = {
   rotate,
   scanWorkers,
   breakerFor,
-  bloomStub,
-  verdictResponse,
   hitLocation,
   shaFromEnvelope,
   customerView,
