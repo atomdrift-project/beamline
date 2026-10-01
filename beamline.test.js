@@ -5275,3 +5275,114 @@ test("a namespace that cannot be read does not take the API down", async () => {
   assert.equal(refused.status, 401);
 });
 
+
+// ─── Reliability: retries, breakers, and layers that fail on their own ────
+
+test("a zone purge that hits a transient 5xx is retried, not reported failed", async () => {
+  const SHA = "e".repeat(64);
+  const env = testEnv(DEAD, { cache: _test.memoryCache(), CF_ZONE_ID: "0123456789abcdef0123456789abcdef", CF_PURGE_TOKEN: "purge-token" });
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return calls === 1
+      ? new Response(JSON.stringify({ success: false, errors: [{ code: 1, message: "busy" }] }), { status: 503 })
+      : new Response(JSON.stringify({ success: true, errors: [], result: {} }), { status: 200 });
+  };
+  try {
+    const res = await handle(new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).caches.zone.purge, "ok");
+    assert.equal(calls, 2, "the 503 was retried once and the retry went through");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a customer is admitted through a dash namespace that fails once", async () => {
+  let reads = 0;
+  const kv = {
+    async get(key) {
+      reads += 1;
+      if (reads === 1) throw new Error("kv blinked");
+      return key === `tok:${CUSTOMER}` ? JSON.stringify({ oid: "org1", tier: "free" }) : null;
+    },
+  };
+  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", DASH_KV: kv };
+  const res = await handle(
+    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", { headers: { authorization: `Bearer ${CUSTOMER}` } }),
+    env,
+    {},
+  );
+  assert.notEqual(res.status, 401, "one failed read became a 401 for a paying customer");
+  assert.equal(reads, 2);
+});
+
+// A caller hanging up aborts the lookup's fetch. That is not the worker
+// failing, and charging it for one let impatient clients open a healthy
+// worker's breaker.
+test("v1 lookup: a caller hanging up is not held against the worker", async () => {
+  _test.reset();
+  const server = createServer(() => {});
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const env = testEnv(base, { SCAN_URL: base });
+  try {
+    for (let attempt = 0; attempt < _test.BREAKER_FAILS; attempt++) {
+      const controller = new AbortController();
+      const pending = handle(
+        new Request(`http://beamline/v1/lookup?purl=pkg%3Anpm%2Fhangup${attempt}%401.0.0`),
+        env,
+        { signal: controller.signal, waitUntil() {} },
+      );
+      setTimeout(() => controller.abort(), 20);
+      assert.equal((await pending).status, 499);
+    }
+    assert.equal(_test.breakerFor(base).open(), false);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("concurrent requests on a cold isolate share one stats poll per worker", async () => {
+  _test.reset();
+  const scan = await mockBackend({ stats: statsFor() });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    await Promise.all([1, 2, 3].map(() => handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx)));
+    assert.equal(scan.hits.stats, 1);
+  } finally {
+    await scan.close();
+  }
+});
+
+// KV outlives the edge by months and serves every other data center, so an
+// edge write the Cache API refuses must not take the KV copy with it.
+test("v1 lookup: a refused edge write still files the answer in KV", async () => {
+  _test.reset();
+  const purl = "pkg:npm/edge-refused@1.0.0";
+  const stored = new Map();
+  const kv = {
+    async get(key) { return stored.get(key) || null; },
+    async put(key, value) { stored.set(key, value); },
+  };
+  const cache = {
+    async match() { return null; },
+    async put() { throw new Error("cache refused"); },
+  };
+  const scan = await mockBackend({
+    v1: () => ({ decision: "allow", purl, sha256: "f".repeat(64), fires_at: -1, findings: [], engine_version: "2.11.0", analyzed_at: "2026-09-30T00:00:00Z" }),
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url, BEAMLINE_KV: kv, cache });
+  const ctx = waitCtx();
+  try {
+    const res = await handle(new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}`), env, ctx.ctx);
+    assert.equal(res.status, 200);
+    await ctx.flush();
+    assert.ok(stored.size > 0, "nothing reached KV once the edge refused");
+  } finally {
+    await scan.close();
+  }
+});

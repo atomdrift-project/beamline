@@ -341,20 +341,45 @@ async function identify(request, env) {
   // a KV read we pay for.
   const kv = env?.DASH_KV;
   if (token && kv && CUSTOMER_TOKEN_RE.test(token)) {
-    try {
-      const raw = await kv.get(`tok:${token}`, { cacheTtl: TOKEN_CACHE_TTL_S });
-      if (raw) {
-        const row = JSON.parse(raw);
-        if (row?.oid) return { token, known: true, org: { oid: String(row.oid), tier: String(row.tier || "free") } };
-      }
-    } catch (err) {
-      // A namespace that cannot be read must not take the API down with it.
-      // The caller falls through to the static gate, which on a deployment
-      // that has one means a 401 and on an open one means service as usual.
-      logLine("token_lookup_failed", { err: errText(err) });
-    }
+    const raw = await dashRow(kv, token);
+    const row = parseJson(raw);
+    if (row?.oid) return { token, known: true, org: { oid: String(row.oid), tier: String(row.tier || "free") } };
+    // Dash wrote something it should not have. Not retried — it will read the
+    // same way next time — and not logged with the token, which is a secret.
+    if (raw) logLine("token_row_invalid", { bytes: raw.length });
   }
   return { token, known: false, org: null };
+}
+
+// How many times a failed read of the dash namespace is retried, and the
+// backoff between. Short: every request from that customer is waiting on it.
+const TOKEN_LOOKUP_RETRIES = 2;
+const TOKEN_LOOKUP_RETRY_BASE_MS = 50;
+const TOKEN_LOOKUP_RETRY_MAX_MS = 500;
+
+// One customer's row from the dash namespace, or null.
+//
+// A read that fails is retried briefly, because the alternative is a 401 to a
+// paying customer for an outage that is ours and probably already over. Once
+// the retries are spent, a namespace that cannot be read must still not take
+// the API down with it: the caller falls through to the static gate, which on a
+// deployment that has one means a 401 and on an open one means service as
+// usual.
+/**
+ * @param {{get: (key: string, opts: object) => Promise<string|null>}} kv
+ * @param {string} token
+ * @returns {Promise<string|null>} never rejects
+ */
+async function dashRow(kv, token) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await kv.get(`tok:${token}`, { cacheTtl: TOKEN_CACHE_TTL_S });
+    } catch (err) {
+      logLine("token_lookup_failed", { attempt, err: errText(err) });
+      if (attempt >= TOKEN_LOOKUP_RETRIES) return null;
+      await sleep(backoff(TOKEN_LOOKUP_RETRY_BASE_MS, attempt, TOKEN_LOOKUP_RETRY_MAX_MS), null);
+    }
+  }
 }
 
 // What dash mints: `i13_<nuclide>_<26 base32>`. Matched loosely enough to
@@ -625,6 +650,11 @@ const V1_FLUSH_MAX_LOCATORS = 16;
 // The zone purge API takes at most this many URLs per call.
 const CF_PURGE_BATCH = 30;
 const CF_PURGE_TIMEOUT_MS = 10000;
+// Retries after the first purge call, and the backoff between them. Short: a
+// flush answers its caller only once the zone has, so this is their wait.
+const CF_PURGE_RETRIES = 3;
+const CF_PURGE_RETRY_BASE_MS = 250;
+const CF_PURGE_RETRY_MAX_MS = 2_000;
 
 // How long a v1 answer stays in the edge cache.
 //
@@ -872,6 +902,7 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
         }
         if (answered.status !== 200) {
           breakerFor(base).fail();
+          logLine("v1_lookup", { src: "scan", status: answered.status, worker, retry: true, ...ids });
           continue;
         }
         breakerFor(base).ok();
@@ -914,6 +945,10 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
         waitUntil(ctx, cacheV1Aliases(env, cache, origin, path, locator, stored, follow));
         return res;
       } catch (err) {
+        // A caller who hung up aborted this fetch; the worker did nothing
+        // wrong, and charging its breaker for it takes a healthy worker out
+        // of the fleet one impatient client at a time.
+        if (clientAborted(ctx)) throw err;
         breakerFor(base).fail();
         logLine("v1_lookup", { src: "scan", worker, unreachable: true, err: errText(err), ...ids });
       }
@@ -1058,8 +1093,7 @@ async function backfillDigestKey(env, cache, origin, body, follow, full = false)
   // locator key beside it holds the verdict.
   const existing = await cachedText(cache, key);
   if (existing && v1CachedAnalyzeAnswer(existing, full)) return;
-  await cache.put(key, storedDocument(env, body));
-  await kvPut(env, path, body);
+  await fileDocument(env, cache, key, path, body);
   logLine("v1_cache_backfill", { key: "sha256", sha, follow, max_age: maxAge });
 }
 
@@ -1132,17 +1166,32 @@ function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonic
 async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, follow, canonicalPurl, full = false) {
   const keys = v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl, full);
   await Promise.all(
-    keys.map(async (key) => {
-      try {
-        await cache.put(key, storedDocument(env, body));
-        const parsed = new URL(key.url);
-        await kvPut(env, `${parsed.pathname}${parsed.search}`, body);
-      } catch (err) {
-        logLine("v1_cache_write", { stored: false, key: key.url, err: errText(err) });
-      }
+    keys.map((key) => {
+      const parsed = new URL(key.url);
+      return fileDocument(env, cache, key, `${parsed.pathname}${parsed.search}`, body);
     }),
   );
   return keys.length;
+}
+
+// One document into both layers, together and independently.
+//
+// They used to be written in series inside one try, so an edge write the Cache
+// API refused skipped the KV write after it — and KV is the copy that outlives
+// the edge by months and serves every other data center. Each failure is now
+// its own log line and costs only its own layer.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Cache} cache
+ * @param {Request} key - the edge cache key
+ * @param {string} path - the same key as a path, which KV hashes
+ * @param {string} body
+ * @returns {Promise<void>} never rejects
+ */
+async function fileDocument(env, cache, key, path, body) {
+  const [edge, kv] = await Promise.allSettled([cache.put(key, storedDocument(env, body)), kvPut(env, path, body)]);
+  if (edge.status === "rejected") logLine("v1_cache_write", { stored: false, layer: "cache", key: path, err: errText(edge.reason) });
+  if (kv.status === "rejected") logLine("v1_cache_write", { stored: false, layer: "kv", key: path, err: errText(kv.reason) });
 }
 
 // A stored or streamed body, parsed. Everything here is handed JSON that came
@@ -1965,35 +2014,61 @@ async function purgeZone(env, ctx, urls) {
   const batches = [];
   for (let i = 0; i < urls.length; i += CF_PURGE_BATCH) batches.push(urls.slice(i, i + CF_PURGE_BATCH));
   const endpoint = `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(zone)}/purge_cache`;
-  const results = await Promise.all(
-    batches.map(async (files) => {
-      try {
-        return await fetchTimeout(
-          endpoint,
-          {
-            method: "POST",
-            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-            body: JSON.stringify({ files }),
-          },
-          CF_PURGE_TIMEOUT_MS,
-          ctx,
-          async (res) => {
-            const body = await res.json().catch(() => null);
-            const ok = res.ok && body && body.success === true;
-            if (!ok) {
-              const errors = (body && body.errors) || [];
-              logLine("v1_purge", { rid: ctx.rid, ok: false, status: res.status, urls: files.length, err: JSON.stringify(errors) });
-            }
-            return ok;
-          },
-        );
-      } catch (err) {
-        logLine("v1_purge", { rid: ctx.rid, ok: false, urls: files.length, err: errText(err) });
-        return false;
-      }
-    }),
-  );
+  const results = await Promise.all(batches.map((files) => purgeBatch(endpoint, token, files, ctx)));
   return results.every(Boolean) ? "ok" : "failed";
+}
+
+// One purge call, retried while the failure is the API's rather than ours.
+//
+// A network error, a 429 or a 5xx says nothing about the request and is likely
+// gone a moment later, and the alternative is telling the caller to retry a
+// flush whose local half already happened. Any other refusal — a token without
+// the permission, a zone that is not ours — repeats identically, so it is
+// reported at once. Bounded short, because the caller is waiting on it.
+/**
+ * @param {string} endpoint
+ * @param {string} token
+ * @param {string[]} files - at most CF_PURGE_BATCH URLs
+ * @param {Ctx} ctx
+ * @returns {Promise<boolean>} whether the zone accepted the purge; never rejects
+ */
+async function purgeBatch(endpoint, token, files, ctx) {
+  for (let attempt = 0; ; attempt++) {
+    let retryable = true;
+    try {
+      const outcome = await fetchTimeout(
+        endpoint,
+        {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify({ files }),
+        },
+        CF_PURGE_TIMEOUT_MS,
+        ctx,
+        async (res) => {
+          const body = await res.json().catch(() => null);
+          const ok = res.ok && body?.success === true;
+          if (!ok) {
+            logLine("v1_purge", { rid: ctx.rid, ok: false, status: res.status, attempt, urls: files.length, err: JSON.stringify(body?.errors || []) });
+          }
+          return { ok, retryable: res.status === 429 || res.status >= 500 };
+        },
+      );
+      if (outcome.ok) return true;
+      retryable = outcome.retryable;
+    } catch (err) {
+      if (clientAborted(ctx)) return false;
+      logLine("v1_purge", { rid: ctx.rid, ok: false, attempt, urls: files.length, err: errText(err) });
+    }
+    if (!retryable || attempt >= CF_PURGE_RETRIES) return false;
+    const wait = backoff(CF_PURGE_RETRY_BASE_MS, attempt, CF_PURGE_RETRY_MAX_MS);
+    logLine("v1_purge_retry", { rid: ctx.rid, attempt: attempt + 1, wait_ms: Math.round(wait), urls: files.length });
+    try {
+      await sleep(wait, ctx);
+    } catch {
+      return false;
+    }
+  }
 }
 
 // Drop every key one locator can be filed under: both `full` shapes of every
@@ -2453,12 +2528,14 @@ async function v1Dispatch(env, ctx, job, pass) {
     // pool exactly when the fleet could least afford to lose them.
     if (upstream.status === 429) {
       if (pass) pass.busy += 1;
+      await drain(upstream);
       logLine("v1_analyze", { src: "scan", status: 429, worker, busy: true, ...ids });
       continue;
     }
     if (upstream.status >= 500) {
       if (pass) pass.broken += 1;
       breakerFor(base).fail();
+      await drain(upstream);
       logLine("v1_analyze", { src: "scan", status: upstream.status, worker, retry: true, ...ids });
       continue;
     }
@@ -2468,6 +2545,7 @@ async function v1Dispatch(env, ctx, job, pass) {
     if (upstream.status === 404) {
       if (pass) pass.broken += 1;
       breakerFor(base).fail();
+      await drain(upstream);
       logLine("v1_analyze", { src: "scan", status: 404, worker, no_route: true, ...ids });
       continue;
     }
@@ -2642,6 +2720,8 @@ async function v1Resume(env, ctx, job, tried) {
         signal: ctx.signal,
       });
     } catch (err) {
+      // As on the lookup: a caller's abort is not the worker's failure.
+      if (clientAborted(ctx)) return null;
       breakerFor(base).fail();
       logLine("v1_analyze_resume", { src: "scan", worker, unreachable: true, err: errText(err), ...ids });
       continue;
@@ -3430,6 +3510,8 @@ function dispatchAge(base, now) {
 // isolate gets a warm estimate from the first poll instead of routing blind
 // until it has seen enough traffic to learn.
 const statsCache = new Map();
+// Stats polls in flight, by worker, so concurrent misses share one.
+const statsPolls = new Map();
 
 // When this isolate last dispatched to each worker, newest last. Read by
 // `pendingSince` for the occupancy term; see `occupancy`.
@@ -3629,22 +3711,38 @@ async function scanStats(env, ctx, base) {
   const now = Date.now();
   const hit = statsCache.get(base);
   if (hit && now - hit.at < STATS_TTL_MS) return hit.stats;
-  let stats = null;
-  try {
-    stats = await fetchTimeout(
-      `${base}/_/stats`,
-      { method: "GET", headers: scanHeaders(env, ctx) },
-      STATS_TIMEOUT_MS,
-      // Deliberately not ctx: a caller hanging up should not poison the cache
-      // for every later request in this isolate.
-      null,
-      async (resp) => (resp.ok ? await resp.json() : null),
-    );
-  } catch {
-    stats = null;
-  }
-  statsCache.set(base, { at: now, stats });
-  return stats;
+  // One poll per worker at a time. A cold isolate takes a burst of requests
+  // that all find the cache empty, and each used to poll every worker itself:
+  // the same answer bought once per request, from the workers least able to
+  // spare it when the burst is load.
+  const pending = statsPolls.get(base);
+  if (pending) return pending;
+  const poll = (async () => {
+    let stats = null;
+    try {
+      stats = await fetchTimeout(
+        `${base}/_/stats`,
+        { method: "GET", headers: scanHeaders(env, ctx) },
+        STATS_TIMEOUT_MS,
+        // Deliberately not ctx: a caller hanging up should not poison the cache
+        // for every later request in this isolate.
+        null,
+        async (resp) => {
+          if (resp.ok) return resp.json();
+          await drain(resp);
+          logLine("scan_stats", { worker: hostOf(base), status: resp.status });
+          return null;
+        },
+      );
+    } catch (err) {
+      logLine("scan_stats", { worker: hostOf(base), err: errText(err) });
+    }
+    statsCache.set(base, { at: now, stats });
+    statsPolls.delete(base);
+    return stats;
+  })();
+  statsPolls.set(base, poll);
+  return poll;
 }
 
 // Predicted milliseconds until this worker returns a verdict for an artifact of
