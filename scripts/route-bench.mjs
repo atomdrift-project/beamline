@@ -35,6 +35,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { cleartextRemote } from "../tok.js";
 
 const BEAMLINE = (process.env.BEAMLINE || "https://poc.api.isotope13.ai").replace(/\/$/, "");
 const TOKEN =
@@ -46,6 +47,10 @@ const TOKEN =
       return "";
     }
   })();
+if (TOKEN && cleartextRemote(BEAMLINE)) {
+  console.error(`${BEAMLINE} is plain http to a remote host; refusing to send a bearer token over it. Use https.`);
+  process.exit(2);
+}
 
 const args = process.argv.slice(2);
 const trials = Number(args[args.indexOf("--trials") + 1]) || 1;

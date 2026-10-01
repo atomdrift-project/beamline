@@ -3356,6 +3356,38 @@ test("registry size: pypi from the release document, npm from the tarball itself
   }
 });
 
+// The name is the caller's and the tarball is the publisher's; neither may
+// steer the size probe off the registry path it was meant to read.
+test("registry size: npm names cannot walk the path and tarballs cannot leave the registry", async () => {
+  const seen = [];
+  const elsewhere = await mockBackend({
+    route: (url) => {
+      seen.push(`elsewhere ${url.pathname}`);
+      return { headers: { "content-length": "1", "content-type": "application/octet-stream" } };
+    },
+  });
+  const registry = await mockBackend({
+    route: (url) => {
+      seen.push(url.pathname);
+      if (url.pathname === "/offsite/1.0.0") return { body: { dist: { tarball: `${elsewhere.url}/x.tgz` } } };
+      return null;
+    },
+  });
+  const env = { NPM_REGISTRY_URL: registry.url };
+  try {
+    for (const purl of ["pkg:npm/..%2F..%2Fadmin@1.0.0", "pkg:npm/a%2Fb%2Fc@1.0.0", "pkg:npm/x%3Fq%3D1@1.0.0"]) {
+      assert.equal(await _test.registrySize(env, waitCtx().ctx, purl, {}), null, purl);
+    }
+    assert.ok(!seen.some((p) => p.includes("admin")), `walked: ${seen.join(" ")}`);
+    assert.ok(seen.includes("/x%3Fq%3D1/1.0.0"), `a query in a name stays in the path: ${seen.join(" ")}`);
+    assert.equal(await _test.registrySize(env, waitCtx().ctx, "pkg:npm/offsite@1.0.0", {}), null);
+    assert.ok(!seen.some((p) => p.startsWith("elsewhere")), "an off-registry tarball was fetched");
+  } finally {
+    await registry.close();
+    await elsewhere.close();
+  }
+});
+
 test("v1 analyze: a big wheel goes to the worker with whale room, not the emptiest small box", async () => {
   _test.reset();
   const registry = await mockBackend({
@@ -4055,6 +4087,47 @@ test("v1 analyze: an oversized artifact is refused by name", async () => {
   );
   assert.equal(res.status, 413);
   assert.equal((await res.json()).error.code, "artifact_too_large");
+});
+
+// A stream with no declared length is the case a buffer-then-measure check
+// cannot bound: it is cut off at the chunk that crosses the limit, and the
+// rest of it is never pulled.
+test("v1 analyze: an undeclared oversized stream is cut off, not buffered", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD, MAX_BYTES: "8" });
+  let pulled = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      pulled += 1;
+      controller.enqueue(new TextEncoder().encode("12345"));
+    },
+  });
+  const res = await handle(
+    new Request("http://beamline/v1/analyze", { method: "POST", body, duplex: "half" }),
+    env,
+    waitCtx().ctx,
+  );
+  assert.equal(res.status, 413);
+  assert.equal((await res.json()).error.code, "artifact_too_large");
+  assert.ok(pulled <= 3, `pulled ${pulled} chunks of an endless body`);
+});
+
+test("v1 lookup: a sha256 that is not one is refused before it becomes a key", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const res = await handle(new Request("http://beamline/v1/lookup?sha256=..%2F..%2Fadmin"), env, waitCtx().ctx);
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error.code, "invalid_sha256");
+});
+
+// A password in a URL would be logged, sent to a worker, and filed as a key in
+// a cache every caller shares.
+test("v1: a URL carrying credentials is refused on every route", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const url = encodeURIComponent("https://user:hunter2@example.com/pkg.tgz");
+  for (const [method, path] of [["GET", "/v1/lookup"], ["POST", "/v1/analyze"], ["POST", "/v1/flush"]]) {
+    const res = await handle(new Request(`http://beamline${path}?url=${url}`, { method }), env, waitCtx().ctx);
+    assert.equal(res.status, 400, path);
+    assert.equal((await res.json()).error.code, "invalid_url", path);
+  }
 });
 
 // A threat-feed-derived level carries a real `decision` but no engine. It is a

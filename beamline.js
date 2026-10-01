@@ -334,7 +334,7 @@ async function identify(request, env) {
   const bearer = /^Bearer\s+(\S+)/i.exec((request.headers.get("authorization") || "").trim());
   const token = bearer ? bearer[1] : "";
   const ours = tokenList(env?.BEAMLINE_TOKEN);
-  if (token && ours.some((t) => tokenEq(token, t))) return { token, known: true, org: null };
+  if (token && ours.some((candidate) => tokenEq(token, candidate))) return { token, known: true, org: null };
 
   // Shape-checked before it is spent as a key. A token that cannot be one of
   // ours is a scan for an open API, and every one of those would otherwise be
@@ -482,6 +482,10 @@ function writePoint(env, route, headers, ecosystem, status, ms, oid) {
 
 // Which ecosystem was asked about, from the caller's own query. A bounded set;
 // anything else is `other`.
+/**
+ * @param {URL} url
+ * @returns {string} a PURL type scan averages, or `other`
+ */
 function ecosystemOf(url) {
   return purlType(url.searchParams.get("purl") || "");
 }
@@ -501,19 +505,11 @@ async function dispatch(request, env, host, caller) {
   // filtered and bounded first.
   const rid =
     cleanId(request.headers.get("x-request-id")) || cleanId(request.headers.get("cf-ray")) || crypto.randomUUID();
-  // X-Beamline-Pin: <host> forces dispatch to one worker and bypasses the
-  // cache, so an experiment can time a specific backend on a specific sample.
-  // It only restricts a choice beamline was already free to make, but it does
-  // spend a scan slot on demand — so it lives behind the token gate with
-  // everything else, and is bounded like any other caller-supplied header.
-  // ExecutionContext keeps waitUntil on its prototype, bound to itself, so a
-  // spread produces an object without it — and every background job would then
-  // be an unregistered promise the runtime may cancel the moment the response
-  // goes out. That is silent: the helper below simply finds no waitUntil and
-  // does nothing, so the cache never populates and nothing says why. Carry it
-  // over explicitly, still bound to the context that owns it. Every later
-  // { ...ctx } spreads this plain object, where it is an own property.
   const url = new URL(request.url);
+  // Forwarded to scan as a header and read there as a name, so it carries no
+  // control characters at all, not only line breaks: a NUL or an escape is
+  // neither a header nor a name.
+  const filename = (request.headers.get("x-filename") || request.headers.get("x-file-name") || "").trim();
   const ctx = {
     ...host,
     rid,
@@ -521,13 +517,26 @@ async function dispatch(request, env, host, caller) {
     // an open deployment and for our own operational tokens. Read by the
     // telemetry writes deep in the analyze path.
     org: caller?.org || null,
+    // X-Beamline-Pin: <host> forces dispatch to one worker and bypasses the
+    // cache, so an experiment can time a specific backend on a specific sample.
+    // It only restricts a choice beamline was already free to make, but it does
+    // spend a scan slot on demand — so it lives behind the token gate with
+    // everything else, and is bounded like any other caller-supplied header.
     pin: cleanId(request.headers.get("x-beamline-pin")) || null,
-    filename: cleanFilename(request.headers.get("x-filename") || request.headers.get("x-file-name")),
+    // eslint-disable-next-line no-control-regex
+    filename: filename && filename.length <= 255 && !/[\x00-\x1f\x7f]/.test(filename) ? filename : null,
     // A refresh is a cache-read policy, not part of an artifact's identity. It
     // therefore bypasses Beamline's Cache API/KV reads while retaining the
     // ordinary canonical key for the result Scan returns and we write back.
     refresh: url.searchParams.get("refresh") === "1",
   };
+  // ExecutionContext keeps waitUntil on its prototype, bound to itself, so a
+  // spread produces an object without it — and every background job would then
+  // be an unregistered promise the runtime may cancel the moment the response
+  // goes out. That is silent: the helper below simply finds no waitUntil and
+  // does nothing, so the cache never populates and nothing says why. Carry it
+  // over explicitly, still bound to the context that owns it. Every later
+  // { ...ctx } spreads this plain object, where it is an own property.
   if (typeof host?.waitUntil === "function") ctx.waitUntil = (promise) => host.waitUntil(promise);
   if (request.signal && !ctx.signal) ctx.signal = request.signal;
   // /_/health is the name every service in this stack answers to; /healthz
@@ -586,7 +595,7 @@ async function dispatch(request, env, host, caller) {
     // Name the routes, and when the last segment is one of ours, say so.
     const routes = ["/v1/lookup", "/v1/analyze", "/v1/flush"];
     const tail = url.pathname.replace(/\/+$/, "");
-    const guess = tail && routes.find((r) => r.endsWith(tail));
+    const guess = tail && routes.find((route) => route.endsWith(tail));
     return v1Error(
       404,
       "no_such_route",
@@ -665,22 +674,33 @@ const SUSPICIOUS_LEVEL_CEILING = 3000;
 // answers the question completely now — a worker that misses its own index asks
 // the corpus itself. One question, one answer, one place that knows how to
 // produce it.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {URL} url
+ * @returns {Promise<Response>}
+ */
 async function handleV1Lookup(env, ctx, url) {
   const budgetRaw = url.searchParams.get("false_positive_budget");
   const budget = parseFalsePositiveBudget(budgetRaw);
-  const purls = url.searchParams.getAll("purl").map((p) => normalizePurl(p)).filter(Boolean);
+  const purls = url.searchParams.getAll("purl").map((value) => normalizePurl(value)).filter(Boolean);
   const urls = url.searchParams.getAll("url").map((value) => value.trim()).filter(Boolean);
-  const sha = (url.searchParams.get("sha256") || "").trim();
+  const sha = (url.searchParams.get("sha256") || "").trim().toLowerCase();
   const locators = urls.length ? urls.map((value) => ({ type: "url", value })) : purls.map((value) => ({ type: "purl", value }));
 
   if (purls.length && urls.length) {
     return v1Error(400, "multiple_locators", "Use ?purl= or ?url=, not both.");
   }
   if (urls.some((value) => !validArtifactUrl(value))) {
-    return v1Error(400, "invalid_url", "url must be an absolute http or https URL.");
+    return v1Error(400, "invalid_url", "url must be an absolute http or https URL with no credentials in it.");
   }
   if (!sha && !locators.length) {
     return v1Error(400, "missing_package", "Name an artifact with ?purl=, ?url=, or ?sha256=.");
+  }
+  // Checked here as /v1/analyze and /v1/flush check it. Anything else would be
+  // a cache key and a worker request spent on a name no artifact can have.
+  if (sha && !SHA_RE.test(sha)) {
+    return v1Error(400, "invalid_sha256", "sha256 must be 64 hexadecimal characters.");
   }
   if (locators.length > V1_MAX_KEYS) {
     return v1Error(
@@ -782,6 +802,18 @@ async function handleV1Lookup(env, ctx, url) {
 // lookup spends no analysis slot, and since every worker defers to the same
 // corpus when it does not know, they now give the same answer. Broadcasting
 // would multiply the load behind them to learn nothing.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {Cache} cache
+ * @param {Request} cacheKey - the asked-for key; its origin files the aliases
+ * @param {string} path - the cache path the caller's question resolved to
+ * @param {string} sha
+ * @param {Locator[]} locators
+ * @param {number} budget - false_positive_budget
+ * @param {string} follow - the resolved follow policy
+ * @returns {Promise<Response>}
+ */
 async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, follow) {
   const ids = v1LocatorIds(ctx.rid, sha, locators);
   const locator = locators.length === 1 ? locators[0] : null;
@@ -860,7 +892,9 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
         // worker will still analyze perfectly well. Opening its breaker over
         // this would take a healthy analyzer out of the fleet to punish an
         // outage somewhere else.
-        if (v1OutageBody(answered.body)) {
+        // Any one row unreachable makes the whole reply one this service
+        // should not rest on, whether one locator was asked or several.
+        if (rowsIn(answered.body).some(isOutage)) {
           logLine("v1_lookup", { src: source, status: 200, worker, unavailable: true, ms: Date.now() - t0, ...ids });
           outage = { body: answered.body, worker, source };
           continue;
@@ -926,6 +960,12 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
 // already compute the difference on the way here and used to discard it.
 // Distinct from `reason`, which explains a verdict about the artifact and stays
 // null on a row that carries no verdict at all.
+/**
+ * @param {string|null} sha
+ * @param {Locator|null} locator
+ * @param {string|null} [cause=null] - no_workers, unreachable, saturated or mixed
+ * @returns {object} a compact `unavailable` row
+ */
 function v1Unavailable(sha, locator, cause = null) {
   const row = {
     status: "unavailable",
@@ -957,6 +997,13 @@ function v1Unavailable(sha, locator, cause = null) {
 // document filed without saying which question it answers is a document that
 // will eventually answer the wrong one. Passing no policy builds the path scan
 // is asked on, which takes locators only.
+/**
+ * @param {string|null} sha
+ * @param {Locator[]|null} locators
+ * @param {string|null} follow - null builds the path scan is asked on
+ * @param {boolean} [full=false]
+ * @returns {string} `/v1/lookup?…`, the key both cache layers share
+ */
 function v1CachePath(sha, locators, follow, full = false) {
   const query = [];
   if (sha) query.push(`sha256=${encodeURIComponent(sha)}`);
@@ -989,6 +1036,15 @@ function v1CachePath(sha, locators, follow, full = false) {
 // every time it is read would refresh its TTL forever, and an entry that never
 // ages is pinned rather than cached. A verdict is allowed to go stale on
 // schedule.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Cache} cache
+ * @param {string} origin
+ * @param {string} body - the decision to file
+ * @param {string} follow - the policy that produced it
+ * @param {boolean} [full=false]
+ * @returns {Promise<void>}
+ */
 async function backfillDigestKey(env, cache, origin, body, follow, full = false) {
   const sha = v1DecisionSha(body);
   if (!sha) return;
@@ -996,12 +1052,12 @@ async function backfillDigestKey(env, cache, origin, body, follow, full = false)
   if (!maxAge) return;
   const path = v1CachePath(sha, [], follow, full);
   const key = new Request(`${origin}${path}`);
-  const existing = await cache.match(key).catch(() => null);
   // Only a decision is worth leaving alone. A miss cached under this digest is
   // the exact thing this write answers, and skipping the write on account of
   // one leaves the digest key saying "nobody has analyzed this" while the
   // locator key beside it holds the verdict.
-  if (existing && v1CachedAnalyzeAnswer(await existing.text().catch(() => null), full)) return;
+  const existing = await cachedText(cache, key);
+  if (existing && v1CachedAnalyzeAnswer(existing, full)) return;
   await cache.put(key, storedDocument(env, body));
   await kvPut(env, path, body);
   logLine("v1_cache_backfill", { key: "sha256", sha, follow, max_age: maxAge });
@@ -1019,6 +1075,16 @@ async function backfillDigestKey(env, cache, origin, body, follow, full = false)
 // across policies would file a shallow answer where a caller asking the deeper
 // question reads, which is the same mistake as filing under a PURL nobody
 // typed — one name, two questions.
+/**
+ * @param {string} origin
+ * @param {string} requestedPath
+ * @param {Locator|null} locator
+ * @param {string} body
+ * @param {string} follow
+ * @param {string|null} canonicalPurl - scan's spelling of the asked PURL
+ * @param {boolean} [full=false]
+ * @returns {Request[]} one key per name the document answers to
+ */
 function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl, full = false) {
   const paths = new Set([requestedPath]);
   if (locator) paths.add(v1CachePath(null, [locator], follow, full));
@@ -1051,6 +1117,18 @@ function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonic
 // the log line at the one call site that logs: building the key set a second
 // time to count it re-parsed the document and could disagree with what was
 // actually written.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Cache} cache
+ * @param {string} origin
+ * @param {string} requestedPath
+ * @param {Locator|null} locator
+ * @param {string} body
+ * @param {string} follow
+ * @param {string|null} [canonicalPurl]
+ * @param {boolean} [full=false]
+ * @returns {Promise<number>} how many keys were written
+ */
 async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, follow, canonicalPurl, full = false) {
   const keys = v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl, full);
   await Promise.all(
@@ -1071,6 +1149,10 @@ async function cacheV1Aliases(env, cache, origin, requestedPath, locator, body, 
 // from a cache, a worker, or a stream line, and every one of them treats text
 // that will not parse as text that is not a document — so the judgement is made
 // once, here, rather than in a try block per reader, each free to drift.
+/**
+ * @param {string|null|undefined} text
+ * @returns {unknown} the parsed value, or null when it does not parse
+ */
 function parseJson(text) {
   try {
     return JSON.parse(text);
@@ -1083,18 +1165,30 @@ function parseJson(text) {
 // several with an array, and every reader below asks the same question of each
 // row — so both arrive as a list. A body that will not parse yields one empty
 // row, which answers nothing, which is what an unreadable body should say.
+/**
+ * @param {string} body
+ * @returns {unknown[]} every row, an object body as a list of one
+ */
 function rowsIn(body) {
   const row = parseJson(body);
   return Array.isArray(row) ? row : [row];
 }
 
 // The digest a decision names, when it names a well-formed one.
+/**
+ * @param {string} body
+ * @returns {string|null} a well-formed lowercase digest, or null
+ */
 function v1DecisionSha(body) {
   const row = parseJson(body);
   const sha = row && typeof row === "object" ? (row.sha256 || shaFromEnvelope(row)) : null;
   return typeof sha === "string" && SHA_RE.test(sha) ? sha : null;
 }
 
+/**
+ * @param {string|null} raw - the query value; null when absent
+ * @returns {number|null} the budget, or null when it is not a whole number from 0 to 3000
+ */
 function parseFalsePositiveBudget(raw) {
   if (raw === null) return DEFAULT_FALSE_POSITIVE_BUDGET;
   const value = String(raw).trim();
@@ -1103,10 +1197,18 @@ function parseFalsePositiveBudget(raw) {
   return budget >= 0 && budget <= SUSPICIOUS_LEVEL_CEILING ? budget : null;
 }
 
+// An absolute http(s) URL carrying no credentials. A URL is logged, sent to a
+// worker, and filed as a key in caches every caller shares, so a password in
+// its userinfo would be written to all three; refusing it is the only place
+// that can stop that.
+/**
+ * @param {string} value
+ * @returns {boolean}
+ */
 function validArtifactUrl(value) {
   try {
     const parsed = new URL(value);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password;
   } catch {
     return false;
   }
@@ -1234,6 +1336,10 @@ const FOLLOW_POLICIES = [
   "dependencies,references,ci-actions",
 ];
 
+/**
+ * @param {string} policy - a canonical spelling from parseFollow
+ * @returns {Set<string>} the kinds it follows
+ */
 function followSet(policy) {
   if (policy === "none") return new Set();
   if (policy === "all") return new Set(FOLLOW_KINDS);
@@ -1252,6 +1358,10 @@ function followSet(policy) {
 //
 // This orders how a decision is chosen, not how the reads are issued; those go
 // out together. See fullestAnswer.
+/**
+ * @param {string} policy
+ * @returns {string[]} stored policies that answer it, widest first
+ */
 function followCandidates(policy) {
   const want = followSet(policy);
   // FOLLOW_POLICIES runs narrowest first, so containment order reversed is
@@ -1343,9 +1453,14 @@ async function fullestAnswer(asked, candidates, load) {
 //
 // Compared segment by segment as numbers, because `2.11.0` orders before
 // `2.8.0` under the string comparison a naive version of this would use.
-function newerEngine(a, b) {
-  const left = String(a || "").split(".");
-  const right = String(b || "").split(".");
+/**
+ * @param {string|null|undefined} candidate
+ * @param {string|null|undefined} incumbent
+ * @returns {boolean} whether `candidate` is the newer engine version
+ */
+function newerEngine(candidate, incumbent) {
+  const left = String(candidate || "").split(".");
+  const right = String(incumbent || "").split(".");
   for (let i = 0; i < Math.max(left.length, right.length); i++) {
     const step = (Number.parseInt(left[i], 10) || 0) - (Number.parseInt(right[i], 10) || 0);
     if (step) return step > 0;
@@ -1353,6 +1468,11 @@ function newerEngine(a, b) {
   return false;
 }
 
+/**
+ * @param {string} body
+ * @param {boolean} [full=false] - accept only a full envelope
+ * @returns {string|null} the canonical document, or null when it is not one
+ */
 function v1DocumentBody(body, full = false) {
   const row = parseJson(body);
   if (!row || typeof row !== "object") return null;
@@ -1364,10 +1484,21 @@ function v1DocumentBody(body, full = false) {
   return JSON.stringify(canonicalV1Row(row));
 }
 
+/**
+ * @param {object} row
+ * @returns {object}
+ */
 function canonicalV1Row(row) {
   return compactV1Row(normalizeV1Row(row));
 }
 
+/**
+ * @param {string} body
+ * @param {number} budget
+ * @param {Locator|null} locator - a URL locator is echoed into each row
+ * @param {boolean} [legacyCachedUnknown=false] - translate scan's old `unknown`
+ * @returns {string|null} the body as the caller sees it, or null when it does not parse
+ */
 function v1BudgetedBody(body, budget, locator, legacyCachedUnknown = false) {
   const row = parseJson(body);
   if (!row || typeof row !== "object") return null;
@@ -1388,6 +1519,11 @@ function v1BudgetedBody(body, budget, locator, legacyCachedUnknown = false) {
   return JSON.stringify(Array.isArray(rows) ? rows.map(addUrl) : addUrl(rows));
 }
 
+/**
+ * @param {unknown} row
+ * @param {number|null} [budget=null] - null keeps the stored severity
+ * @returns {unknown} a copy with `status` and `severity` settled; non-objects pass through
+ */
 function normalizeV1Row(row, budget = null) {
   if (!row || typeof row !== "object" || Array.isArray(row)) return row;
   const status = row.status || (row.decision === "allow" || row.decision === "block" ? "analyzed" : row.decision);
@@ -1396,22 +1532,23 @@ function normalizeV1Row(row, budget = null) {
   if (normalized.status !== "analyzed") {
     normalized.severity = "unknown";
   } else if (Number.isInteger(normalized.fires_at) && budget !== null) {
-    normalized.severity = severityForLevel(normalized.fires_at, budget);
+    const level = normalized.fires_at;
+    if (level < 0) normalized.severity = "benign";
+    else if (level <= budget) normalized.severity = "hostile";
+    else if (level <= SUSPICIOUS_LEVEL_CEILING) normalized.severity = "suspicious";
+    else normalized.severity = "benign";
   } else if (normalized.severity == null) {
     normalized.severity = "unknown";
   }
   return normalized;
 }
 
-function severityForLevel(firesAt, budget) {
-  if (firesAt < 0) return "benign";
-  if (firesAt <= budget) return "hostile";
-  if (firesAt <= SUSPICIOUS_LEVEL_CEILING) return "suspicious";
-  return "benign";
-}
-
 // Null means the field has no information. Do not make every client pay for
 // keys whose only value is null; nested findings use the same sparse shape.
+/**
+ * @param {unknown} value
+ * @returns {unknown} a copy without null fields, recursively
+ */
 function compactV1Row(value) {
   if (Array.isArray(value)) return value.map(compactV1Row);
   if (!value || typeof value !== "object") return value;
@@ -1422,14 +1559,35 @@ function compactV1Row(value) {
   );
 }
 
+// What the edge cache holds under `key`, as text, or null. A read that fails
+// is a miss: the layer behind it still answers.
+/**
+ * @param {Cache} cache
+ * @param {Request} key
+ * @returns {Promise<string|null>}
+ */
+async function cachedText(cache, key) {
+  const found = await cache.match(key).catch(() => null);
+  return found ? await found.text().catch(() => null) : null;
+}
+
 // KV keys are hashes rather than raw URLs: a batch of PURLs can exceed KV's
 // 512-byte key limit, while the lookup path remains the single source of truth
 // for both Cache API and KV key identity.
+/**
+ * @param {string} path
+ * @returns {Promise<string>}
+ */
 async function kvKey(path) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(path));
-  return `v1:${[...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+  return `v1:${[...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
+/**
+ * @param {Record<string, unknown>} env
+ * @param {string} path
+ * @returns {Promise<string|null>} never rejects
+ */
 async function kvGet(env, path) {
   const kv = env && env.BEAMLINE_KV;
   if (!kv || typeof kv.get !== "function") return null;
@@ -1441,6 +1599,11 @@ async function kvGet(env, path) {
   }
 }
 
+/**
+ * @param {Record<string, unknown>} env
+ * @param {string} path
+ * @returns {Promise<boolean>} whether the delete went through; never rejects
+ */
 async function kvDelete(env, path) {
   const kv = env && env.BEAMLINE_KV;
   if (!kv || typeof kv.delete !== "function") return false;
@@ -1456,6 +1619,12 @@ async function kvDelete(env, path) {
 // Nothing is written without an expiry. `unanalyzed` keeps the short clock it has
 // at the edge, because it stops being true the moment anything analyzes the
 // artifact; a verdict keeps the long one.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {string} path
+ * @param {string} body
+ * @returns {Promise<void>}
+ */
 async function kvPut(env, path, body) {
   const kv = env && env.BEAMLINE_KV;
   if (!kv || typeof kv.put !== "function") return;
@@ -1477,6 +1646,10 @@ async function kvPut(env, path, body) {
 // has analyzed is never analyzed — the caller is told `block` and the gap the
 // derived level exists to paper over stays open forever. An engine is what
 // separates a measurement from a citation, so that is what is checked.
+/**
+ * @param {string} body
+ * @returns {object|null} the row when it is an engine's verdict
+ */
 function v1CachedVerdict(body) {
   const row = parseJson(body);
   if (!row || typeof row !== "object" || Array.isArray(row)) return null;
@@ -1485,6 +1658,10 @@ function v1CachedVerdict(body) {
   return row;
 }
 
+/**
+ * @param {unknown} row
+ * @returns {boolean}
+ */
 function isFullEnvelope(row) {
   return !!row && typeof row === "object" && !Array.isArray(row)
     && !!row.ml && typeof row.ml === "object" && !Array.isArray(row.ml)
@@ -1492,14 +1669,32 @@ function isFullEnvelope(row) {
     && !!row.raw && typeof row.raw === "object" && !Array.isArray(row.raw);
 }
 
+/**
+ * @param {string|null} body
+ * @param {boolean} [full=false]
+ * @returns {object|null} the answer /v1/analyze may serve, or null
+ */
 function v1CachedAnalyzeAnswer(body, full = false) {
   if (!full) return v1CachedVerdict(body);
   const row = parseJson(body);
   return isFullEnvelope(row) ? row : null;
 }
 
-// How long this answer may be cached. A body carrying any `unavailable` is not
-// cacheable at all; anything no engine produced is cacheable only briefly.
+// One row saying the fleet could not find out, in either spelling scan has
+// used for it. Named once because two readers ask it — a body carrying one is
+// not an answer to relay and not an answer to cache — and a predicate spelled
+// out twice is a predicate that eventually says two things.
+/**
+ * @param {unknown} row
+ * @returns {boolean}
+ */
+function isOutage(row) {
+  return row?.status === "unavailable" || row?.decision === "unavailable";
+}
+
+// How long this document may be held, in seconds. A body carrying any
+// `unavailable` is not cacheable at all; anything no engine produced is
+// cacheable only briefly.
 //
 // One marker, because it is one question. A verdict is immutable for the engine
 // that produced it, and everything else here is not: `unanalyzed` stops being true
@@ -1510,28 +1705,16 @@ function v1CachedAnalyzeAnswer(body, full = false) {
 //
 // A pre-engine_version verdict lands in the short bucket too. That costs a
 // little more traffic and is never wrong, which is the right side to err on.
-// Whether a 200 body is an outage rather than an answer. Same shapes
-// `v1MaxAge` reads, for the same reason: one locator or several, and any one
-// of them unreachable makes the whole reply one this service should not rest
-// on - to cache, or to stop asking on.
-function v1OutageBody(body) {
-  return rowsIn(body).some(isOutage);
-}
-
-// One row saying the fleet could not find out, in either spelling scan has
-// used for it. Named once because two readers ask it — a body carrying one is
-// not an answer to relay and not an answer to cache — and a predicate spelled
-// out twice is a predicate that eventually says two things.
-function isOutage(row) {
-  return row?.status === "unavailable" || row?.decision === "unavailable";
-}
-
-// How long this document may be held, in seconds.
 //
 // `env` is read for the verdict age only. The short ages are policy about what
 // the document *is* — an absence goes stale the moment anything analyzes the
 // artifact, an outage describes only this moment — and neither is a deployment
 // choice. How long a settled verdict is worth keeping is.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {string} body
+ * @returns {number} seconds; 0 means do not cache
+ */
 function v1MaxAge(env, body) {
   const rows = rowsIn(body);
   if (rows.some(isOutage)) return 0;
@@ -1539,6 +1722,10 @@ function v1MaxAge(env, body) {
   return numEnv(env, "VERDICT_MAX_AGE", V1_VERDICT_MAX_AGE);
 }
 
+/**
+ * @param {string|null} source - X-Scan-Source, or a layer of ours
+ * @returns {string} a name CACHE_LAYERS knows
+ */
 function beamlineSource(source) {
   switch (source) {
     case "cache":
@@ -1595,12 +1782,26 @@ const CACHE_LAYERS = new Map([
 // Set together, always, because they are one fact. Three routes used to set the
 // source by hand and a fourth derived it, which is how a header ends up present
 // on the paths nobody graphs and missing on the ones they do.
+/**
+ * @param {Headers} headers - set in place
+ * @param {string} source
+ * @returns {void}
+ */
 function setSource(headers, source) {
   headers.set("X-Beamline-Source", source);
   const layer = CACHE_LAYERS.get(source);
   if (layer !== undefined) headers.set("X-Cache-Layer", String(layer));
 }
 
+/**
+ * @param {Record<string, unknown>} env
+ * @param {string} body
+ * @param {number} status
+ * @param {string|null} worker - the host that answered, if any
+ * @param {number} maxAge - seconds; 0 is no-store
+ * @param {string|null} [source]
+ * @returns {Response}
+ */
 function v1Body(env, body, status, worker, maxAge, source) {
   const headers = new Headers({
     "content-type": "application/json",
@@ -1611,6 +1812,12 @@ function v1Body(env, body, status, worker, maxAge, source) {
   return new Response(body, { status, headers });
 }
 
+/**
+ * @param {number} status
+ * @param {string} code
+ * @param {string} message
+ * @returns {Response}
+ */
 function v1Error(status, code, message) {
   return new Response(JSON.stringify({ error: { code, message } }), {
     status,
@@ -1635,22 +1842,17 @@ function v1Error(status, code, message) {
 // that was just dropped. So each document is read before it is deleted, the
 // locators inside it are queued, and the walk continues until nothing new
 // turns up. Bounded, because the graph is caller-influenced.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {URL} url
+ * @returns {Promise<Response>}
+ */
 async function handleV1Flush(env, ctx, url) {
-  const purl = normalizePurl(url.searchParams.get("purl"));
-  const artifactUrl = (url.searchParams.get("url") || "").trim();
-  const sha256 = (url.searchParams.get("sha256") || "").trim().toLowerCase();
-  const named = Number(Boolean(purl)) + Number(Boolean(artifactUrl)) + Number(Boolean(sha256));
-  if (named > 1) {
-    return v1Error(400, "multiple_locators", "Use ?purl=, ?url=, or ?sha256=, not more than one.");
-  }
-  if (!named) {
+  const named = oneLocator(url);
+  if (named.error) return named.error;
+  if (!named.locator) {
     return v1Error(400, "missing_package", "Name an artifact with ?purl=, ?url=, or ?sha256=.");
-  }
-  if (sha256 && !SHA_RE.test(sha256)) {
-    return v1Error(400, "invalid_sha256", "sha256 must be 64 hexadecimal characters.");
-  }
-  if (artifactUrl && !validArtifactUrl(artifactUrl)) {
-    return v1Error(400, "invalid_url", "url must be an absolute http or https URL.");
   }
 
   const cache = await getCache(env);
@@ -1666,13 +1868,7 @@ async function handleV1Flush(env, ctx, url) {
   // parent is read — but breadth is not: siblings are independent keys, and
   // draining them one at a time would make a flush as many round trips deep as
   // the artifact has spellings.
-  let frontier = [
-    purl
-      ? { type: "purl", value: purl }
-      : artifactUrl
-        ? { type: "url", value: artifactUrl }
-        : { type: "sha256", value: sha256 },
-  ];
+  let frontier = [named.locator];
   while (frontier.length && seen.size < V1_FLUSH_MAX_LOCATORS) {
     const wave = [];
     for (const locator of frontier) {
@@ -1716,6 +1912,33 @@ async function handleV1Flush(env, ctx, url) {
   return json({ status: "flushed", caches, locators, keys_examined: examined, keys_dropped: dropped }, 200);
 }
 
+// The one artifact a request names by ?purl=, ?url= or ?sha256=, null when it
+// names none, or the 400 saying why it cannot be read. /v1/analyze and
+// /v1/flush take a single locator under the same rules, so the rules are
+// written once.
+/**
+ * @param {URL} url
+ * @returns {{locator: Locator|null, error?: undefined}|{error: Response}}
+ */
+function oneLocator(url) {
+  const purl = normalizePurl(url.searchParams.get("purl"));
+  const artifactUrl = (url.searchParams.get("url") || "").trim();
+  const sha256 = (url.searchParams.get("sha256") || "").trim().toLowerCase();
+  if (Number(Boolean(purl)) + Number(Boolean(artifactUrl)) + Number(Boolean(sha256)) > 1) {
+    return { error: v1Error(400, "multiple_locators", "Use ?purl=, ?url=, or ?sha256=, not more than one.") };
+  }
+  if (sha256 && !SHA_RE.test(sha256)) {
+    return { error: v1Error(400, "invalid_sha256", "sha256 must be 64 hexadecimal characters.") };
+  }
+  if (artifactUrl && !validArtifactUrl(artifactUrl)) {
+    return { error: v1Error(400, "invalid_url", "url must be an absolute http or https URL with no credentials in it.") };
+  }
+  if (purl) return { locator: { type: "purl", value: purl } };
+  if (artifactUrl) return { locator: { type: "url", value: artifactUrl } };
+  if (sha256) return { locator: { type: "sha256", value: sha256 } };
+  return { locator: null };
+}
+
 // Every data center, not just this one.
 //
 // cache.delete() removes an entry from the colo that ran the flush and from
@@ -1729,6 +1952,12 @@ async function handleV1Flush(env, ctx, url) {
 // Unconfigured is not a failure. `node local.js` has no edge cache to purge,
 // and a deployment without the secrets is exactly as flushed as it was before
 // this existed. The caller can see which it got.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string[]} urls - cache keys to purge in every data center
+ * @returns {Promise<"ok"|"failed"|"unconfigured">}
+ */
 async function purgeZone(env, ctx, urls) {
   const zone = (env.CF_ZONE_ID || "").trim();
   const token = (env.CF_PURGE_TOKEN || "").trim();
@@ -1821,8 +2050,7 @@ async function dropLocator(env, cache, origin, locator) {
  */
 async function dropKey(env, cache, origin, path) {
   const request = new Request(`${origin}${path}`);
-  const [hit, stored] = await Promise.all([cache.match(request).catch(() => null), kvGet(env, path)]);
-  const cached = hit ? await hit.text().catch(() => null) : null;
+  const [cached, stored] = await Promise.all([cachedText(cache, request), kvGet(env, path)]);
   await Promise.all([
     typeof cache.delete === "function" ? cache.delete(request).catch(() => false) : false,
     kvDelete(env, path),
@@ -1863,36 +2091,27 @@ function locatorsIn(body) {
 // long enough to refuse — `429 At capacity` arrives before any body — so a
 // refusal is still something to route around rather than a decision already
 // half-delivered.
+/**
+ * @param {Request} request
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {URL} url
+ * @returns {Promise<Response>}
+ */
 async function handleV1Analyze(request, env, ctx, url) {
-  const purl = normalizePurl(url.searchParams.get("purl"));
-  const artifactUrl = (url.searchParams.get("url") || "").trim();
-  const sha256 = (url.searchParams.get("sha256") || "").trim().toLowerCase();
   const budgetRaw = url.searchParams.get("false_positive_budget");
   const budget = parseFalsePositiveBudget(budgetRaw);
   const full = url.searchParams.get("full") === "1";
-  const locatorCount = Number(Boolean(purl)) + Number(Boolean(artifactUrl)) + Number(Boolean(sha256));
-  if (locatorCount > 1) {
-    return v1Error(400, "multiple_locators", "Use ?purl=, ?url=, or ?sha256=, not more than one.");
-  }
-  if (sha256 && !SHA_RE.test(sha256)) {
-    return v1Error(400, "invalid_sha256", "sha256 must be 64 hexadecimal characters.");
-  }
-  if (sha256 && !ctx.refresh) {
+  const named = oneLocator(url);
+  if (named.error) return named.error;
+  const { locator } = named;
+  const bySha = locator?.type === "sha256";
+  if (bySha && !ctx.refresh) {
     return v1Error(400, "refresh_required", "?sha256= on /v1/analyze requires refresh=1.");
   }
-  if (ctx.refresh && !sha256) {
+  if (ctx.refresh && !bySha) {
     return v1Error(400, "missing_sha256", "refresh=1 requires ?sha256=.");
   }
-  if (artifactUrl && !validArtifactUrl(artifactUrl)) {
-    return v1Error(400, "invalid_url", "url must be an absolute http or https URL.");
-  }
-  const locator = purl
-    ? { type: "purl", value: purl }
-    : artifactUrl
-      ? { type: "url", value: artifactUrl }
-      : sha256
-        ? { type: "sha256", value: sha256 }
-        : null;
   // Locators name a stored artifact, and the artifact itself is another way
   // in. A caller holding bytes nobody has published — a build output, a file off
   // disk, something pulled from a mirror — has nothing to locate them by, and
@@ -1908,11 +2127,11 @@ async function handleV1Analyze(request, env, ctx, url) {
     const max = numEnv(env, "MAX_BYTES", V1_MAX_UPLOAD_BYTES);
     let buffered;
     try {
-      buffered = await request.arrayBuffer();
+      buffered = await readBounded(request, max);
     } catch {
       return v1Error(400, "invalid_body", "Could not read the artifact from the request body.");
     }
-    if (buffered.byteLength > max) {
+    if (!buffered) {
       return v1Error(413, "artifact_too_large", `The artifact exceeds the ${max} byte limit.`);
     }
     if (buffered.byteLength > 0) bytes = buffered;
@@ -1982,10 +2201,7 @@ async function handleV1Analyze(request, env, ctx, url) {
     // us off to spend an analysis slot on a verdict a wider entry is already
     // holding.
     let hit = await fullestAnswer(follow.value, candidates, async (policy) => {
-      const found = await cache
-        .match(new Request(`${url.origin}${v1CachePath(null, [locator], policy, full)}`))
-        .catch(() => null);
-      const text = found ? await found.text().catch(() => null) : null;
+      const text = await cachedText(cache, new Request(`${url.origin}${v1CachePath(null, [locator], policy, full)}`));
       return text ? { document: text, fromCache: true } : null;
     });
     if (!hit) {
@@ -2053,6 +2269,7 @@ async function handleV1Analyze(request, env, ctx, url) {
   // progress rather than starting another beside it, so a caller who
   // reconnected belongs back on that worker — anywhere else pays for the whole
   // analysis a second time.
+  //
   // Three round trips that do not depend on each other, taken together: who
   // is already running this package, what it weighs, and how the fleet looks
   // right now. In sequence they cost a worker round trip apiece; measured
@@ -2081,15 +2298,6 @@ async function handleV1Analyze(request, env, ctx, url) {
   // against the same clock the analysis itself is promised, and a broken one
   // keeps the short budget.
   const busyDeadline = t0 + numEnv(env, "SCAN_TIMEOUT_MS", DEFAULT_SCAN_TIMEOUT_MS) * BUSY_BUDGET_SHARE;
-  // A pass that never reached a verdict is worth making again: a 5xx, a 429 at
-  // capacity, an edge timeout at 120s, a dropped connection — none of those are
-  // answers, and a moment later they may not hold. A rejection is an answer
-  // (bad bytes, unsupported type), and v1Dispatch returns those rather than
-  // null, so repeating one never burns a slot.
-  //
-  // Retrying is safe because scan de-duplicates by sha and purl across isolates:
-  // a retry joins the analysis already running rather than starting a second one,
-  // which is what makes retrying an edge timeout worth doing at all.
   // Everything a pass needs, settled once. Each attempt asks the same question
   // of a different worker, so the only thing that changes between them is the
   // tally it fills in.
@@ -2108,6 +2316,15 @@ async function handleV1Analyze(request, env, ctx, url) {
     // an upload has no locator to file one against.
     cacheFollow: locator && !bytes ? follow.value : null,
   };
+  // A pass that never reached a verdict is worth making again: a 5xx, a 429 at
+  // capacity, an edge timeout at 120s, a dropped connection — none of those are
+  // answers, and a moment later they may not hold. A rejection is an answer
+  // (bad bytes, unsupported type), and v1Dispatch returns those rather than
+  // null, so repeating one never burns a slot.
+  //
+  // Retrying is safe because scan de-duplicates by sha and purl across isolates:
+  // a retry joins the analysis already running rather than starting a second one,
+  // which is what makes retrying an edge timeout worth doing at all.
   let last = null;
   for (let attempt = 0; ; attempt++) {
     const pass = { busy: 0, broken: 0 };
@@ -2125,7 +2342,17 @@ async function handleV1Analyze(request, env, ctx, url) {
   // /v1/lookup gives one: the caller asked about a package, and "we could not
   // find out" is an answer about it that their policy may treat differently
   // from "nobody has analyzed this".
-  const cause = v1UnavailableCause(env, ctx, last);
+  //
+  // Which failure it was, in the terms a caller's retry policy needs. The
+  // tallies were already kept to decide whether another pass was worth making;
+  // this only stops them being thrown away once it is not.
+  const cause = !scanWorkers(env, ctx.pin).length
+    ? "no_workers"
+    : !last?.busy
+      ? "unreachable"
+      : last.broken
+        ? "mixed"
+        : "saturated";
   logLine("v1_analyze", { src: "none", status: 200, unavailable: true, cause, ms: Date.now() - t0, ...ids });
   return new Response(`${JSON.stringify(v1Unavailable(null, locator, cause))}\n`, {
     status: 200,
@@ -2133,13 +2360,42 @@ async function handleV1Analyze(request, env, ctx, url) {
   });
 }
 
-// Which failure the fleet just had, in the terms a caller's retry policy needs.
-// The tallies are already kept to decide whether another pass is worth making;
-// this only stops them being thrown away once it is not.
-function v1UnavailableCause(env, ctx, pass) {
-  if (!scanWorkers(env, ctx.pin).length) return "no_workers";
-  if (!pass || !pass.busy) return "unreachable";
-  return pass.broken ? "mixed" : "saturated";
+// A request body, or null when it is larger than `max`.
+//
+// Checked as it arrives rather than after it is held. Reading the whole body
+// first and measuring it afterwards let any caller make an isolate buffer as
+// much as the platform would carry — far past the limit, and past the memory
+// the isolate has — before being told no. A declared length over the limit is
+// refused without reading at all; an undeclared or understated one is cut off
+// at the first chunk that crosses it.
+/**
+ * @param {Request} request
+ * @param {number} max - bytes
+ * @returns {Promise<ArrayBuffer|null>} null when the body exceeds `max`
+ */
+async function readBounded(request, max) {
+  const declared = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > max) return null;
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return out.buffer;
 }
 
 // One pass over the fleet. Returns the response, or null when every worker
@@ -2414,6 +2670,17 @@ async function v1Resume(env, ctx, job, tried) {
 // Store a completed stream's decision where the cheap route will find it.
 // This function starts only after the decision arrives, so waitUntil covers
 // bounded cache writes rather than the analysis that produced them.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string} origin
+ * @param {Locator|null} locator
+ * @param {string} decided - the terminal frame, as scan sent it
+ * @param {string} follow - the policy that produced it
+ * @param {string|null} canonicalPurl
+ * @param {boolean} [full=false]
+ * @returns {Promise<void>}
+ */
 async function cacheV1Decision(env, ctx, origin, locator, decided, follow, canonicalPurl, full = false) {
   const ids = v1LocatorIds(ctx.rid, null, locator ? [locator] : []);
   const document = v1DocumentBody(decided, full);
@@ -2439,9 +2706,10 @@ async function cacheV1Decision(env, ctx, origin, locator, decided, follow, canon
 // frames without asking every scan version to learn a new wire format first.
 //
 // `resume` makes the stream survive losing its worker. It carries the base URL
-// currently serving it, how long silence may last before that worker is taken
-// for gone, how many handovers are allowed, and a callback that produces a
-// replacement body. Omitted, the stream behaves as it always did.
+// the stream starts on (read, never written), how long silence may last
+// before that worker is taken for gone, how many handovers are allowed, and a
+// callback that produces a replacement body. Omitted, the stream behaves as it
+// always did.
 /**
  * @param {ReadableStream} stream - the worker's NDJSON
  * @param {number} budget - false_positive_budget, applied to each decision
@@ -2473,6 +2741,10 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   // first: two workers refusing in turn used to bounce the request between
   // them while a third with room was never asked.
   const tried = new Set();
+  // The worker serving the stream now. Starts as the one dispatched to and moves
+  // with each handover; kept here rather than written back into `resume`, which
+  // belongs to the caller.
+  let serving = resume?.base ?? null;
   // A read that outlived its stall timer. Kept, not dropped: when the stream
   // is read on rather than handed over, the frame it delivers still counts.
   let inflight = null;
@@ -2492,12 +2764,12 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
       decisionSeen = true;
       // The worker finished what it took on. Charged to whoever is serving the
       // stream now, which after a handover is not who started it.
-      if (resume) breakerFor(resume.base).ok();
+      if (serving) breakerFor(serving).ok();
       // How long the caller waited for an answer, as against the headers this
       // response opened with minutes ago. Telemetry must never take a stream
       // down with it, so it is guarded like the logging around it.
       try {
-        meta.settled?.({ finisher: resume ? hostOf(resume.base) : null, orphaned: abandoned });
+        meta.settled?.({ finisher: serving ? hostOf(serving) : null, orphaned: abandoned });
       } catch (err) {
         logLine("v1_analyze_verdict", { recorded: false, err: errText(err), ...meta.ids });
       }
@@ -2566,7 +2838,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     // it failed every caller. A refusal is the exception: the worker answered
     // promptly and correctly that it had no room for this one.
     // A stalled stream is still talking, so its worker is alive too.
-    if (why !== "refused" && why !== "stalled") breakerFor(resume.base).fail();
+    if (why !== "refused" && why !== "stalled") breakerFor(serving).fail();
     // Refusals have their own budget. One costs milliseconds and says nothing
     // about the request, and three of them spending the handovers left an
     // 11-minute analysis on the fourth worker to be cut at its first stall.
@@ -2574,7 +2846,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     const limit = why === "refused" ? MAX_STREAM_REFUSALS : resume.limit;
     const spent = used >= limit;
     logLine("v1_analyze_stream", {
-      worker: hostOf(resume.base),
+      worker: hostOf(serving),
       why,
       handover: spent ? undefined : used + 1,
       exhausted: spent || undefined,
@@ -2583,7 +2855,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     if (spent) return false;
     if (why === "refused") refusals += 1;
     else handovers += 1;
-    tried.add(resume.base);
+    tried.add(serving);
     try {
       await reader.cancel();
     } catch {
@@ -2593,7 +2865,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     if (!next) return false;
     reader = next.body.getReader();
     inflight = null;
-    resume.base = next.base;
+    serving = next.base;
     // The dead worker's trailing bytes are half a frame, not a frame, and its
     // clock is not the replacement's.
     decoder = new TextDecoder();
@@ -2693,7 +2965,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
           // after another stall interval.
           if (why === "stalled" && (!resume || handovers >= resume.limit)) {
             phase.changedAt = Date.now();
-            logLine("v1_analyze_stream", { worker: resume ? hostOf(resume.base) : undefined, why, kept: true, ...meta.ids });
+            logLine("v1_analyze_stream", { worker: serving ? hostOf(serving) : undefined, why, kept: true, ...meta.ids });
             continue;
           }
           if (await handover(why)) continue;
@@ -2855,6 +3127,12 @@ function phaseCompletion(meta, phase, elapsed = phase.lastElapsed) {
   return frame;
 }
 
+/**
+ * @param {string} line
+ * @param {number} budget
+ * @param {Locator|null} locator
+ * @returns {string}
+ */
 function budgetedV1Line(line, budget, locator) {
   if (!line.includes('"decision"')) return line;
   const body = v1BudgetedBody(line, budget, locator);
@@ -2888,7 +3166,7 @@ async function runningWorker(env, ctx, input, ids) {
   if (!workers.length || !keys.length) return null;
   const path = `/status?${keys.join("&")}`;
   const asked = await Promise.all(workers.map((base) => statusAsk(env, ctx, path, base)));
-  const busy = asked.find((a) => a?.state === "running");
+  const busy = asked.find((answer) => answer?.state === "running");
   if (busy) {
     logLine("scan_affinity", { worker: busy.worker, elapsed_ms: busy.elapsed_ms, ...ids });
   }
@@ -3138,6 +3416,11 @@ function starvedEstimate(own, fleetEsts) {
   return Math.min(own, known[Math.floor(known.length / 2)]);
 }
 
+/**
+ * @param {string} base
+ * @param {number} now
+ * @returns {number} milliseconds since this isolate last dispatched to `base`
+ */
 function dispatchAge(base, now) {
   return now - (lastDispatch.get(base) ?? isolateBorn);
 }
@@ -3152,6 +3435,11 @@ const statsCache = new Map();
 // `pendingSince` for the occupancy term; see `occupancy`.
 const dispatchLog = new Map();
 
+/**
+ * @param {string} base
+ * @param {number} [now=Date.now()]
+ * @returns {void}
+ */
 function noteDispatch(base, now = Date.now()) {
   const log = dispatchLog.get(base) ?? [];
   log.push(now);
@@ -3178,7 +3466,7 @@ function noteDispatch(base, now = Date.now()) {
 function pendingSince(base, at, now = Date.now()) {
   const log = dispatchLog.get(base);
   if (!log || at == null) return 0;
-  return log.filter((t) => t >= at && now - t <= STATS_TTL_MS).length;
+  return log.filter((sentAt) => sentAt >= at && now - sentAt <= STATS_TTL_MS).length;
 }
 
 // The size of a package, from its registry, before any worker is asked. pypi
@@ -3231,6 +3519,12 @@ function purlNameVersion(purl) {
   }
 }
 
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string} purl
+ * @returns {Promise<number|null>} bytes, or null where the registry will not say
+ */
 async function registrySizeOf(env, ctx, purl) {
   const parts = purlNameVersion(purl);
   if (!parts) return null;
@@ -3246,13 +3540,21 @@ async function registrySizeOf(env, ctx, purl) {
     );
     // The largest file of the release: which one the worker fetches is its
     // decision, and the routing question is only whether this is a whale.
-    const sizes = (doc?.urls || []).map((u) => Number(u?.size)).filter((n) => Number.isFinite(n) && n > 0);
+    const sizes = (doc?.urls || []).map((file) => Number(file?.size)).filter((size) => Number.isFinite(size) && size > 0);
     return sizes.length ? Math.max(...sizes) : null;
   }
   if (parts.type === "npm") {
     const base = (env.NPM_REGISTRY_URL || "https://registry.npmjs.org").replace(/\/$/, "");
+    // The name is the caller's text, decoded, and is about to become a path.
+    // Only the two shapes npm allows get that far — `name` and `@scope/name` —
+    // and each segment is encoded, so a `..`, a `?` or a `#` cannot walk the
+    // request somewhere on the registry the caller chose instead.
+    const segments = parts.name.split("/");
+    const shaped = segments.length === 1 || (segments.length === 2 && segments[0].startsWith("@"));
+    if (!shaped || segments.some((segment) => !segment || segment === "." || segment === ".." || segment === "@")) return null;
+    const name = segments.map((segment) => encodeURIComponent(segment).replace(/^%40/, "@")).join("/");
     const doc = await fetchTimeout(
-      `${base}/${parts.name}/${encodeURIComponent(parts.version)}`,
+      `${base}/${name}/${encodeURIComponent(parts.version)}`,
       { headers: { accept: "application/json" } },
       SIZE_LOOKUP_MS,
       ctx,
@@ -3260,6 +3562,11 @@ async function registrySizeOf(env, ctx, purl) {
     );
     const tarball = doc?.dist?.tarball;
     if (typeof tarball !== "string" || !tarball) return null;
+    // A publisher writes this field, so it is an address somebody else chose.
+    // Followed only back to the registry it came from: a size hint is not worth
+    // letting a package aim this Worker at an arbitrary host. One that does not
+    // parse throws, and registrySize files that as no hint.
+    if (new URL(tarball).origin !== new URL(base).origin) return null;
     // The packument's `unpackedSize` is the tree, not the tarball the worker
     // downloads; a HEAD on the tarball is the number the worker's lanes use.
     const length = await fetchTimeout(tarball, { method: "HEAD" }, SIZE_LOOKUP_MS, ctx, async (resp) => {
@@ -3286,12 +3593,20 @@ const PURL_TYPES = new Set(["cargo", "golang", "npm", "pypi"]);
 
 // The type between `pkg:` and the first `/`, or "other" — matching how scan
 // buckets it, so the two agree on which average is being read.
+/**
+ * @param {string} purl
+ * @returns {string}
+ */
 function purlType(purl) {
   const rest = String(purl || "").replace(/^pkg:/i, "");
   const ty = rest.split("/")[0].toLowerCase();
   return PURL_TYPES.has(ty) ? ty : "other";
 }
 
+/**
+ * @param {number} bytes
+ * @returns {string} one of SIZE_BUCKETS' names
+ */
 function sizeBucket(bytes) {
   for (const [name, bound] of SIZE_BUCKETS) {
     if (bytes <= bound) return name;
@@ -3451,18 +3766,6 @@ function lookupMsOf(stats) {
   return stats.avg_lookup_ms ?? null;
 }
 
-// Whether this worker's lookup estimate rests on enough samples to be trusted
-// for tie-breaking, as opposed to merely being the best number available.
-/**
- * @param {ScanStats|null} stats
- * @returns {boolean}
- */
-function lookupIsSettled(stats) {
-  if (!stats) return false;
-  if (recentMs(stats.recent_lookup) != null) return true;
-  return stats.lookup_samples != null && stats.lookup_samples >= MIN_CLASS_SAMPLES;
-}
-
 /**
  * @param {ScanStats} stats
  * @param {Hint|null} hint
@@ -3514,7 +3817,11 @@ function bucketMs(bucket) {
   if (!bucket) return null;
   const windowed = recentMs(bucket.recent);
   if (windowed != null) return windowed;
-  return emptyWindow(bucket.recent) ? null : meanMs(bucket);
+  // The lifetime mean, for a worker that has not been upgraded to publish a
+  // window yet. Same sample floor: one job is a story, not a statistic.
+  if (emptyWindow(bucket.recent) || bucket.avg_ms == null) return null;
+  if (bucket.jobs != null && bucket.jobs < MIN_CLASS_SAMPLES) return null;
+  return bucket.avg_ms;
 }
 
 // A worker that publishes a window and has nothing in it — distinct from one
@@ -3559,18 +3866,6 @@ function recentMs(recent) {
   if (!recent || recent.p80_ms == null) return null;
   if (recent.samples != null && recent.samples < MIN_CLASS_SAMPLES) return null;
   return recent.p80_ms;
-}
-
-// The lifetime mean, for a worker that has not been upgraded to publish a
-// window yet. Same sample floor: one job is a story, not a statistic.
-/**
- * @param {Bucket|null|undefined} bucket
- * @returns {number|null}
- */
-function meanMs(bucket) {
-  if (!bucket || bucket.avg_ms == null) return null;
-  if (bucket.jobs != null && bucket.jobs < MIN_CLASS_SAMPLES) return null;
-  return bucket.avg_ms;
 }
 
 // The worker's blended average, if it rests on enough completions to mean
@@ -3630,8 +3925,8 @@ function mixedMs(stats, mix) {
 function jobMix(all) {
   const mix = new Map();
   for (const stats of all) {
-    for (const [name, b] of Object.entries(stats?.avg_job_ms_by_size || {})) {
-      if (b?.avg_ms != null && b.jobs) mix.set(name, (mix.get(name) || 0) + b.jobs);
+    for (const [name, bucket] of Object.entries(stats?.avg_job_ms_by_size || {})) {
+      if (bucket?.avg_ms != null && bucket.jobs) mix.set(name, (mix.get(name) || 0) + bucket.jobs);
     }
   }
   return mix.size ? mix : null;
@@ -3653,7 +3948,11 @@ function jobMix(all) {
  */
 function hasHistory(stats, hint, mix) {
   if (!stats) return false;
-  if (hint?.lookup) return lookupIsSettled(stats);
+  // A lookup estimate is trusted for tie-breaking only once it rests on enough
+  // samples, as opposed to merely being the best number available.
+  if (hint?.lookup) {
+    return recentMs(stats.recent_lookup) != null || (stats.lookup_samples != null && stats.lookup_samples >= MIN_CLASS_SAMPLES);
+  }
   if (classMs(stats, hint) != null) return true;
   if (hint == null && mixedMs(stats, mix) != null) return true;
   return blendedMs(stats) != null;
@@ -3730,12 +4029,21 @@ function capability(stats, sizeHint, upload = false) {
 // is the one thing here that was already working.
 const TIE_CEILING_MS = 250;
 const TIE_FRACTION = 0.25;
-function tiedEst(a, b) {
-  return Math.abs(a - b) < Math.min(TIE_CEILING_MS, TIE_FRACTION * Math.min(a, b));
+/**
+ * @param {number} left - milliseconds
+ * @param {number} right - milliseconds
+ * @returns {boolean}
+ */
+function tiedEst(left, right) {
+  return Math.abs(left - right) < Math.min(TIE_CEILING_MS, TIE_FRACTION * Math.min(left, right));
 }
 
 // The stats we already hold for a worker, or undefined when we would have to
 // go and ask. Distinct from null, which means we asked and it did not answer.
+/**
+ * @param {string} base
+ * @returns {ScanStats|null|undefined} undefined when the reading is missing or stale
+ */
 function cachedStats(base) {
   const hit = statsCache.get(base);
   return hit && Date.now() - hit.at < STATS_TTL_MS ? hit.stats : undefined;
@@ -3744,6 +4052,10 @@ function cachedStats(base) {
 // Round-robin start, per isolate. Used only when there is nothing measured to
 // rank on; the point is merely never to start at the same worker every time.
 let lookupTurn = 0;
+/**
+ * @param {string[]} workers
+ * @returns {string[]} a rotated copy
+ */
 function rotate(workers) {
   const start = lookupTurn++ % workers.length;
   return [...workers.slice(start), ...workers.slice(0, start)];
@@ -3785,12 +4097,12 @@ function rotate(workers) {
  */
 function byEst(ranked) {
   return [...ranked]
-    .sort((x, y) => {
-      if (!tiedEst(x.est, y.est)) return x.est - y.est;
-      if (x.known && y.known) return x.r - y.r;
-      return x.i - y.i;
+    .sort((a, b) => {
+      if (!tiedEst(a.est, b.est)) return a.est - b.est;
+      if (a.known && b.known) return a.r - b.r;
+      return a.i - b.i;
     })
-    .map((w) => w.base);
+    .map((worker) => worker.base);
 }
 
 // Measured for /analyze too, 20 analyses per arm at 40-way concurrency, which
@@ -3875,7 +4187,7 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
   );
   // One shared yardstick for the whole fleet, so it has to be built from every
   // worker's history before any single worker can be scored against it.
-  const mix = jobMix(polled.map((w) => w.stats));
+  const mix = jobMix(polled.map((worker) => worker.stats));
   const scored = polled.map(({ base, i, stats }) => ({
     base,
     stats,
@@ -3895,7 +4207,7 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
   // stops applying the moment it is being used again.
   if (probe) {
     const now = Date.now();
-    const known = scored.filter((w) => w.stats != null && w.known).map((w) => w.est).sort((a, b) => a - b);
+    const known = scored.filter((worker) => worker.stats != null && worker.known).map((worker) => worker.est).sort((a, b) => a - b);
     if (known.length > 1) {
       for (const candidate of scored) {
         if (candidate.stats == null || dispatchAge(candidate.base, now) < STARVE_PROBE_MS) continue;
@@ -3907,7 +4219,7 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
       }
     }
   }
-  const usable = scored.filter((w) => w.why == null);
+  const usable = scored.filter((worker) => worker.why == null);
   // Everything filtered out means the filter is wrong, or the fleet is. Either
   // way, refusing to dispatch is worse than dispatching on stale information.
   const pool = usable.length ? usable : scored;
@@ -3953,10 +4265,10 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
       probed = hostOf(starving.base);
     }
   }
-  const starved = scored.filter((w) => w.starved).map((w) => hostOf(w.base));
+  const starved = scored.filter((worker) => worker.starved).map((worker) => hostOf(worker.base));
   return {
     pool,
-    excluded: usable.length ? scored.filter((w) => w.why != null) : [],
+    excluded: usable.length ? scored.filter((worker) => worker.why != null) : [],
     informed: pool[0].known,
     probed,
     starved: starved.length ? starved.join(",") : undefined,
@@ -3974,8 +4286,8 @@ async function rankPool(env, ctx, workers, hint, probe = false) {
 async function rankWorkers(env, ctx, workers, ids, hint) {
   const ranked = await rankPool(env, ctx, workers, hint, true);
   logLine("scan_route", {
-    order: ranked.pool.map((w) => hostOf(w.base)).join(","),
-    est_ms: ranked.pool.map((w) => Math.round(w.est)).join(","),
+    order: ranked.pool.map((worker) => hostOf(worker.base)).join(","),
+    est_ms: ranked.pool.map((worker) => Math.round(worker.est)).join(","),
     excluded: ranked.excluded.length || undefined,
     informed: ranked.informed || undefined,
     probed: ranked.probed,
@@ -3984,7 +4296,7 @@ async function rankWorkers(env, ctx, workers, ids, hint) {
     type: hint?.purl ? purlType(hint.purl) : undefined,
     ...ids,
   });
-  return ranked.pool.map((w) => w.base);
+  return ranked.pool.map((worker) => worker.base);
 }
 
 // GET /_/routes[?size=<bytes|10mb>] — what the router would do right now.
@@ -3997,6 +4309,12 @@ async function rankWorkers(env, ctx, workers, ids, hint) {
 //
 // Behind the token gate with everything else: this names every worker and its
 // current load.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {URL} url
+ * @returns {Promise<Response>}
+ */
 async function handleRoutes(env, ctx, url) {
   // Three ways to ask, matching the three ways a request arrives: by the PURL
   // itself, by a bare type, or by an upload size. With none of them, answer for
@@ -4005,9 +4323,13 @@ async function handleRoutes(env, ctx, url) {
   const rawSize = (url.searchParams.get("size") || "").trim();
   const rawType = (url.searchParams.get("type") || "").trim();
   const rawPurl = (url.searchParams.get("purl") || "").trim();
-  const size = rawSize && rawSize.toLowerCase() !== "none" ? parseSize(rawSize) : null;
-  if (rawSize && rawSize.toLowerCase() !== "none" && size == null) {
-    return v1Error(400, "invalid_size", `Could not read ${rawSize} as a size.`);
+  // Bytes, or a human size like "10mb".
+  let size = null;
+  if (rawSize && rawSize.toLowerCase() !== "none") {
+    const match = /^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$/i.exec(rawSize);
+    if (!match) return v1Error(400, "invalid_size", `Could not read ${rawSize} as a size.`);
+    const scale = { b: 1, kb: 1 << 10, mb: 1 << 20, gb: 1 << 30 }[(match[2] || "b").toLowerCase()];
+    size = Math.round(Number(match[1]) * scale);
   }
 
   const all = urlList(env.SCAN_URL);
@@ -4026,14 +4348,14 @@ async function handleRoutes(env, ctx, url) {
   else {
     classes = [
       { kind: "lookup", name: "lookup", hint: { lookup: true } },
-      ...["npm", "pypi", "cargo", "golang"].map((t) => ({
+      ...["npm", "pypi", "cargo", "golang"].map((type) => ({
         kind: "purl_type",
-        name: t,
-        hint: { purl: `pkg:${t}/x` },
+        name: type,
+        hint: { purl: `pkg:${type}/x` },
       })),
-      ...SIZE_BUCKETS.map(([n, b]) => {
-        const bytes = b === Infinity ? (128 << 20) + 1 : b;
-        return { kind: "size", name: n, bytes, hint: { bytes } };
+      ...SIZE_BUCKETS.map(([name, bound]) => {
+        const bytes = bound === Infinity ? (128 << 20) + 1 : bound;
+        return { kind: "size", name, bytes, hint: { bytes } };
       }),
     ];
   }
@@ -4053,11 +4375,11 @@ async function handleRoutes(env, ctx, url) {
       // The order a dispatch would try, favourite first. One worker is asked at
       // a time and the next is reached only when the one before it refuses or
       // fails, so this is a queue rather than a set of arms.
-      dispatch: ranked.pool.map((w) => ({
-        worker: hostOf(w.base),
-        est_ms: Math.round(w.est),
+      dispatch: ranked.pool.map((worker) => ({
+        worker: hostOf(worker.base),
+        est_ms: Math.round(worker.est),
       })),
-      excluded: ranked.excluded.map((w) => ({ worker: hostOf(w.base), reason: w.why })),
+      excluded: ranked.excluded.map((worker) => ({ worker: hostOf(worker.base), reason: worker.why })),
     });
   }
 
@@ -4085,16 +4407,14 @@ async function handleRoutes(env, ctx, url) {
   );
 }
 
-// Bytes, or a human size like "10mb". Returns null on anything else.
-function parseSize(raw) {
-  const match = /^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$/i.exec(raw);
-  if (!match) return null;
-  const scale = { b: 1, kb: 1 << 10, mb: 1 << 20, gb: 1 << 30 }[(match[2] || "b").toLowerCase()];
-  const bytes = Number(match[1]) * scale;
-  return Number.isFinite(bytes) && bytes >= 0 ? Math.round(bytes) : null;
-}
 // Exponential with full jitter, capped: a burst of waiters on the same sample
 // spreads out instead of retrying in lockstep.
+/**
+ * @param {number} base - milliseconds
+ * @param {number} attempt - zero-based
+ * @param {number} cap - milliseconds
+ * @returns {number} milliseconds to wait
+ */
 function backoff(base, attempt, cap) {
   const ceiling = Math.min(base * 2 ** Math.min(attempt, 10), cap);
   return ceiling <= base ? base : base + Math.random() * (ceiling - base);
@@ -4103,18 +4423,17 @@ function backoff(base, attempt, cap) {
 // What every outbound request to a scan worker carries. There is one backend,
 // so there is one of these: the indirection this used to have existed for a
 // second credential that no longer has a service behind it.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @returns {Record<string, string>}
+ */
 function scanHeaders(env, ctx) {
   const token = (env.SCAN_TOKEN || "").trim();
   const headers = { "x-request-id": ctx.rid };
   if (token) headers.authorization = `Bearer ${token}`;
   if (ctx.filename) headers["x-filename"] = ctx.filename;
   return headers;
-}
-
-function cleanFilename(raw) {
-  const value = String(raw || "").trim();
-  if (!value || value.length > 255 || /[\r\n]/.test(value)) return null;
-  return value;
 }
 
 // One coordinate, one spelling.
@@ -4136,6 +4455,10 @@ function cleanFilename(raw) {
 // the canonical spelling is also what reaches scan. A caller who writes `PKG:`
 // gets an answer instead of the 400 the raw text used to earn, and the PURL
 // echoed back is the canonical one rather than whatever they typed.
+/**
+ * @param {unknown} raw
+ * @returns {string} the canonical spelling, or "" for nothing
+ */
 function normalizePurl(raw) {
   const value = String(raw || "").trim();
   if (!value) return "";
@@ -4151,6 +4474,10 @@ function normalizePurl(raw) {
 // unspellable one is either a request we cannot make or an entry nothing can
 // read back. Must look like a PURL, so a confused worker cannot file an
 // answer under something that is not a coordinate at all.
+/**
+ * @param {unknown} raw
+ * @returns {string|null}
+ */
 function cleanPurl(raw) {
   const value = String(raw || "").trim();
   if (!value || value.length > 512) return null;
@@ -4158,19 +4485,32 @@ function cleanPurl(raw) {
   return value;
 }
 
+/**
+ * @param {unknown} raw - comma-separated
+ * @returns {string[]}
+ */
 function tokenList(raw) {
   return String(raw || "")
     .split(",")
-    .map((s) => s.trim())
+    .map((item) => item.trim())
     .filter(Boolean);
 }
 
+/**
+ * @param {Ctx|null} ctx
+ * @returns {boolean}
+ */
 function clientAborted(ctx) {
   return !!(ctx && ctx.signal && ctx.signal.aborted);
 }
 
 // Constant-time for equal-length strings: a token check that returns early on
 // the first wrong character tells an attacker how much of a prefix they have.
+/**
+ * @param {unknown} left
+ * @param {unknown} right
+ * @returns {boolean}
+ */
 function tokenEq(left, right) {
   if (typeof left !== "string" || typeof right !== "string" || left.length !== right.length) return false;
   let differing = 0;
@@ -4191,11 +4531,22 @@ function tokenEq(left, right) {
 // answer we meant nobody to keep. Unreachable today, since only a document that
 // earned a TTL is ever in the cache to be re-served, which is exactly how two
 // spellings of one rule survive long enough to diverge.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {number} maxAge - seconds; 0 is no-store
+ * @returns {string} a Cache-Control value
+ */
 function clientScope(env, maxAge) {
   if (!maxAge) return "no-store";
   return `${(env.BEAMLINE_TOKEN || "").trim() ? "private" : "public"}, max-age=${maxAge}`;
 }
 
+/**
+ * @param {object|null} envelope - a full scan report
+ * @param {string|null} sha
+ * @param {string|null} purl
+ * @returns {object}
+ */
 function customerView(envelope, sha, purl) {
   const ml = envelope && envelope.ml;
   const out = {};
@@ -4213,6 +4564,10 @@ function customerView(envelope, sha, purl) {
   return out;
 }
 
+/**
+ * @param {unknown} llm
+ * @returns {string}
+ */
 function llmWhy(llm) {
   if (!llm) return "";
   if (typeof llm === "string") return llm.trim();
@@ -4220,6 +4575,11 @@ function llmWhy(llm) {
   return typeof text === "string" ? text.trim() : "";
 }
 
+/**
+ * @param {object|null} raw - the report's `raw` section
+ * @param {string|null} purl
+ * @returns {object[]} at most HIT_LIMIT, most critical first
+ */
 function topHits(raw, purl) {
   const files = (raw && (raw.files || raw.fs)) || [];
   const rows = [];
@@ -4260,6 +4620,12 @@ function topHits(raw, purl) {
 // line to quote for a match inside it. Binary windows have no line structure.
 // A report whose context was trimmed falls back to the finding's own first
 // evidence span, which locates it without naming a line.
+/**
+ * @param {object|null} file
+ * @param {string} id
+ * @param {object|null} trait
+ * @returns {{off: number|null, line: number|null}}
+ */
 function hitLocation(file, id, trait) {
   for (const context of (file && file.ctx) || []) {
     for (const note of (context && context.n) || []) {
@@ -4272,10 +4638,18 @@ function hitLocation(file, id, trait) {
   return { off: Array.isArray(span) ? num(span[0]) : null, line: null };
 }
 
+/**
+ * @param {unknown} value
+ * @returns {number|null}
+ */
 function num(value) {
   return Number.isFinite(Number(value)) ? Number(value) : null;
 }
 
+/**
+ * @param {unknown} path
+ * @returns {string} the innermost member's path
+ */
 function hitFile(path) {
   if (!path) return "";
   let inner = String(path);
@@ -4284,11 +4658,19 @@ function hitFile(path) {
   return inner.replace(/^\/+/, "") || "";
 }
 
-function identPkg(f) {
-  const ident = (f && (f.ident || f.identity)) || {};
+/**
+ * @param {object|null} file
+ * @returns {string} `name@version`, or ""
+ */
+function identPkg(file) {
+  const ident = (file && (file.ident || file.identity)) || {};
   if (!ident.name) return "";
   return ident.version ? `${ident.name}@${ident.version}` : ident.name;
 }
+/**
+ * @param {object|null} body
+ * @returns {string} lowercase, or ""
+ */
 function shaFromEnvelope(body) {
   const sha = body?.raw?.files?.[0]?.sha;
   return typeof sha === "string" ? sha.toLowerCase() : "";
@@ -4310,16 +4692,16 @@ function shaFromEnvelope(body) {
  * @returns {Promise<T>}
  */
 async function fetchTimeout(url, opts, ms, ctx, read) {
-  const ac = new AbortController();
+  const controller = new AbortController();
   const outer = ctx && ctx.signal;
   if (outer && outer.aborted) {
     throw new DOMException("Aborted", "AbortError");
   }
-  const onAbort = () => ac.abort();
+  const onAbort = () => controller.abort();
   if (outer) outer.addEventListener("abort", onAbort, { once: true });
-  const timer = setTimeout(() => ac.abort(), ms);
+  const timer = setTimeout(() => controller.abort(), ms);
   try {
-    return await read(await fetch(url, { ...opts, signal: ac.signal }));
+    return await read(await fetch(url, { ...opts, signal: controller.signal }));
   } finally {
     clearTimeout(timer);
     if (outer) outer.removeEventListener("abort", onAbort);
@@ -4327,6 +4709,10 @@ async function fetchTimeout(url, opts, ms, ctx, read) {
 }
 
 // A body nobody reads pins its connection until the collector notices.
+/**
+ * @param {Response} resp
+ * @returns {Promise<void>} never rejects
+ */
 async function drain(resp) {
   try {
     await resp.body?.cancel();
@@ -4335,6 +4721,10 @@ async function drain(resp) {
   }
 }
 
+/**
+ * @param {Record<string, unknown>} env
+ * @returns {Promise<Cache>}
+ */
 async function getCache(env) {
   if (env && env.cache) return env.cache;
   try {
@@ -4390,6 +4780,10 @@ function memoryCache() {
   };
 }
 
+/**
+ * @param {Request|string} req
+ * @returns {string}
+ */
 function cacheId(req) {
   return typeof req === "string" ? req : req.url;
 }
@@ -4411,6 +4805,11 @@ function cacheId(req) {
 // `private` is the header the caller receives, because that one travels: it is
 // read by their proxy and their browser, and a PURL is their dependency list.
 // clientScope() still stamps that, and is unchanged.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {string} body
+ * @returns {Response}
+ */
 function storedDocument(env, body) {
   // Full envelopes are already canonical scan output. Running one through the
   // compact decision normalizer would add `status` and `severity`, changing
@@ -4425,22 +4824,41 @@ function storedDocument(env, body) {
   });
 }
 
+/**
+ * @param {Ctx|null} ctx
+ * @param {Promise<unknown>} promise
+ * @returns {void}
+ */
 function waitUntil(ctx, promise) {
   const guarded = Promise.resolve(promise).catch((err) => {
     logLine("wait_error", { err: errText(err) });
   });
   if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(guarded);
 }
+/**
+ * @param {Record<string, unknown>} env
+ * @param {string} key
+ * @param {number} fallback
+ * @returns {number} a finite, non-negative value
+ */
 function numEnv(env, key, fallback) {
   if (!env || env[key] == null || env[key] === "") return fallback;
   const value = Number(env[key]);
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
+/**
+ * @param {unknown} raw
+ * @returns {string} at most 64 characters of [A-Za-z0-9._:-]
+ */
 function cleanId(raw) {
   return String(raw || "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 64);
 }
 
+/**
+ * @param {unknown} err
+ * @returns {string}
+ */
 function errText(err) {
   return String((err && err.message) || err);
 }
@@ -4452,6 +4870,11 @@ function errText(err) {
 const STRUCTURED_LOGS =
   typeof navigator !== "undefined" && navigator.userAgent === "Cloudflare-Workers";
 
+/**
+ * @param {string} event
+ * @param {Record<string, unknown>} [fields]
+ * @returns {void} never throws
+ */
 function logLine(event, fields) {
   if (logLine.mute) return;
   try {
@@ -4465,6 +4888,10 @@ function logLine(event, fields) {
   }
 }
 
+/**
+ * @param {string} base
+ * @returns {ReturnType<typeof makeBreaker>}
+ */
 function breakerFor(base) {
   let breaker = scanBreakers.get(base);
   if (!breaker) {
@@ -4475,6 +4902,10 @@ function breakerFor(base) {
 }
 
 // SCAN_URL is one URL or a comma-separated list of interchangeable workers.
+/**
+ * @param {unknown} raw - comma-separated
+ * @returns {string[]} base URLs without trailing slashes
+ */
 function urlList(raw) {
   return tokenList(raw).map((base) => base.replace(/\/+$/, "")).filter(Boolean);
 }
@@ -4492,6 +4923,11 @@ function urlList(raw) {
 // answered `unavailable` in 25ms each without a single outbound fetch. The
 // fleet was healthy throughout. Same rule scan's own corpus reader follows for
 // the same reason — an address believed to be failing still beats no address.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {string|null} pin
+ * @returns {string[]}
+ */
 function scanWorkers(env, pin) {
   const all = urlList(env.SCAN_URL);
   // A pin names one worker and means it. Falling back to another would answer
@@ -4511,6 +4947,10 @@ function scanWorkers(env, pin) {
 
 // Host only: enough to tell workers apart in a log line, without spilling the
 // full internal URL into every record.
+/**
+ * @param {string} base
+ * @returns {string}
+ */
 function hostOf(base) {
   try {
     return new URL(base).host;
@@ -4554,6 +4994,11 @@ function makeBreaker() {
   };
 }
 
+/**
+ * @param {unknown} obj
+ * @param {number} status
+ * @returns {Response}
+ */
 function json(obj, status) {
   return new Response(JSON.stringify(obj), {
     status,
@@ -4566,6 +5011,10 @@ function json(obj, status) {
 // caller hunting for a misspelled path instead of a missing flag. RFC 9110
 // requires the `Allow` header here; the detail repeats it for anyone reading
 // only the body.
+/**
+ * @param {string} allow
+ * @returns {Response}
+ */
 function methodNotAllowed(allow) {
   const body = { error: { code: "method_not_allowed", message: `Use ${allow}.` } };
   return new Response(JSON.stringify(body), {
@@ -4574,6 +5023,11 @@ function methodNotAllowed(allow) {
   });
 }
 
+/**
+ * @param {number} ms
+ * @param {Ctx|null} ctx - its abort rejects the wait
+ * @returns {Promise<void>}
+ */
 function sleep(ms, ctx) {
   const outer = ctx && ctx.signal;
   if (outer && outer.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));

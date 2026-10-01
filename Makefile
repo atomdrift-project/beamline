@@ -17,11 +17,20 @@ POPULAR     ?=
 ANALYZE_MISSES ?=
 STRESS_ROUTE ?= both
 REPEAT      ?= 1
+WAVES       ?= 4
+PER_WORKER  ?=
+BENCH_CONCURRENCY ?= auto
+SEED        ?= 1
+WORKERS     ?=
+BENCH_FILE  ?=
+BENCH_OUT   ?=
+DRY_RUN     ?=
 API         ?= v1
 BEAMLINE_URL ?= https://api.isotope13.ai
 BEAMLINE_TOKEN ?=
-# SCAN_TOKEN is a backend credential. BEAMLINE_TOKEN is client policy and is
-# environment-only: an unset value deliberately leaves the API open.
+# SCAN_TOKEN is a backend credential. Server-side BEAMLINE_TOKEN is client
+# policy and is environment-only: an unset value leaves the API open.
+# The stress client falls back to ~/.tok/beamline for its bearer token.
 HOPPER_TOKEN ?=
 SCAN_TOKEN ?=
 # CF_ZONE_ID names the zone the API hostname lives in, and CF_PURGE_TOKEN is
@@ -42,15 +51,15 @@ KV_NAMESPACE ?= beamline
 # resolves to an org and a tier. `make -C ../../iso13/dash kv-create` prints it.
 DASH_KV ?=
 
-.PHONY: lint test stress-test pop-test kv-create deploy-cf
+.PHONY: lint test stress-test pop-test fleet-bench kv-create deploy-cf
 
 # Parse every file, then oxlint. No lint config is checked in: the defaults
 # are the standard, and the tree stays free of npm packages.
 lint:
-	@for f in beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs scripts/route-ab.mjs scripts/deploy-cf.mjs beamline.test.js stress.test.js; do \
+	@for f in beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs scripts/route-ab.mjs scripts/fleet-bench.mjs scripts/fleet-bench.test.mjs scripts/deploy-cf.mjs beamline.test.js stress.test.js; do \
 	  node --check "$$f" || exit 1; \
 	done
-	npx --yes $(OXLINT) --deny-warnings beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs scripts/route-ab.mjs scripts/deploy-cf.mjs beamline.test.js stress.test.js
+	npx --yes $(OXLINT) --deny-warnings beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs scripts/route-ab.mjs scripts/fleet-bench.mjs scripts/fleet-bench.test.mjs scripts/deploy-cf.mjs beamline.test.js stress.test.js
 
 test:
 	node --test
@@ -110,6 +119,17 @@ stress-test:
 # a cache or an index rather than from a fresh analysis.
 pop-test:
 	@$(MAKE) --no-print-directory stress-test POPULAR=1 ANALYZE_MISSES=1 STRESS_ROUTE=combined
+
+# Pin every worker at once, each driven at its own free slots (or a fixed
+# BENCH_CONCURRENCY) for WAVES rounds of releases the fleet has not analyzed
+# yet — same ecosystem mix and bytes per package everywhere — then report
+# throughput per worker by count and by MiB. PER_WORKER=N gives every worker N
+# instead. DRY_RUN=1 prints the plan only.
+fleet-bench:
+	@BEAMLINE_URL="$(BEAMLINE_URL)" BEAMLINE_TOKEN="$(BEAMLINE_TOKEN)" node scripts/fleet-bench.mjs \
+	  --waves $(WAVES) --concurrency $(BENCH_CONCURRENCY) --seed $(SEED) \
+	  $(if $(WORKERS),--workers $(WORKERS)) $(if $(BENCH_FILE),--file $(BENCH_FILE)) \
+	  $(if $(BENCH_OUT),--out $(BENCH_OUT)) $(if $(PER_WORKER),--per-worker $(PER_WORKER)) $(if $(DRY_RUN),--dry-run)
 
 # Create the default KV namespace. Copy the returned ID into wrangler.toml's
 # BEAMLINE_KV binding before deploying.

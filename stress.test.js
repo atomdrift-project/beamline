@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { _test } from "./stress.js";
+import { cleartextRemote } from "./tok.js";
+
+// Clients read a bearer token from ~/.tok unasked, so where it may be sent is
+// decided before it is: https anywhere, plain http only to loopback.
+test("a bearer token never crosses a network in the clear", () => {
+  for (const url of ["http://api.example.com", "http://10.0.0.5:8080", "http://127.example.com"]) {
+    assert.equal(cleartextRemote(url), true, url);
+  }
+  for (const url of ["https://api.isotope13.ai", "http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080", "", "not a url"]) {
+    assert.equal(cleartextRemote(url), false, url);
+  }
+});
 
 test("npm PURL encodes a scoped name the way scan expects", () => {
   assert.equal(_test.npmPurl("left-pad", "1.3.0"), "pkg:npm/left-pad@1.3.0");

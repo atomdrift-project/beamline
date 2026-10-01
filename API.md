@@ -448,7 +448,7 @@ reworded.
 | --- | --- | --- |
 | `missing_package` | 400 | Neither `purl`, `url`, nor `sha256`. |
 | `multiple_locators` | 400 | More than one of `purl`, `url`, and `sha256` was supplied. |
-| `invalid_url` | 400 | Not an absolute `http` or `https` URL. |
+| `invalid_url` | 400 | Not an absolute `http` or `https` URL, or one carrying credentials. |
 | `url_with_body` | 400 | An exact URL cannot be combined with uploaded bytes. |
 | `invalid_follow_policy` | 400 | Unknown, empty, or contradictory `follow` selection. |
 | `invalid_purl` | 400 | Not a package URL. |

@@ -1,3 +1,7 @@
+/**
+ * @param {boolean} authRequired
+ * @returns {string}
+ */
 function docsHtml(authRequired) {
   return String.raw`<!doctype html>
 <html lang="en">
@@ -270,7 +274,7 @@ POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
         <pre><code>{
   "error": {
     "code": "invalid_url",
-    "message": "url must be an absolute http or https URL."
+    "message": "url must be an absolute http or https URL with no credentials in it."
   }
 }</code></pre>
         <p><code>400</code> means the request is invalid. <code>401</code> means a bearer token is required or invalid. <code>413</code> means too many packages or an oversized upload. <code>429</code> means capacity is temporarily full; retry with backoff. If Beamline cannot answer about an artifact, it returns <code>200</code> with <code>status: "unavailable"</code>.</p>
@@ -394,7 +398,7 @@ export function docsResponse(authRequired = false) {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "public, max-age=300",
-      "content-security-policy": "default-src 'self' https://atomdrift.org; style-src 'unsafe-inline' https://atomdrift.org; script-src 'unsafe-inline'; connect-src 'self'; font-src https://atomdrift.org; img-src 'none'; base-uri 'none'; form-action 'none'",
+      "content-security-policy": "default-src 'self' https://atomdrift.org; style-src 'unsafe-inline' https://atomdrift.org; script-src 'unsafe-inline'; connect-src 'self'; font-src https://atomdrift.org; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
       "x-content-type-options": "nosniff",
     },
   });

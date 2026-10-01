@@ -8,21 +8,23 @@
 
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
-import { readToken } from "./tok.js";
+import { cleartextRemote, readToken } from "./tok.js";
 
 const UA = "beamline-stress/1.0 (+https://github.com/isotope13-dev/forager)";
 const DEFAULT_N = 6;
 const DEFAULT_CONCURRENCY = 2;
 const META_TIMEOUT_MS = 20_000;
+const NPM_WIDTH = 16;
+// index.golang.org answers 400 to any limit above this.
+const GO_INDEX_MAX = 2000;
 const GO_WINDOWS_MS = [3_600_000, 6 * 3_600_000, 24 * 3_600_000, 7 * 24 * 3_600_000];
 
 const n = Math.max(1, Number(process.env.N) || DEFAULT_N);
 const samples = Math.max(0, Number(process.env.SAMPLES) || 0);
 const concurrency = Math.max(1, Number(process.env.CONCURRENCY) || DEFAULT_CONCURRENCY);
 const beamlineUrl = trimSlash(process.env.BEAMLINE_URL);
-// Client authentication is opt-in through the environment. Do not discover a
-// local beamline token implicitly: an absent value means the API is open.
-const token = (process.env.BEAMLINE_TOKEN || "").trim();
+// Use the local client credential unless the environment supplies an override.
+const token = (process.env.BEAMLINE_TOKEN || "").trim() || readToken("beamline");
 const scanToken = (process.env.SCAN_TOKEN || "").trim() || readToken("scan");
 const hopperToken = (process.env.HOPPER_TOKEN || "").trim() || readToken("hopper");
 // SCAN_URL may list several interchangeable workers; probe the first.
@@ -99,6 +101,16 @@ async function main() {
   if (!beamlineUrl) {
     process.stderr.write("BEAMLINE_URL is required\n");
     process.exit(2);
+  }
+  for (const [name, url, secret] of [
+    ["BEAMLINE_URL", beamlineUrl, token],
+    ["SCAN_URL", scanUrl, scanToken],
+    ["HOPPER_URL", hopperUrl, hopperToken],
+  ]) {
+    if (secret && cleartextRemote(url)) {
+      process.stderr.write(`${name} is plain http to a remote host; refusing to send a bearer token over it. Use https.\n`);
+      process.exit(2);
+    }
   }
   if (!["combined", "lookup", "analyze", "both"].includes(stressRoute)) {
     process.stderr.write("STRESS_ROUTE must be combined, lookup, analyze, or both\n");
@@ -242,28 +254,37 @@ async function probe(url, extra = {}) {
   }
 }
 
-async function fetchNpm(limit) {
+export async function fetchNpm(limit) {
   const cap = Math.min(10_000, Math.max(100, limit * 50));
   const resp = await get(`https://replicate.npmjs.com/registry/_changes?descending=true&limit=${cap}`, META_TIMEOUT_MS);
   const body = await resp.json();
   const names = parseNpmChanges(body);
   const jobs = [];
-  for (const name of names) {
-    if (jobs.length >= limit) break;
-    try {
-      const packument = await get(`https://registry.npmjs.org/${encodeNpmName(name)}`, META_TIMEOUT_MS);
-      const meta = await packument.json();
-      const version = meta["dist-tags"]?.latest || meta.version;
-      if (!version) continue;
-      jobs.push(job("npm", npmPurl(meta.name || name, version)));
-    } catch {
-      // Packument vanished between _changes and fetch.
-    }
+  // Resolved a batch at a time, and in the abbreviated install format: a full
+  // packument can run to megabytes, and one at a time a few thousand of them
+  // took longer than the benchmark they were feeding.
+  for (let i = 0; i < names.length && jobs.length < limit; i += NPM_WIDTH) {
+    const resolved = await Promise.all(names.slice(i, i + NPM_WIDTH).map(npmLatest));
+    for (const purl of resolved) if (purl && jobs.length < limit) jobs.push(job("npm", purl));
   }
   return jobs;
 }
 
-async function fetchPypi(limit) {
+async function npmLatest(name) {
+  try {
+    const packument = await get(`https://registry.npmjs.org/${encodeNpmName(name)}`, META_TIMEOUT_MS, {
+      accept: "application/vnd.npm.install-v1+json",
+    });
+    const meta = await packument.json();
+    const version = meta["dist-tags"]?.latest;
+    return version ? npmPurl(meta.name || name, version) : null;
+  } catch {
+    // Packument vanished between _changes and fetch.
+    return null;
+  }
+}
+
+export async function fetchPypi(limit) {
   const feed = await get("https://pypi.org/rss/updates.xml", META_TIMEOUT_MS);
   const xml = await feed.text();
   return parsePypiRss(xml)
@@ -271,7 +292,7 @@ async function fetchPypi(limit) {
     .map((p) => job("pypi", pypiPurl(p.name, p.version)));
 }
 
-async function fetchCrates(limit) {
+export async function fetchCrates(limit) {
   const names = await crateNames(limit);
   const jobs = [];
   for (const name of names) {
@@ -313,11 +334,11 @@ async function cratesSparseNewestVersion(name) {
   return rec.vers || "";
 }
 
-async function fetchGo(limit) {
+export async function fetchGo(limit) {
   for (let i = 0; i < GO_WINDOWS_MS.length; i++) {
     const span = GO_WINDOWS_MS[i];
     const since = new Date(Date.now() - span).toISOString();
-    const url = `https://index.golang.org/index?since=${encodeURIComponent(since)}&limit=${limit * 4}`;
+    const url = `https://index.golang.org/index?since=${encodeURIComponent(since)}&limit=${Math.min(GO_INDEX_MAX, limit * 4)}`;
     const index = await get(url, META_TIMEOUT_MS);
     const text = await index.text();
     const rows = parseGoIndex(text);

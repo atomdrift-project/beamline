@@ -41,7 +41,7 @@ const TUNABLES = [
   "NPM_REGISTRY_URL",
 ];
 
-const env = Object.fromEntries(TUNABLES.map((k) => [k, process.env[k] || ""]));
+const env = Object.fromEntries(TUNABLES.map((name) => [name, process.env[name] || ""]));
 
 // The client token is deliberately environment-only: if BEAMLINE_TOKEN is not
 // passed, the API is open. SCAN_TOKEN still falls back to ~/.tok because it is
@@ -60,6 +60,10 @@ env.SCAN_TOKEN ||= readToken("scan");
 let inflight = 0;
 let nudge = null;
 
+/**
+ * @param {number} delta - +1 as a request starts, -1 as it ends
+ * @returns {void}
+ */
 function busy(delta) {
   inflight += delta;
   if (inflight > 0 && !nudge) nudge = setInterval(() => {}, 1).unref();
@@ -84,9 +88,9 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
     const buf = await readRequest(req, MAX_BYTES);
     const headers = new Headers();
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (v == null) continue;
-      headers.set(k, Array.isArray(v) ? v.join(", ") : v);
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (value == null) continue;
+      headers.set(name, Array.isArray(value) ? value.join(", ") : value);
     }
     const request = new Request(url, {
       method: req.method,
@@ -106,14 +110,14 @@ const server = createServer(async (req, res) => {
     };
     const out = await handle(request, env, ctx);
     res.statusCode = out.status;
-    out.headers.forEach((v, k) => res.setHeader(k, v));
+    out.headers.forEach((value, name) => res.setHeader(name, value));
     // Nothing sits in front of this process, so compression is ours to do.
     // Behind Cloudflare the edge does it and beamline.js stays out of the way.
     let body = Buffer.from(await out.arrayBuffer());
     const accepts = String(req.headers["accept-encoding"] || "")
       .toLowerCase()
       .split(",")
-      .some((p) => p.trim().startsWith("gzip"));
+      .some((coding) => coding.trim().startsWith("gzip"));
     if (accepts && body.length >= GZIP_MIN_BYTES && !res.getHeader("content-encoding")) {
       body = gzipSync(body);
       res.setHeader("content-encoding", "gzip");
@@ -131,20 +135,25 @@ const server = createServer(async (req, res) => {
   }
 });
 
+/**
+ * @param {import("node:http").IncomingMessage} req
+ * @param {number} maxBytes
+ * @returns {Promise<Buffer>} rejects with code 413 past the limit
+ */
 function readRequest(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    let n = 0;
-    req.on("data", (c) => {
-      n += c.length;
-      if (n > maxBytes) {
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
         req.destroy();
         const err = new Error("too large");
         err.code = 413;
         reject(err);
         return;
       }
-      chunks.push(c);
+      chunks.push(chunk);
     });
     req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
