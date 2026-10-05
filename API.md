@@ -55,7 +55,7 @@ served — it describes different bytes.
 ## GET /v1/lookup
 
 ```
-$ curl 'https://api.atomdrift.com/v1/lookup?purl=npm/left-pad@1.3.0'
+$ curl 'https://api.isotope13.ai/v1/lookup?purl=npm/left-pad@1.3.0'
 {
   "status": "analyzed",
   "purl": "npm/left-pad@1.3.0",
@@ -120,7 +120,7 @@ published to Hopper through Scan's normal result path. Only the exact spelling
 ```
 $ curl -sN -X POST --data-binary @suspect.tgz \
     -H 'Content-Type: application/octet-stream' \
-    'https://api.atomdrift.com/v1/analyze'
+    'https://api.isotope13.ai/v1/analyze'
 ```
 
 The digest is the identity, so two callers uploading the same artifact share one
@@ -138,7 +138,7 @@ assessment. **Read lines until one carries `status`. That is the answer.**
 
 ```
 $ curl -sN -X POST \
-    'https://api.atomdrift.com/v1/analyze?purl=pypi/tensorflow@2.15.0'
+    'https://api.isotope13.ai/v1/analyze?purl=pypi/tensorflow@2.15.0'
 {"state":"analyzing","elapsed_ms":1002,"total_elapsed_ms":1002,"phase":"fetch","phase_state":"started","phase_elapsed_ms":0,"request_id":"…","purl":"pypi/tens…"}
 {"state":"analyzing","elapsed_ms":6004,"total_elapsed_ms":6004,"phase":"fetch","phase_state":"completed","phase_elapsed_ms":5002,"request_id":"…","purl":"pypi/tens…"}
 {"state":"analyzing","elapsed_ms":6004,"total_elapsed_ms":6004,"phase":"unpack","phase_state":"started","phase_elapsed_ms":0,"request_id":"…","purl":"pypi/tens…"}
@@ -238,7 +238,7 @@ Drops every cached answer for one artifact. Name it with `?purl=`, `?url=`, or
 `?sha256=` — exactly one, the same locators `/v1/lookup` takes.
 
 ```
-$ curl -X POST 'https://api.atomdrift.com/v1/flush?purl=pypi/ddtrace@3.18.1'
+$ curl -X POST 'https://api.isotope13.ai/v1/flush?purl=pypi/ddtrace@3.18.1'
 {"status":"flushed",
  "caches":{"edge":{"dropped":4},
            "kv":{"dropped":4},
