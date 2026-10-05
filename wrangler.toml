@@ -38,6 +38,11 @@ dataset = "beamline_requests"
 enabled = true
 head_sampling_rate = 1
 
+# Invocation logs would record every request's metadata, client IP included.
+# Our own logLine output is all we read, and it never carries an IP.
+[observability.logs]
+invocation_logs = false
+
 [vars]
 MAX_BYTES = "16777216"
 SCAN_TIMEOUT_MS = "1800000"
