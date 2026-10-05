@@ -19,7 +19,7 @@ const MAX_INFLIGHT = Number(process.env.MAX_INFLIGHT) || 32;
 // the same way a deployed Worker is. Anything absent falls back to the built-in
 // default.
 //
-// Not here, and deliberately: BEAMLINE_KV, DASH_KV and BEAMLINE_AE are Worker
+// Not here, and deliberately: BEAMLINE_KV, TOKENS_KV and BEAMLINE_AE are Worker
 // bindings with no local equivalent, and CF_ZONE_ID / CF_PURGE_TOKEN purge a
 // zone cache this process does not sit behind — /v1/flush reports that as
 // `unconfigured` rather than pretending.

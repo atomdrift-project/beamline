@@ -122,7 +122,7 @@ const scanBreakers = new Map();
 // that eventually disagrees with itself.
 
 /**
- * A customer, as the dash namespace records them.
+ * A customer, as dash's token namespace records them.
  * @typedef {object} Org
  * @property {string} oid
  * @property {string} tier
@@ -316,7 +316,7 @@ export async function handle(request, env, ctx) {
 // Three outcomes. A token in BEAMLINE_TOKEN is ours — the stress harness, the
 // precache pass, an operator — and is deliberately anonymous: it is not a
 // customer, and filing its traffic under an org would put our own load in
-// someone's usage graph. A token in the dash namespace is a customer, and
+// someone's usage graph. A token in TOKENS_KV is a customer, and
 // carries the org and the tier it was minted with. Anything else is neither,
 // and whether that is allowed through is the gate's business, not ours.
 //
@@ -339,7 +339,7 @@ async function identify(request, env) {
   // Shape-checked before it is spent as a key. A token that cannot be one of
   // ours is a scan for an open API, and every one of those would otherwise be
   // a KV read we pay for.
-  const kv = env?.DASH_KV;
+  const kv = env?.TOKENS_KV;
   if (token && kv && CUSTOMER_TOKEN_RE.test(token)) {
     const raw = await dashRow(kv, token);
     const row = parseJson(raw);
@@ -351,13 +351,13 @@ async function identify(request, env) {
   return { token, known: false, org: null };
 }
 
-// How many times a failed read of the dash namespace is retried, and the
+// How many times a failed read of the token namespace is retried, and the
 // backoff between. Short: every request from that customer is waiting on it.
 const TOKEN_LOOKUP_RETRIES = 2;
 const TOKEN_LOOKUP_RETRY_BASE_MS = 50;
 const TOKEN_LOOKUP_RETRY_MAX_MS = 500;
 
-// One customer's row from the dash namespace, or null.
+// One customer's row from the token namespace, or null.
 //
 // A read that fails is retried briefly, because the alternative is a 401 to a
 // paying customer for an outage that is ours and probably already over. Once

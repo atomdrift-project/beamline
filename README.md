@@ -83,12 +83,16 @@ The deploy recipe turns that ID into the `BEAMLINE_KV` binding for Wrangler.
 ## Customers
 
 Beamline does not own customers; [dash](https://dash.isotope13.io) does. Dash
-writes `tok:<token>` into its own KV namespace when a customer mints or revokes
+writes `tok:<token>` into a token namespace when a customer mints or revokes
 one, and beamline reads it — nothing here writes it. Pass that namespace's id
-as `DASH_KV` to `make deploy-cf` and a bearer token resolves to an org and a
-tier, which is what puts a customer's requests in their own usage graph and
-puts their requests in their own usage graph. Omit it and beamline is exactly
-what it was before customers existed.
+as `TOKENS` to `make deploy-cf` and a bearer token resolves to an org and a
+tier, which is what puts a customer's requests in their own usage graph. Omit
+it and beamline is exactly what it was before customers existed.
+
+The token namespace holds `tok:` keys and nothing else. Dash keeps OAuth
+identities in a namespace of its own, and beamline is deliberately not bound to
+it: a KV binding cannot be limited to a prefix, so being bound there would mean
+being able to read every customer's identity.
 
 Rules delivery is not here. It lives in `iso13/rules`, behind
 `updates.isotope13.ai`, reading this same token namespace — a separate Worker

@@ -28,12 +28,14 @@ dataset = "beamline_requests"
 # account-specific ID through KV and materializes the binding for deployment:
 #   npx wrangler kv namespace create beamline
 #
-# DASH_KV is the second namespace, and beamline only ever reads it. Dash writes
+# TOKENS_KV is the second namespace, and beamline only ever reads it. Dash writes
 # `tok:<token>` there when a customer mints or revokes one, and beamline
 # resolves a bearer token through it to an org and a tier — which is what puts
 # a customer's requests in their own usage graph and decides which rules bucket
-# their token opens. Passed to `make deploy-cf` as DASH_KV; omitting it leaves
-# beamline exactly as it was before customers existed.
+# their token opens. It holds nothing else: dash keeps identities in a namespace
+# of its own that beamline is not bound to. Passed to `make deploy-cf` as
+# TOKENS; omitting it leaves beamline exactly as it was before customers
+# existed.
 [observability]
 enabled = true
 head_sampling_rate = 1

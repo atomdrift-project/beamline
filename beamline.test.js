@@ -5142,7 +5142,7 @@ test("flush validates its locator and refuses a GET", async () => {
 // attribution (whose graph the request lands in), because a token that works
 // but is filed under nobody is a customer with an empty dashboard.
 
-function dashKV(rows = {}) {
+function tokenKV(rows = {}) {
   return {
     reads: 0,
     async get(key) {
@@ -5155,8 +5155,8 @@ function dashKV(rows = {}) {
 const CUSTOMER = "i13_krypton85_h7q3mx2p9wkd4rz8bn5tvcyfd0";
 
 test("a customer token is admitted where a bare request is not", async () => {
-  const kv = dashKV({ [`tok:${CUSTOMER}`]: JSON.stringify({ oid: "7k3mq9x2wd4prz8bn5tvcyfl0e", tier: "business" }) });
-  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", DASH_KV: kv };
+  const kv = tokenKV({ [`tok:${CUSTOMER}`]: JSON.stringify({ oid: "7k3mq9x2wd4prz8bn5tvcyfl0e", tier: "business" }) });
+  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", TOKENS_KV: kv };
 
   const anon = await handle(new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0"), env, {});
   assert.equal(anon.status, 401);
@@ -5183,8 +5183,8 @@ test("a customer token is admitted where a bare request is not", async () => {
 });
 
 test("a token that cannot be one of dash's is never spent as a KV read", async () => {
-  const kv = dashKV();
-  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", DASH_KV: kv };
+  const kv = tokenKV();
+  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", TOKENS_KV: kv };
   for (const bogus of ["hunter2", "Bearer", "i13_x", "../../etc/passwd", "i13_krypton85_SHOUTING0000000000000000"]) {
     await handle(
       new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", {
@@ -5199,11 +5199,11 @@ test("a token that cannot be one of dash's is never spent as a KV read", async (
 
 test("our own token is admitted and deliberately not filed under any org", async () => {
   const points = [];
-  const kv = dashKV();
+  const kv = tokenKV();
   const env = {
     ...testEnv("http://unused"),
     BEAMLINE_TOKEN: "ops-secret",
-    DASH_KV: kv,
+    TOKENS_KV: kv,
     BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
   };
   const res = await handle(
@@ -5225,7 +5225,7 @@ test("a customer's request is filed under their org, and indexed by it", async (
   const oid = "7k3mq9x2wd4prz8bn5tvcyfl0e";
   const env = {
     ...testEnv("http://unused"),
-    DASH_KV: dashKV({ [`tok:${CUSTOMER}`]: JSON.stringify({ oid, tier: "oem" }) }),
+    TOKENS_KV: tokenKV({ [`tok:${CUSTOMER}`]: JSON.stringify({ oid, tier: "oem" }) }),
     BEAMLINE_AE: { writeDataPoint: (p) => points.push(p) },
   };
   await handle(
@@ -5252,7 +5252,7 @@ test("a namespace that cannot be read does not take the API down", async () => {
     },
   };
   // Open deployment: the customer falls back to anonymous and is still served.
-  const open = { ...testEnv("http://unused"), DASH_KV: broken };
+  const open = { ...testEnv("http://unused"), TOKENS_KV: broken };
   const res = await handle(
     new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", {
       headers: { authorization: `Bearer ${CUSTOMER}` },
@@ -5299,7 +5299,7 @@ test("a zone purge that hits a transient 5xx is retried, not reported failed", a
   }
 });
 
-test("a customer is admitted through a dash namespace that fails once", async () => {
+test("a customer is admitted through a token namespace that fails once", async () => {
   let reads = 0;
   const kv = {
     async get(key) {
@@ -5308,7 +5308,7 @@ test("a customer is admitted through a dash namespace that fails once", async ()
       return key === `tok:${CUSTOMER}` ? JSON.stringify({ oid: "org1", tier: "free" }) : null;
     },
   };
-  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", DASH_KV: kv };
+  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", TOKENS_KV: kv };
   const res = await handle(
     new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", { headers: { authorization: `Bearer ${CUSTOMER}` } }),
     env,
