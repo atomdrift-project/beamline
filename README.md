@@ -47,6 +47,7 @@ Cloudflare dashboard's Query Builder can aggregate them without any of that.
 | `blob4` | scan worker, empty when a beamline layer answered |
 | `blob5` | ecosystem, from the caller's PURL |
 | `blob6` | HTTP status |
+| `blob7` | token fingerprint — first 16 hex of SHA-256(token); customer requests only |
 | `double1` | cache layer, `-1` when nothing answered |
 | `double2` | milliseconds |
 
@@ -58,8 +59,12 @@ cost. Every terminal verdict is filed under it, cached or scanned; an
 `unavailable` is under neither, because timing it would measure how quickly
 beamline gave up rather than how long anything took.
 
-The blobs above are unchanged. What a customer's request adds is an `index`,
-and only an index: the org. Analytics Engine samples per index, so without one
+What a customer's request adds is an `index` — the org — and `blob7`, which
+names the token by fingerprint so dash can show when each key was last used.
+The token itself never enters the dataset: anything holding the analytics key
+can read it, and 64 bits of hash cannot be walked back to the secret. Our own
+operational traffic writes the original six blobs. The org is an index rather
+than a blob: Analytics Engine samples per index, so without one
 a customer doing millions of lookups samples away a customer doing hundreds,
 and the quiet one's dashboard draws a graph made of two surviving rows.
 Filtering is all anyone does with the org — `WHERE index1 =` is how that is

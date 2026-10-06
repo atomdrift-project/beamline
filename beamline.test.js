@@ -5240,9 +5240,15 @@ test("a customer's request is filed under their org, and indexed by it", async (
   // `WHERE index1 =`, and without it one busy customer samples a quiet one out
   // of the data entirely.
   assert.deepEqual(points[0].indexes, [oid]);
-  // The dataset's own shape is untouched: same six blobs, in the same places.
-  assert.equal(points[0].blobs.length, 6);
+  // The original six blobs keep their places, and a seventh names the token
+  // by fingerprint — never the token itself — so dash can show when each key
+  // was last used.
+  assert.equal(points[0].blobs.length, 7);
   assert.equal(points[0].blobs[0], "lookup");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(CUSTOMER));
+  const expected = Buffer.from(digest).subarray(0, 8).toString("hex");
+  assert.equal(points[0].blobs[6], expected);
+  assert.ok(!points[0].blobs.includes(CUSTOMER), "the token itself never lands in the dataset");
 });
 
 test("a namespace that cannot be read does not take the API down", async () => {

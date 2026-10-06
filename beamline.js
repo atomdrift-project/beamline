@@ -126,6 +126,7 @@ const scanBreakers = new Map();
  * @typedef {object} Org
  * @property {string} oid
  * @property {string} tier
+ * @property {string} tid - the token's fingerprint; see fingerprint()
  */
 
 /**
@@ -343,7 +344,13 @@ async function identify(request, env) {
   if (token && kv && CUSTOMER_TOKEN_RE.test(token)) {
     const raw = await dashRow(kv, token);
     const row = parseJson(raw);
-    if (row?.oid) return { token, known: true, org: { oid: String(row.oid), tier: String(row.tier || "free") } };
+    if (row?.oid) {
+      return {
+        token,
+        known: true,
+        org: { oid: String(row.oid), tier: String(row.tier || "free"), tid: await fingerprint(token) },
+      };
+    }
     // Dash wrote something it should not have. Not retried — it will read the
     // same way next time — and not logged with the token, which is a secret.
     if (raw) logLine("token_row_invalid", { bytes: raw.length });
@@ -387,6 +394,22 @@ async function dashRow(kv, token) {
 // never becomes a KV key.
 const CUSTOMER_TOKEN_RE = /^i13_[a-z]+[0-9]*_[0-9a-z]{26}$/;
 
+// Which of an org's tokens made a request, without the token: the first 64
+// bits of its SHA-256, in hex. Dash computes the same thing for each token it
+// lists and reads back MAX(timestamp) per fingerprint, which is how a customer
+// sees when each key was last used — the one fact that makes a token list
+// auditable. The token itself never goes in the dataset: anything holding the
+// analytics key can read it, and 64 bits of hash cannot be walked back to a
+// 130-bit secret. rules writes the same blob, computed the same way.
+/**
+ * @param {string} token
+ * @returns {Promise<string>} 16 hex characters
+ */
+async function fingerprint(token) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return Array.from(new Uint8Array(digest, 0, 8), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 // One datapoint per request, written from the response the caller actually got.
 //
 // A Worker cannot be scraped: it is stateless and spread across every colo, so
@@ -420,7 +443,7 @@ function recordRequest(env, request, response, ms, caller) {
   // measures what the caller waited before hearing anything — the number that
   // decides whether a proxy in the middle cuts the connection. What the run
   // cost is ROUTE_VERDICT, written when the assessment goes out.
-  writePoint(env, route, response.headers, ecosystemOf(url), response.status, ms, caller?.org?.oid);
+  writePoint(env, route, response.headers, ecosystemOf(url), response.status, ms, caller?.org);
 }
 
 // The route a completed analysis is filed under, beside the `analyze` point
@@ -465,8 +488,12 @@ const ROUTE_ORPHAN = "analyze:orphan";
 // — without it the quiet customer's dashboard would draw a graph made of one
 // or two surviving rows. Filtering is all anyone does with it, `WHERE index1 =`
 // is how that is spelled, and a blob carrying the same value would be a column
-// nothing reads. So the shape of this dataset is unchanged; it has gained a
-// way to be sliced, not a field.
+// nothing reads.
+//
+// A customer's request adds one blob after the original six: the token's
+// fingerprint, so dash can say when each key was last used. Appended, so every
+// existing query reads the same positions; and absent on our own traffic, which
+// has no org to report it to.
 /**
  * @param {Record<string, unknown>} env
  * @param {string} route - a named route, never one derived from the path
@@ -474,16 +501,15 @@ const ROUTE_ORPHAN = "analyze:orphan";
  * @param {string} ecosystem
  * @param {number} status
  * @param {number} ms
- * @param {string} [oid] - the org to index under; omitted leaves it unindexed
+ * @param {Org|null} [org] - the org to index under; omitted leaves it unindexed
  * @returns {void}
  */
-function writePoint(env, route, headers, ecosystem, status, ms, oid) {
+function writePoint(env, route, headers, ecosystem, status, ms, org) {
   // Absent locally (`node local.js`) and in tests, and `writeDataPoint` is
   // fire-and-forget: it returns void, never throws, and must not be awaited.
   const ae = env?.BEAMLINE_AE;
   if (typeof ae?.writeDataPoint !== "function") return;
   const source = headers.get("X-Beamline-Source") || "";
-  const org = String(oid || "");
   ae.writeDataPoint({
     blobs: [
       route,
@@ -492,12 +518,13 @@ function writePoint(env, route, headers, ecosystem, status, ms, oid) {
       headers.get("X-Beamline-Worker") || "",
       ecosystem,
       String(status),
+      ...(org ? [org.tid] : []),
     ],
     // Only when there is an org to file under. An unattributed request — an
     // open deployment, one of our own tokens — is left out rather than
     // gathered under an empty string, which would become the busiest index in
     // the dataset and sample every real customer against it.
-    ...(org ? { indexes: [org] } : {}),
+    ...(org ? { indexes: [org.oid] } : {}),
     // `layer` carries -1 when nothing answered, matching what poppy records: a
     // request that reached no layer is not a shallow one, and averaging it as
     // zero would report the fleet at its cheapest exactly when it is down.
@@ -2330,7 +2357,7 @@ async function handleV1Analyze(request, env, ctx, url) {
       // the same time. Written anyway: the series is every answer this route
       // gave, and one missing its cheap half would read as a fleet that only
       // ever scans.
-      writePoint(env, ROUTE_VERDICT, answered, ecosystemOf(url), 200, Date.now() - t0, ctx.org?.oid);
+      writePoint(env, ROUTE_VERDICT, answered, ecosystemOf(url), 200, Date.now() - t0, ctx.org);
       return new Response(`${body.trimEnd()}\n`, { status: 200, headers: answered });
     }
     // Why we are about to spend an analysis slot. Without this a cache that
@@ -2622,7 +2649,7 @@ async function v1Dispatch(env, ctx, job, pass) {
       // ROUTE_VERDICT answers "how long until the caller had an answer". Orphans
       // are the longest runs there are — they are the ones whose caller gave up
       // — so folding them in would bias exactly the tail that gets read.
-      writePoint(env, orphaned ? ROUTE_ORPHAN : ROUTE_VERDICT, credited, ecosystemOf(url), 200, took, ctx.org?.oid);
+      writePoint(env, orphaned ? ROUTE_ORPHAN : ROUTE_VERDICT, credited, ecosystemOf(url), 200, took, ctx.org);
       // Also a log line, because Workers Logs is the other place these are read
       // and it indexes the fields it is given. Same numbers, same names.
       logLine("v1_analyze_verdict", {
