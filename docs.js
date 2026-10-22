@@ -277,7 +277,7 @@ POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
     "message": "url must be an absolute http or https URL with no credentials in it."
   }
 }</code></pre>
-        <p><code>400</code> means the request is invalid. <code>401</code> means a bearer token is required or invalid. <code>413</code> means too many packages or an oversized upload. <code>429</code> means capacity is temporarily full; retry with backoff. If Beamline cannot answer about an artifact, it returns <code>200</code> with <code>status: "unavailable"</code>.</p>
+        <p><code>400</code> means the request is invalid. <code>401</code> means a bearer token is required or invalid. <code>413</code> means too many packages or an oversized upload. <code>429</code> with code <code>quota_exceeded</code> means your hourly quota is spent: 2,500 requests without a token, more with one from <a href="https://dash.isotope13.io/">dash.isotope13.io</a>; wait out <code>Retry-After</code>. Any other <code>429</code> means capacity is temporarily full; retry with backoff. If Beamline cannot answer about an artifact, it returns <code>200</code> with <code>status: "unavailable"</code>.</p>
       </section>
 
       <section id="support" class="footer"><h2><a class="heading-link" href="#support">Support</a></h2><p>Need help? Have a suggestion? Reach out to <a href="mailto:support@isotope13.ai">support@isotope13.ai</a>.</p><p class="muted"><a href="https://github.com/atomdrift-project/beamline">Source on GitHub</a> · <a href="https://github.com/atomdrift-project/beamline/blob/main/API.md">Full API reference</a> · <a href="https://lab.atomdrift.org/">Sample data</a></p></section>

@@ -31,6 +31,26 @@ The documentation and health routes are public either way. A client token
 authenticates you to us and travels no further; beamline holds separate
 credentials for its backends.
 
+## Quotas
+
+Requests are counted per clock hour: per org for a customer token, and per
+address otherwise (an IPv6 caller by its /64). Documentation and health routes
+are not counted, and neither is a refused request.
+
+| caller | requests per hour |
+| --- | --- |
+| No token | 2,500 |
+| Community | 2,048 |
+| Supporter | 4,096 |
+| Business | 10,000 |
+| POC | 10,000 |
+| Critical | 100,000 |
+
+Past it, every request is a `429` with code `quota_exceeded` and a
+`Retry-After` naming the seconds until the hour turns. Get a token, or a larger
+quota, at https://dash.isotope13.io/; past Critical, write to
+support@isotope13.ai.
+
 ## Keys
 
 Both keys travel as query parameters. A PURL's grammar carries `?` and `#`, and
@@ -481,7 +501,7 @@ without a package-level assessment.
 | 404 | No such route. |
 | 405 | Right route, wrong method. `Allow` names the one that works. |
 | 413 | Too many packages. |
-| 429 | At capacity. Retry; it is jittered on our side. |
+| 429 | `quota_exceeded`: your hourly quota is spent. Wait out `Retry-After`. Otherwise at capacity: retry; it is jittered on our side. |
 
 There is no `503` for a package we could not reach a worker for. That is a
 `200` carrying `unavailable`.

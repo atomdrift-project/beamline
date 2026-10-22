@@ -341,7 +341,8 @@ async function identify(request, env) {
   // ours is a scan for an open API, and every one of those would otherwise be
   // a KV read we pay for.
   const kv = env?.TOKENS_KV;
-  if (token && kv && CUSTOMER_TOKEN_RE.test(token)) {
+  const legacy = Date.now() < LEGACY_TOKENS_UNTIL && token.length <= 64 && LEGACY_TOKEN_RE.test(token);
+  if (token && kv && (CUSTOMER_TOKEN_RE.test(token) || legacy)) {
     const raw = await dashRow(kv, token);
     const row = parseJson(raw);
     if (row?.oid) {
@@ -394,6 +395,16 @@ async function dashRow(kv, token) {
 // never becomes a KV key.
 const CUSTOMER_TOKEN_RE = /^i13_[a-z]+[0-9]*_[0-9a-z]{26}$/;
 
+// Tokens handed out before dash existed: `x-` and lowercase words joined by
+// single hyphens, at most 64 characters, as `x-<name>-<yyyy-mm>`. Each one
+// is a `tok:` row written by hand, with a KV expiration, under an oid that no
+// dash org or person holds — so the token itself is only ever in that row, and
+// dash, which rewrites only the tokens its orgs list, never touches it. The
+// cutoff is the same date again, kept here so an expiration left off the row
+// cannot keep one alive. Past it nothing is looked up and this can go.
+const LEGACY_TOKEN_RE = /^x-[a-z0-9]+(?:-[a-z0-9]+)+$/;
+const LEGACY_TOKENS_UNTIL = Date.UTC(2026, 10, 5);
+
 // Which of an org's tokens made a request, without the token: the first 64
 // bits of its SHA-256, in hex. Dash computes the same thing for each token it
 // lists and reads back MAX(timestamp) per fingerprint, which is how a customer
@@ -408,6 +419,157 @@ const CUSTOMER_TOKEN_RE = /^i13_[a-z]+[0-9]*_[0-9a-z]{26}$/;
 async function fingerprint(token) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
   return Array.from(new Uint8Array(digest, 0, 8), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// Hourly request quotas: per org for a customer token, per address for
+// everyone else.
+//
+// Counted in the Quota Durable Object, one per subject, because nothing else
+// on the platform counts globally over an hour: the rate-limit binding counts
+// per colo, over ten or sixty seconds. The window is the clock hour, which lets
+// a caller spend up to twice its quota across an hour boundary; that is the
+// price of a reset time anyone can state.
+//
+// Our own tokens are not counted: the precache pass and the stress harness are
+// load we chose. A token that is neither ours nor a customer's is counted
+// against the address it came from, so a made-up token buys nothing.
+//
+// The limiter is a guard, not a dependency. When it cannot answer — no
+// binding, an object that throws, one that has not replied within
+// QUOTA_WAIT_MS — the request is served and the failure logged. An outage of
+// the counter must not become an outage of the API.
+const QUOTA_HOUR_MS = 3_600_000;
+const QUOTA_WAIT_MS = 1_000;
+const QUOTA_DASH = "https://dash.isotope13.io/";
+const QUOTA_SUPPORT = "support@isotope13.ai";
+const ANONYMOUS_QUOTA = 2_500;
+// Keyed by the tier dash writes into `tok:`, named as dash shows it, and the
+// same numbers dash draws usage against: change one, change both. `poc` is the
+// exception: it is not sold, and only the hand-written legacy rows below carry
+// it. A tier beamline does not know is held to the floor rather than refused.
+const TIER_QUOTAS = {
+  free: { name: "community", limit: 2_048 },
+  supporter: { name: "supporter", limit: 4_096 },
+  business: { name: "business", limit: 10_000 },
+  poc: { name: "poc", limit: 10_000 },
+  oem: { name: "critical", limit: 100_000 },
+};
+
+/**
+ * @param {Request} request
+ * @param {Record<string, unknown>} env
+ * @param {Caller} caller
+ * @param {string} rid
+ * @returns {Promise<Response|null>} a 429 once the caller's hour is spent, else null
+ */
+async function enforceQuota(request, env, caller, rid) {
+  const ns = env.QUOTA;
+  if (!ns || (caller?.known && !caller.org)) return null;
+  let subject, limit, label, message;
+  if (caller?.org) {
+    const known = Object.hasOwn(TIER_QUOTAS, caller.org.tier);
+    if (!known) logLine("quota_unknown_tier", { rid, tier: caller.org.tier });
+    const tier = known ? TIER_QUOTAS[caller.org.tier] : TIER_QUOTAS.free;
+    subject = `org:${caller.org.oid}`;
+    limit = tier.limit;
+    label = tier.name;
+    // There is no tier above critical to send anyone to.
+    message =
+      tier === TIER_QUOTAS.oem
+        ? `${tier.name}-tier quota exceeded, contact ${QUOTA_SUPPORT}`
+        : `${tier.name}-tier quota exceeded, visit ${QUOTA_DASH} to upgrade`;
+  } else {
+    const address = addressSubject(request.headers.get("cf-connecting-ip") || "");
+    // Only `node local.js` has no edge in front of it to say who is calling.
+    if (!address) return null;
+    subject = `ip:${address}`;
+    limit = ANONYMOUS_QUOTA;
+    label = "anonymous";
+    message = `anonymous quota exceeded, visit ${QUOTA_DASH} for a token`;
+  }
+
+  let timer;
+  let verdict;
+  try {
+    const stub = ns.get(ns.idFromName(subject));
+    verdict = await Promise.race([
+      stub.fetch(`https://quota/?limit=${limit}`).then((res) => res.json()),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`no answer in ${QUOTA_WAIT_MS}ms`)), QUOTA_WAIT_MS);
+      }),
+    ]);
+  } catch (err) {
+    logLine("quota_unavailable", { rid, quota: label, err: errText(err) });
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+  // Only an explicit refusal refuses. Anything else the object might say is
+  // the limiter failing, and that serves the request.
+  if (verdict?.allowed !== false) return null;
+
+  // The address stays out of the log, as it does everywhere else; the org is
+  // who to call.
+  logLine("quota_exceeded", { rid, quota: label, limit, oid: caller?.org?.oid });
+  const res = v1Error(429, "quota_exceeded", message);
+  res.headers.set("retry-after", String(Math.max(1, Math.ceil((verdict.reset - Date.now()) / 1000))));
+  return res;
+}
+
+// The address an anonymous quota is counted against. IPv4 is the address
+// itself; IPv6 is its /64, which is what one subscriber is usually handed, so
+// walking through it does not buy a fresh quota.
+/**
+ * @param {string} ip - CF-Connecting-IP, which the edge sets and a client cannot
+ * @returns {string} empty when there is no address
+ */
+function addressSubject(ip) {
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (mapped) return mapped[1];
+  if (!ip.includes(":")) return ip;
+  const [head, tail] = ip.split("::");
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = tail === undefined ? left : [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill("0"), ...right];
+  return `${groups.slice(0, 4).map((group) => parseInt(group, 16).toString(16)).join(":")}::/64`;
+}
+
+// One subject's hour: the Durable Object behind enforceQuota.
+//
+// A plain class answering fetch, not an RPC DurableObject, because that needs
+// `cloudflare:workers` and neither `node local.js` nor the tests can import
+// it. The count is stored rather than held in memory, so an object evicted
+// mid-hour does not hand its caller a fresh quota; the alarm deletes it once
+// the hour is over, so an address seen once does not leave a row forever.
+// Storage reads and writes hold the input gate, so two requests cannot both
+// read the same count.
+export class Quota {
+  /** @param {{storage: DurableObjectStorage}} state */
+  constructor(state) {
+    this.storage = state.storage;
+  }
+
+  /**
+   * @param {Request} request - `?limit=` is the subject's hourly quota
+   * @returns {Promise<Response>} `{allowed, reset}`, reset in epoch ms
+   */
+  async fetch(request) {
+    const limit = Number(new URL(request.url).searchParams.get("limit"));
+    const hour = Math.floor(Date.now() / QUOTA_HOUR_MS);
+    const reset = (hour + 1) * QUOTA_HOUR_MS;
+    const row = await this.storage.get("hour");
+    const used = row?.hour === hour ? row.count : 0;
+    // A refused request is not counted: the quota is what was served.
+    if (used >= limit) return Response.json({ allowed: false, reset });
+    await this.storage.put("hour", { hour, count: used + 1 });
+    if (used === 0) await this.storage.setAlarm(reset);
+    return Response.json({ allowed: true, reset });
+  }
+
+  async alarm() {
+    const row = await this.storage.get("hour");
+    if (row && row.hour < Math.floor(Date.now() / QUOTA_HOUR_MS)) await this.storage.deleteAll();
+  }
 }
 
 // One datapoint per request, written from the response the caller actually got.
@@ -615,6 +777,11 @@ async function dispatch(request, env, host, caller) {
   if (!caller?.known && tokenList(env.BEAMLINE_TOKEN).length) {
     return v1Error(401, "unauthorized", "Send your API key as `Authorization: Bearer <key>`.");
   }
+
+  // After the gate, so a refused token is told it is refused rather than that
+  // it is over a quota it never had.
+  const over = await enforceQuota(request, env, caller, rid);
+  if (over) return over;
 
   // Named after the token gate, because a pin spends a scan slot on demand.
   // Reported here rather than as an outage further down: an unservable pin is
@@ -5246,6 +5413,9 @@ export const _test = {
   annotatedV1Stream,
   tokenEq,
   tokenList,
+  addressSubject,
+  TIER_QUOTAS,
+  ANONYMOUS_QUOTA,
   classMs,
   cleanPurl,
   v1CacheAliasPaths,

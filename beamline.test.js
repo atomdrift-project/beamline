@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
-import { handle, _test } from "./beamline.js";
+import { handle, Quota, _test } from "./beamline.js";
 
 const HELLO_SHA = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
@@ -5516,4 +5516,218 @@ test("v1 lookup: a refused edge write still files the answer in KV", async () =>
   } finally {
     await scan.close();
   }
+});
+
+// Quotas. The object is tested against storage it cannot tell from the real
+// thing; the request path against a namespace that answers whatever the test
+// says, because what it decides is who is counted, against what, and what they
+// are told.
+
+function quotaStorage() {
+  const rows = new Map();
+  return {
+    rows,
+    alarm: null,
+    async get(key) {
+      return rows.get(key);
+    },
+    async put(key, value) {
+      rows.set(key, structuredClone(value));
+    },
+    async setAlarm(at) {
+      this.alarm = at;
+    },
+    async deleteAll() {
+      rows.clear();
+    },
+  };
+}
+
+const takeQuota = async (quota, limit) => (await quota.fetch(new Request(`https://quota/?limit=${limit}`))).json();
+
+test("quota: an hour serves exactly its limit, and refusals are not counted", async () => {
+  const storage = quotaStorage();
+  const quota = new Quota({ storage });
+  for (let i = 0; i < 3; i++) assert.equal((await takeQuota(quota, 3)).allowed, true);
+  for (let i = 0; i < 2; i++) assert.equal((await takeQuota(quota, 3)).allowed, false);
+  assert.equal(storage.rows.get("hour").count, 3);
+  const { reset } = await takeQuota(quota, 3);
+  assert.equal(reset % 3_600_000, 0, "the reset is the top of the hour");
+  assert.ok(reset > Date.now() && reset - Date.now() <= 3_600_000);
+  assert.equal(storage.alarm, reset, "the row is collected when its hour ends");
+});
+
+test("quota: a new hour starts from zero, and the alarm clears only a finished one", async () => {
+  const storage = quotaStorage();
+  const quota = new Quota({ storage });
+  const hour = Math.floor(Date.now() / 3_600_000);
+  storage.rows.set("hour", { hour: hour - 1, count: 99 });
+  assert.equal((await takeQuota(quota, 1)).allowed, true, "last hour's spend carried over");
+  await quota.alarm();
+  assert.equal(storage.rows.get("hour").count, 1, "the alarm deleted the hour in progress");
+  storage.rows.set("hour", { hour: hour - 1, count: 1 });
+  await quota.alarm();
+  assert.equal(storage.rows.size, 0);
+});
+
+test("quota: an IPv6 caller is counted by its /64, an IPv4 caller by its address", () => {
+  const same = ["2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:0db8:0001:0002:0:0:0:9"];
+  for (const ip of same) assert.equal(_test.addressSubject(ip), "2001:db8:1:2::/64", ip);
+  assert.equal(_test.addressSubject("2001:db8::1"), "2001:db8:0:0::/64");
+  assert.equal(_test.addressSubject("::1"), "0:0:0:0::/64");
+  assert.notEqual(_test.addressSubject("2001:db8:1:3::1"), _test.addressSubject("2001:db8:1:2::1"));
+  assert.equal(_test.addressSubject("203.0.113.9"), "203.0.113.9");
+  // Mapped IPv4 would otherwise put every such caller in one shared /64.
+  assert.equal(_test.addressSubject("::ffff:203.0.113.9"), "203.0.113.9");
+  assert.equal(_test.addressSubject(""), "");
+});
+
+function quotaNS(answer = () => ({ allowed: true, reset: Date.now() + 60_000 })) {
+  const asked = [];
+  return {
+    asked,
+    idFromName: (name) => name,
+    get: (name) => ({
+      async fetch(url) {
+        const limit = Number(new URL(url).searchParams.get("limit"));
+        asked.push({ name, limit });
+        const verdict = await answer(name, limit);
+        return verdict instanceof Response ? verdict : Response.json(verdict);
+      },
+    }),
+  };
+}
+
+const refuseAll = () => ({ allowed: false, reset: Date.now() + 90_000 });
+
+// A route that answers instantly once admitted, so a test times the quota and
+// nothing behind it.
+function quotaRequest(headers = {}) {
+  return new Request("http://beamline/v1/nope", { headers });
+}
+
+test("quota: each tier is counted per org at its own limit, and told how to upgrade", async () => {
+  for (const [tier, want] of Object.entries(_test.TIER_QUOTAS)) {
+    const QUOTA = quotaNS(refuseAll);
+    const env = {
+      ...testEnv("http://unused"),
+      TOKENS_KV: tokenKV({ [`tok:${CUSTOMER}`]: JSON.stringify({ oid: "org1", tier }) }),
+      QUOTA,
+    };
+    const res = await handle(quotaRequest({ authorization: `Bearer ${CUSTOMER}`, "cf-connecting-ip": "203.0.113.9" }), env, {});
+    assert.equal(res.status, 429);
+    assert.deepEqual(QUOTA.asked, [{ name: "org:org1", limit: want.limit }], "a customer is counted by org, not address");
+    const { error } = await res.json();
+    assert.equal(error.code, "quota_exceeded");
+    assert.equal(
+      error.message,
+      tier === "oem"
+        ? "critical-tier quota exceeded, contact support@isotope13.ai"
+        : `${want.name}-tier quota exceeded, visit https://dash.isotope13.io/ to upgrade`,
+    );
+    const retry = Number(res.headers.get("retry-after"));
+    assert.ok(retry >= 89 && retry <= 90, `retry-after ${retry}`);
+  }
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(_test.TIER_QUOTAS).map(([k, v]) => [k, v.limit])),
+    { free: 2_048, supporter: 4_096, business: 10_000, poc: 10_000, oem: 100_000 },
+  );
+});
+
+test("quota: anonymous callers are counted by address and told to get a token", async () => {
+  const QUOTA = quotaNS(refuseAll);
+  const env = { ...testEnv("http://unused"), QUOTA };
+  const res = await handle(quotaRequest({ "cf-connecting-ip": "2001:db8:1:2::7" }), env, {});
+  assert.equal(res.status, 429);
+  assert.deepEqual(QUOTA.asked, [{ name: "ip:2001:db8:1:2::/64", limit: _test.ANONYMOUS_QUOTA }]);
+  assert.equal(_test.ANONYMOUS_QUOTA, 2_500);
+  assert.equal(
+    (await res.json()).error.message,
+    "anonymous quota exceeded, visit https://dash.isotope13.io/ for a token",
+  );
+});
+
+test("quota: a token that is nobody's is counted as the address it came from", async () => {
+  const QUOTA = quotaNS(refuseAll);
+  const env = { ...testEnv("http://unused"), TOKENS_KV: tokenKV(), QUOTA };
+  const res = await handle(
+    quotaRequest({ authorization: "Bearer i13_cobalt60_00000000000000000000000000", "cf-connecting-ip": "203.0.113.9" }),
+    env,
+    {},
+  );
+  assert.equal(res.status, 429);
+  assert.deepEqual(QUOTA.asked, [{ name: "ip:203.0.113.9", limit: _test.ANONYMOUS_QUOTA }]);
+});
+
+test("quota: an unknown tier is held to the community quota, not refused", async () => {
+  const QUOTA = quotaNS();
+  const env = {
+    ...testEnv("http://unused"),
+    TOKENS_KV: tokenKV({ [`tok:${CUSTOMER}`]: JSON.stringify({ oid: "org1", tier: "enterprise" }) }),
+    QUOTA,
+  };
+  const res = await handle(quotaRequest({ authorization: `Bearer ${CUSTOMER}` }), env, {});
+  assert.equal(res.status, 404);
+  assert.deepEqual(QUOTA.asked, [{ name: "org:org1", limit: _test.TIER_QUOTAS.free.limit }]);
+});
+
+test("quota: our own tokens, health checks and the docs are never counted", async () => {
+  const QUOTA = quotaNS(refuseAll);
+  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "ops-secret", QUOTA };
+  const ip = { "cf-connecting-ip": "203.0.113.9" };
+  assert.equal((await handle(quotaRequest({ ...ip, authorization: "Bearer ops-secret" }), env, {})).status, 404);
+  assert.equal((await handle(new Request("http://beamline/healthz", { headers: ip }), env, {})).status, 200);
+  assert.equal((await handle(new Request("http://beamline/", { headers: ip }), env, {})).status, 200);
+  // A gated deployment refuses an anonymous caller as unauthorized, not as over quota.
+  assert.equal((await handle(quotaRequest(ip), env, {})).status, 401);
+  assert.deepEqual(QUOTA.asked, []);
+});
+
+test("quota: a limiter that fails or stalls serves the request", { timeout: 5000 }, async () => {
+  const failures = [
+    () => { throw new Error("Durable Object is overloaded"); },
+    () => new Response("internal error", { status: 500 }),
+    () => ({ unexpected: true }),
+    () => new Promise(() => {}),
+  ];
+  for (const answer of failures) {
+    const env = { ...testEnv("http://unused"), QUOTA: quotaNS(answer) };
+    const started = Date.now();
+    const res = await handle(quotaRequest({ "cf-connecting-ip": "203.0.113.9" }), env, {});
+    assert.equal(res.status, 404, String(answer));
+    assert.ok(Date.now() - started < 2_000, "a stalled limiter held the request");
+  }
+});
+
+test("a legacy token is a customer until its cutoff, and nobody after it", async (t) => {
+  const legacy = "x-example-2026-01";
+  const kv = tokenKV({ [`tok:${legacy}`]: JSON.stringify({ oid: "legacyorg", tier: "free" }) });
+  const QUOTA = quotaNS();
+  const env = { ...testEnv("http://unused"), TOKENS_KV: kv, QUOTA };
+  const request = () => quotaRequest({ authorization: `Bearer ${legacy}`, "cf-connecting-ip": "203.0.113.9" });
+
+  t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 10, 4, 23, 59) });
+  await handle(request(), env, {});
+  assert.deepEqual(QUOTA.asked.at(-1), { name: "org:legacyorg", limit: _test.TIER_QUOTAS.free.limit });
+
+  // Whatever the namespace still holds: an expiration left off the row must
+  // not keep the token alive.
+  t.mock.timers.setTime(Date.UTC(2026, 10, 5));
+  const reads = kv.reads;
+  await handle(request(), env, {});
+  assert.equal(kv.reads, reads, "a legacy token was looked up past its cutoff");
+  assert.deepEqual(QUOTA.asked.at(-1), { name: "ip:203.0.113.9", limit: _test.ANONYMOUS_QUOTA });
+});
+
+test("only the legacy shape is looked up, not anything that starts like it", async () => {
+  const kv = tokenKV();
+  const env = { ...testEnv("http://unused"), TOKENS_KV: kv };
+  const bogus = ["x-example", "x-Example-2026-01", "x--2026-01", "x-example-2026-01-", "y-example-2026-01", `x-${"ab-".repeat(21)}c`];
+  for (const token of bogus) await handle(quotaRequest({ authorization: `Bearer ${token}` }), env, {});
+  assert.equal(kv.reads, 0);
+  // Both shapes that were actually handed out.
+  for (const token of ["x-example-2026-01", "x-example-poc-api-2026-01-02-xyz"]) {
+    await handle(quotaRequest({ authorization: `Bearer ${token}` }), env, {});
+  }
+  assert.equal(kv.reads, 2);
 });

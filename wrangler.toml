@@ -36,6 +36,19 @@ dataset = "beamline_requests"
 # of its own that beamline is not bound to. Passed to `make deploy-cf` as
 # TOKENS; omitting it leaves beamline exactly as it was before customers
 # existed.
+# Hourly request quotas, counted by the Quota class in beamline.js: one object
+# per org, or per address for a caller without a customer token. A Durable
+# Object because the rate-limit binding counts per colo over at most a minute,
+# and a quota is global and hourly. It needs no account-specific id, so it lives
+# here. Beamline serves every request when this binding is missing or failing.
+[[durable_objects.bindings]]
+name = "QUOTA"
+class_name = "Quota"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Quota"]
+
 [observability]
 enabled = true
 head_sampling_rate = 1
