@@ -167,8 +167,9 @@ the assessment. These fields are stream telemetry only; they are not stored in
 the verdict cache.
 
 A `{"state":"resumed","worker":"…"}` frame means the scan worker serving the run
-was lost — taken down, upgraded, or gone silent — and Beamline handed the run to
-another one without interrupting your stream. It carries no `status`, so the
+was lost — taken down, upgraded, gone silent, or unable to reach a dependency —
+and Beamline handed the run to another one without interrupting your stream.
+It carries no `status`, so the
 rule above still holds: keep reading until a line carries one. Expect the phase
 sequence to restart after it, since the replacement worker reports its own
 phases. Elapsed times do not go backwards across a resume; Beamline keeps the

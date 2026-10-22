@@ -2767,7 +2767,6 @@ async function v1Resume(env, ctx, job, tried) {
       logLine("v1_analyze_resume", { src: "scan", status: upstream.status, worker, ...ids });
       continue;
     }
-    breakerFor(base).ok();
     if (worker !== busy) noteDispatch(base);
     logLine("v1_analyze_resume", {
       src: "scan",
@@ -2849,6 +2848,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   // somebody waited for.
   let abandoned = false;
   let refused = false;
+  let outage = null;
   let finished = false;
   let handovers = 0;
   let refusals = 0;
@@ -2869,7 +2869,18 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   // travel backwards.
   const phase = { name: null, startedElapsed: 0, lastElapsed: 0, floor: 0, changedAt: Date.now() };
 
-  const encodeLine = (line) => {
+  const encodeLine = (line, terminalOutage = false) => {
+    const row = parseJson(line);
+    const unavailable = isOutage(row);
+    // Package refusals survive a healthier worker. An unqualified outage is
+    // about this worker: hold it until another worker has had a chance, so the
+    // caller still sees exactly one terminal answer.
+    const retryable = unavailable && !["unretrievable", "too_large", "invalid_artifact", "unsupported_artifact"].includes(row.reason);
+    if (retryable && !terminalOutage) {
+      if (serving && !outage) breakerFor(serving).fail();
+      outage = line;
+      if (!abandoned) return [];
+    }
     const annotated = annotatedV1Lines(line, budget, meta, phase);
     if (annotated.refused) refused = true;
     // A decision is terminal by contract. Register its short cache write as
@@ -2879,16 +2890,16 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
       decisionSeen = true;
       // The worker finished what it took on. Charged to whoever is serving the
       // stream now, which after a handover is not who started it.
-      if (serving) breakerFor(serving).ok();
+      if (serving && !retryable) breakerFor(serving).ok();
       // How long the caller waited for an answer, as against the headers this
       // response opened with minutes ago. Telemetry must never take a stream
       // down with it, so it is guarded like the logging around it.
       try {
-        meta.settled?.({ finisher: serving ? hostOf(serving) : null, orphaned: abandoned });
+        if (!unavailable) meta.settled?.({ finisher: serving ? hostOf(serving) : null, orphaned: abandoned });
       } catch (err) {
         logLine("v1_analyze_verdict", { recorded: false, err: errText(err), ...meta.ids });
       }
-      if (onDecision) {
+      if (onDecision && !unavailable) {
         try {
           onDecision(annotated.decision);
         } catch (err) {
@@ -2899,8 +2910,8 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     return annotated.lines.map((row) => encoder.encode(`${row}\n`));
   };
 
-  const push = (line) => {
-    for (const encoded of encodeLine(line)) queued.push(encoded);
+  const push = (line, terminalOutage = false) => {
+    for (const encoded of encodeLine(line, terminalOutage)) queued.push(encoded);
   };
 
   // One chunk, or a rejection when the worker stops talking.
@@ -2953,7 +2964,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     // it failed every caller. A refusal is the exception: the worker answered
     // promptly and correctly that it had no room for this one.
     // A stalled stream is still talking, so its worker is alive too.
-    if (why !== "refused" && why !== "stalled") breakerFor(serving).fail();
+    if (why !== "refused" && why !== "stalled" && why !== "unavailable") breakerFor(serving).fail();
     // Refusals have their own budget. One costs milliseconds and says nothing
     // about the request, and three of them spending the handovers left an
     // 11-minute analysis on the fourth worker to be cut at its first stall.
@@ -2986,6 +2997,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     decoder = new TextDecoder();
     buffered = "";
     refused = false;
+    outage = null;
     phase.floor = phase.lastElapsed;
     phase.name = null;
     phase.changedAt = Date.now();
@@ -3004,6 +3016,15 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
         ...(meta.locator?.type === "url" ? { url: meta.locator.value } : {}),
       }),
     );
+    return true;
+  };
+
+  const recoverOutage = async () => {
+    if (!outage) return false;
+    const held = outage;
+    if (await handover("unavailable")) return true;
+    push(held, true);
+    finished = true;
     return true;
   };
 
@@ -3100,6 +3121,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
             push(buffered);
             buffered = "";
           }
+          if (await recoverOutage()) continue;
           // A clean close with no decision is a truncation too: a worker taken
           // down between frames shuts its side politely and says nothing.
           if (!decisionSeen && (await handover(refused ? "refused" : "eof"))) continue;
@@ -3109,7 +3131,11 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
         buffered += decoder.decode(result.value, { stream: true });
         const lines = buffered.split("\n");
         buffered = lines.pop() ?? "";
-        for (const line of lines) push(line);
+        for (const line of lines) {
+          push(line);
+          if (outage || decisionSeen) break;
+        }
+        await recoverOutage();
       }
     },
     // The caller stopped reading.
@@ -3160,7 +3186,7 @@ function annotatedV1Lines(line, budget, meta, phase) {
 
   // A decision is the terminal event. Close the last reported phase in its own
   // frame so clients never have to infer completion from the decision shape.
-  if (Object.prototype.hasOwnProperty.call(row, "decision") || (meta.full && isFullEnvelope(row))) {
+  if (Object.prototype.hasOwnProperty.call(row, "decision") || isOutage(row) || (meta.full && isFullEnvelope(row))) {
     const done = phaseCompletion(meta, phase);
     return {
       lines: [...(done ? [JSON.stringify(done)] : []), budgetedV1Line(line, budget, meta.locator)],

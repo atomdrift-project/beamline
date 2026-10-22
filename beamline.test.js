@@ -4218,6 +4218,100 @@ test("v1 analyze: a feed-derived level is not an answer to `analyze`", async () 
 const CUT_FRAME = '{"state":"analyzing","purl":"pkg:npm/cut@1.0.0","elapsed_ms":40,"phase":"unpack"}';
 const CUT_DECISION = '{"decision":"allow","fires_at":-1,"purl":"pkg:npm/cut@1.0.0"}';
 
+test("v1 analyze: a streamed infrastructure outage falls back before emitting a terminal answer", async () => {
+  for (const failure of [
+    { decision: "unavailable", reason: null },
+    { decision: "unavailable", reason: "fetch_unavailable" },
+    { status: "unavailable", cause: "unreachable" },
+  ]) {
+    _test.reset();
+    const broken = await mockBackend({ analyzeStream: [CUT_FRAME, JSON.stringify(failure)] });
+    const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+    try {
+      const frames = await analyzeFrames(testEnv(DEAD, { SCAN_URL: `${broken.url},${healthy.url}` }));
+      assert.equal(frames.at(-1).status, "analyzed");
+      assert.equal(frames.filter((f) => f.status || f.decision).length, 1, "an outage leaked before the verdict");
+      assert.ok(frames.some((f) => f.state === "resumed"));
+      assert.equal(broken.hits.analyze, 1);
+      assert.equal(healthy.hits.analyze, 1);
+    } finally {
+      await Promise.all([broken.close(), healthy.close()]);
+    }
+  }
+});
+
+test("v1 analyze: package refusals remain terminal and do not eject healthy workers", async () => {
+  for (const reason of ["unretrievable", "too_large", "invalid_artifact", "unsupported_artifact"]) {
+    _test.reset();
+    const refused = await mockBackend({ analyzeStream: [CUT_FRAME, JSON.stringify({ decision: "unavailable", reason })] });
+    const spare = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+    try {
+      const frames = await analyzeFrames(testEnv(DEAD, { SCAN_URL: `${refused.url},${spare.url}` }));
+      assert.equal(frames.at(-1).status, "unavailable");
+      assert.equal(frames.at(-1).reason, reason);
+      assert.equal(spare.hits.analyze, 0);
+      assert.equal(_test.breakerFor(refused.url).open(), false);
+    } finally {
+      await Promise.all([refused.close(), spare.close()]);
+    }
+  }
+});
+
+test("v1 analyze: an outage hands over without waiting for EOF and accepts an unterminated verdict", { timeout: 5000 }, async () => {
+  _test.reset();
+  const encoder = new TextEncoder();
+  const outage = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode('{"decision":"unavailable"}\n'));
+      // The faulty worker keeps its connection open after reporting failure.
+    },
+  });
+  let resumes = 0;
+  let cached = 0;
+  let settled = 0;
+  const stream = _test.annotatedV1Stream(outage, 25, {
+    requestId: "test", startedAt: Date.now(), ids: {}, settled: () => { settled += 1; },
+  }, () => { cached += 1; }, {
+    base: DEAD, idleMs: 0, limit: 1,
+    resume: async () => {
+      resumes += 1;
+      return { base: "http://healthy.test", body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(CUT_DECISION));
+          controller.close();
+        },
+      }) };
+    },
+  });
+  const frames = (await new Response(stream).text()).trim().split("\n").map(JSON.parse);
+  assert.equal(resumes, 1);
+  assert.equal(frames.at(-1).status, "analyzed");
+  assert.equal(frames.filter((f) => f.status || f.decision).length, 1);
+  assert.equal(cached, 1, "only the surviving verdict may be cached");
+  assert.equal(settled, 1, "only the surviving verdict may be timed");
+});
+
+test("v1 analyze: a fleet of streamed outages returns one unavailable and opens its breakers", async () => {
+  _test.reset();
+  const workers = await Promise.all([1, 2].map(() => mockBackend({
+    analyzeStream: [CUT_FRAME, '{"decision":"unavailable","reason":null}'],
+  })));
+  const points = [];
+  const env = { ...testEnv(DEAD, { SCAN_URL: workers.map((w) => w.url).join(","), SCAN_STREAM_RESUMES: "1" }),
+    BEAMLINE_AE: { writeDataPoint: (point) => points.push(point) } };
+  try {
+    for (let i = 0; i < _test.BREAKER_FAILS; i++) {
+      const frames = await analyzeFrames(env);
+      assert.equal(frames.at(-1).status, "unavailable");
+      assert.equal(frames.filter((f) => f.status || f.decision).length, 1);
+    }
+    for (const w of workers) assert.equal(_test.breakerFor(w.url).open(), true, "200 acceptance erased failure history");
+    assert.ok(!points.some((p) => p.blobs[0] === "analyze:verdict"), "an outage was timed as a verdict");
+  } finally {
+    await Promise.all(workers.map((w) => w.close()));
+  }
+});
+
 // Drives one analyze against `SCAN_URL` and returns the parsed NDJSON frames.
 async function analyzeFrames(env) {
   const res = await handle(
