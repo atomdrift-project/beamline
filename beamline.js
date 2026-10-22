@@ -1073,6 +1073,10 @@ function v1CachePath(sha, locators, follow, full = false) {
     query.push(`${locator.type}=${encodeURIComponent(locator.value)}`);
   }
   if (follow) query.push(`follow=${encodeURIComponent(follow)}`);
+  // Release selection changed from one payload to the most critical payload.
+  // Isolate PURL cache entries from answers filed under the previous rule.
+  // A null follow builds the upstream request, which needs no cache revision.
+  if (follow && !sha && locators?.some((locator) => locator.type === "purl")) query.push("purl_selection=critical");
   if (full) query.push("full=1");
   return `/v1/lookup?${query.join("&")}`;
 }
@@ -1148,7 +1152,11 @@ async function backfillDigestKey(env, cache, origin, body, follow, full = false)
  */
 function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonicalPurl, full = false) {
   const paths = new Set([requestedPath]);
-  if (locator) paths.add(v1CachePath(null, [locator], follow, full));
+  // An exact-artifact answer covers one payload. A PURL-only answer covers
+  // the release's most critical payload, so only that question may warm a
+  // PURL key. A digest paired with a PURL still asks about exact bytes.
+  const releaseLookup = locator?.type === "purl" && !new URL(requestedPath, origin).searchParams.has("sha256");
+  if (locator && (locator.type !== "purl" || releaseLookup)) paths.add(v1CachePath(null, [locator], follow, full));
   // The normalized spelling of the coordinate that was asked, as scan
   // reported it. Not a PURL somebody else chose - the same one, written the
   // one way the normalizer writes it, which is the only spelling every other
@@ -1159,12 +1167,12 @@ function v1CacheAliasPaths(origin, requestedPath, locator, body, follow, canonic
   // `@v4.4.0%2Bincompatible` are one artifact by sha and were two entries
   // here, so the second spelling to arrive bought an analysis the first had
   // already paid for. Go pseudo-versions make that spelling common.
-  if (canonicalPurl) paths.add(v1CachePath(null, [{ type: "purl", value: canonicalPurl }], follow, full));
+  if (releaseLookup && canonicalPurl) paths.add(v1CachePath(null, [{ type: "purl", value: canonicalPurl }], follow, full));
   const sha = v1DecisionSha(body);
   if (sha) paths.add(v1CachePath(sha, [], follow, full));
   const row = parseJson(body);
   if (row && !Array.isArray(row) && typeof row === "object") {
-    if (typeof row.purl === "string" && row.purl.trim()) {
+    if (releaseLookup && typeof row.purl === "string" && row.purl.trim()) {
       paths.add(v1CachePath(null, [{ type: "purl", value: row.purl.trim() }], follow, full));
     }
     if (typeof row.url === "string" && validArtifactUrl(row.url.trim())) {

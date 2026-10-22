@@ -66,6 +66,32 @@ test("scan timeout default is 1800s", () => {
   assert.equal(_test.DEFAULT_SCAN_TIMEOUT_MS, 1_800_000);
 });
 
+test("an exact-artifact verdict cannot warm the release's PURL cache", () => {
+  const purl = "pkg:pypi/litellm@1.107.0";
+  const sha = "a".repeat(64);
+  const body = JSON.stringify({ purl, sha256: sha, status: "analyzed", fires_at: -1 });
+  for (const [path, locator] of [
+    [_test.v1CachePath(sha, [], "references"), null],
+    [_test.v1CachePath(sha, [{ type: "purl", value: purl }], "references"), { type: "purl", value: purl }],
+    [_test.v1CachePath(null, [{ type: "url", value: "https://example.test/payload.whl" }], "references"), { type: "url", value: "https://example.test/payload.whl" }],
+  ]) {
+    const keys = _test.v1CacheAliasPaths("https://b.example", path, locator, body, "references", purl);
+    assert.ok(!keys.some((key) => {
+      const query = new URL(key.url).searchParams;
+      return query.has("purl") && !query.has("sha256");
+    }), path);
+    assert.ok(keys.some((key) => new URL(key.url).searchParams.get("sha256") === sha));
+  }
+});
+
+test("PURL cache keys separate critical selection from old single-payload answers", () => {
+  const locator = { type: "purl", value: "pkg:pypi/litellm@1.107.0" };
+  assert.match(_test.v1CachePath(null, [locator], "references"), /purl_selection=critical/);
+  assert.doesNotMatch(_test.v1CachePath(null, [locator], null), /purl_selection/);
+  assert.doesNotMatch(_test.v1CachePath(HELLO_SHA, [locator], "references"), /purl_selection/);
+  assert.doesNotMatch(_test.v1CachePath(HELLO_SHA, [], "references"), /purl_selection/);
+});
+
 test("GET /healthz", async () => {
   const res = await handle(new Request("http://beamline/healthz"), {}, {});
   assert.equal(res.status, 200);
@@ -641,7 +667,7 @@ test("v1: a digest resolves the same policy as the PURL that answered it", async
   }
 });
 
-test("v1 analyze: exact URL reaches scan and warms locator aliases", async () => {
+test("v1 analyze: exact URL reaches scan and warms its URL alias", async () => {
   const artifactUrl = "https://cdn.example.test/files/app-1.0.0.tgz";
   const purl = "pkg:npm/app@1.0.0";
   let forwarded;
@@ -664,10 +690,9 @@ test("v1 analyze: exact URL reaches scan and warms locator aliases", async () =>
     assert.equal(forwarded.searchParams.get("url"), artifactUrl);
     await ctx.flush();
 
-    // Under the policy the URL scan answered, which is `none`. The PURL's own
-    // default is a different question and must still be cold.
+    // Exact URL analysis answers for those bytes, under follow=none.
     const cached = await handle(
-      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=none`),
+      new Request(`http://beamline/v1/lookup?url=${encodeURIComponent(artifactUrl)}&follow=none`),
       env,
       noopCtx(),
     );
@@ -2157,7 +2182,7 @@ test("v1 analyze: answering from cache still opens the digest door", async () =>
   // The state this exists for: the PURL key warm, the digest key cold. Both at
   // `references`, the policy a PURL with no stated one resolves to.
   await cache.put(
-    new Request("http://beamline/v1/lookup?purl=pkg%3Anpm%2Fevil%401.0.0&follow=references"),
+    new Request(`http://beamline${_test.v1CachePath(null, [{ type: "purl", value: "pkg:npm/evil@1.0.0" }], "references")}`),
     new Response(decision, {
       status: 200,
       headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" },
@@ -2209,7 +2234,7 @@ test("v1 analyze: the digest back-fill never refreshes an entry already there", 
       status: 200,
       headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" },
     });
-  await inner.put(key("purl=pkg%3Anpm%2Fevil%401.0.0&follow=references"), stored(decision));
+  await inner.put(new Request(`http://beamline${_test.v1CachePath(null, [{ type: "purl", value: "pkg:npm/evil@1.0.0" }], "references")}`), stored(decision));
   await inner.put(key(`sha256=${sha}&follow=references`), stored(decision));
 
   const scan = await mockBackend({ analyzeStream: [decision] });
@@ -2641,7 +2666,7 @@ test("v1: KV writes expire, a verdict on the long clock and an unanalyzed row on
   }
 });
 
-test("v1: exact URL aliases the URL, PURL, and SHA cache keys within its policy", async () => {
+test("v1: exact URL aliases URL and SHA keys while the PURL asks about the release", async () => {
   const artifactUrl = "https://registry.example.test/npm/app/-/app-1.0.0.tgz";
   const purl = "pkg:npm/app@1.0.0";
   let forwarded;
@@ -2674,12 +2699,9 @@ test("v1: exact URL aliases the URL, PURL, and SHA cache keys within its policy"
     assert.equal(forwarded.searchParams.get("url"), artifactUrl);
     await firstCtx.flush();
 
-    // Every name for the artifact, all asking the question the URL lookup
-    // answered. A URL resolves to `follow=none`, so that is where the answer is
-    // filed under each of them.
+    // The URL and digest both name this artifact, under follow=none.
     for (const query of [
       `url=${encodeURIComponent(artifactUrl)}&follow=none`,
-      `purl=${encodeURIComponent(purl)}&follow=none`,
       `sha256=${HELLO_SHA}&follow=none`,
     ]) {
       const res = await handle(new Request(`http://beamline/v1/lookup?${query}`), env, noopCtx());
@@ -2691,6 +2713,15 @@ test("v1: exact URL aliases the URL, PURL, and SHA cache keys within its policy"
       else assert.equal(body.url, undefined);
     }
     assert.equal(scan.hits.v1, 1, "aliases should prevent a second scan lookup");
+
+    const byRelease = await handle(
+      new Request(`http://beamline/v1/lookup?purl=${encodeURIComponent(purl)}&follow=none`),
+      env,
+      noopCtx(),
+    );
+    assert.equal(byRelease.headers.get("x-beamline-source"), "scan:analysis");
+    await byRelease.text();
+    assert.equal(scan.hits.v1, 2, "a release lookup must reach the worker independently");
 
     // Names alias, policies do not. A PURL with no stated policy asks about the
     // dependency graph's install commands; this answer followed nothing, and

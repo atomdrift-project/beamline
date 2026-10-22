@@ -82,6 +82,15 @@ repeated parameter answers with a list, in the order asked. The shape follows
 the question, not the data, so a caller that always asks about one always gets
 one.
 
+A versioned PURL can name several payloads, such as a wheel and a source
+distribution. The corpus selects the analyzed payload with the lowest level
+greater than `-1`. If none fires, a clean (`-1`) result precedes a missing level.
+Equal levels prefer the most recent analysis, then the SHA-256 for a stable
+tie-break. The returned digest and findings belong to that selected payload.
+A versionless lookup retains its newest-analysis behavior. Use `sha256` for
+the verdict on specific bytes; an exact-artifact answer does not populate the
+release's PURL cache.
+
 Over 50 packages is a `413`. There is no batch limit on `/v1/analyze` because it
 takes one package.
 
