@@ -52,6 +52,11 @@ const LOOKUP_RETRIES = 1;
 const LOOKUP_RETRY_BASE_MS = 100;
 const LOOKUP_RETRY_MAX_MS = 500;
 const LOOKUP_RETRY_DEADLINE_MS = 5_000;
+// How many workers one batch lookup is split across. An invocation holds at
+// most six connections open at once, shared with the cache writes and stats
+// polls a lookup starts behind it; past that a chunk would wait for a
+// connection while its timeout ran.
+const LOOKUP_SPLIT_MAX = 4;
 // How long an analyze stream may go without a frame before its worker is taken
 // for gone. Scan emits progress while it works, so silence is not patience: it
 // is a worker that stopped talking without closing the connection, the one
@@ -264,6 +269,8 @@ const scanBreakers = new Map();
  * @property {number} startedAt
  * @property {Ids} ids
  * @property {(outcome: {finisher: string|null, orphaned: boolean}) => void} [settled]
+ * @property {(worker: string|null, outcome: string) => void} [answered] - one
+ *   worker's answer or departure; see ROUTE_ANSWER
  * @property {boolean} full
  */
 
@@ -632,6 +639,21 @@ const ROUTE_VERDICT = "analyze:verdict";
 // silently omits them would understate what analysis costs.
 const ROUTE_ORPHAN = "analyze:orphan";
 
+// What each worker said: one row per worker per analyze, not per request.
+//
+// ROUTE_VERDICT is the caller's side; this is the fleet's. The two differ
+// exactly when a request was handed over, and a handover is what hides a sick
+// worker: rdu2 lost its registry egress on 2026-10-23 and answered
+// `unretrievable` for everything, every caller got a verdict from someone
+// else, and every caller-facing series looked healthy. The status blob holds
+// the outcome rather than an HTTP status: `analyzed`, a package refusal
+// (`unretrievable`, `too_large`, …), `unavailable`, or why the stream was
+// given up (`idle`, `stalled`, `eof`, `error`, `refused`).
+const ROUTE_ANSWER = "analyze:answer";
+
+// Outages that are facts about the package, not the worker, as scan names them.
+const PACKAGE_REFUSALS = new Set(["unretrievable", "too_large", "invalid_artifact", "unsupported_artifact"]);
+
 // One datapoint, written the same way wherever it is written from.
 //
 // Read off the headers that went out rather than threaded down from where the
@@ -661,7 +683,7 @@ const ROUTE_ORPHAN = "analyze:orphan";
  * @param {string} route - a named route, never one derived from the path
  * @param {Headers} headers - the response's, read for X-Beamline-Source
  * @param {string} ecosystem
- * @param {number} status
+ * @param {number|string} status - the HTTP status, or on ROUTE_ANSWER the outcome
  * @param {number} ms
  * @param {Org|null} [org] - the org to index under; omitted leaves it unindexed
  * @returns {void}
@@ -909,22 +931,33 @@ async function handleV1Lookup(env, ctx, url) {
   const budget = parseFalsePositiveBudget(budgetRaw);
   const purls = url.searchParams.getAll("purl").map((value) => normalizePurl(value)).filter(Boolean);
   const urls = url.searchParams.getAll("url").map((value) => value.trim()).filter(Boolean);
-  const sha = (url.searchParams.get("sha256") || "").trim().toLowerCase();
-  const locators = urls.length ? urls.map((value) => ({ type: "url", value })) : purls.map((value) => ({ type: "purl", value }));
+  const shas = url.searchParams.getAll("sha256").map((value) => value.trim().toLowerCase()).filter(Boolean);
+  // One digest is the artifact's identity and pairs with a PURL naming the same
+  // bytes. Several digests are several artifacts, listed the way several PURLs
+  // are, so they travel as locators and answer with a list.
+  const sha = shas.length === 1 ? shas[0] : "";
+  const locators = urls.length
+    ? urls.map((value) => ({ type: "url", value }))
+    : shas.length > 1
+      ? shas.map((value) => ({ type: "sha256", value }))
+      : purls.map((value) => ({ type: "purl", value }));
 
   if (purls.length && urls.length) {
     return v1Error(400, "multiple_locators", "Use ?purl= or ?url=, not both.");
+  }
+  if (shas.length > 1 && (purls.length || urls.length)) {
+    return v1Error(400, "multiple_locators", "Several sha256 values name several artifacts; send them without ?purl= or ?url=.");
+  }
+  // Checked here as /v1/analyze and /v1/flush check it. Anything else would be
+  // a cache key and a worker request spent on a name no artifact can have.
+  if (shas.some((value) => !SHA_RE.test(value))) {
+    return v1Error(400, "invalid_sha256", "sha256 must be 64 hexadecimal characters.");
   }
   if (urls.some((value) => !validArtifactUrl(value))) {
     return v1Error(400, "invalid_url", "url must be an absolute http or https URL with no credentials in it.");
   }
   if (!sha && !locators.length) {
     return v1Error(400, "missing_package", "Name an artifact with ?purl=, ?url=, or ?sha256=.");
-  }
-  // Checked here as /v1/analyze and /v1/flush check it. Anything else would be
-  // a cache key and a worker request spent on a name no artifact can have.
-  if (sha && !SHA_RE.test(sha)) {
-    return v1Error(400, "invalid_sha256", "sha256 must be 64 hexadecimal characters.");
   }
   if (locators.length > V1_MAX_KEYS) {
     return v1Error(
@@ -1020,12 +1053,18 @@ async function handleV1Lookup(env, ctx, url) {
   return v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, follow.value);
 }
 
-// Ask the workers in turn until one answers.
+// Ask the fleet, a batch split across it.
 //
-// Sequential rather than raced, and one worker rather than all of them: a v1
-// lookup spends no analysis slot, and since every worker defers to the same
-// corpus when it does not know, they now give the same answer. Broadcasting
-// would multiply the load behind them to learn nothing.
+// One locator is one question for one worker. A batch is split into one
+// contiguous chunk per live worker and the chunks are asked at once: a worker
+// answers its share from a single index query, so the fleet answers a batch in
+// parallel rather than one worker answering all of it while the rest sit idle.
+// Each chunk starts at a different worker and falls back through the others on
+// its own, so a worker that fails costs its chunk a retry and nobody else's.
+// The rows go back together in the order asked.
+//
+// One chunk — a single locator, a pinned worker, a fleet of one — is exactly
+// the request this always sent.
 /**
  * @param {Record<string, unknown>} env
  * @param {Ctx} ctx
@@ -1042,11 +1081,82 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
   const ids = v1LocatorIds(ctx.rid, sha, locators);
   const locator = locators.length === 1 ? locators[0] : null;
   const origin = new URL(cacheKey.url).origin;
+  // Ranked once for every chunk. Each chunk ranking for itself would advance
+  // the shared rotation once per chunk, and two chunks could start at one worker.
+  const order = await lookupOrder(env, ctx, scanWorkers(env, ctx.pin), ids);
+  const count = Math.max(1, Math.min(order.length, locators.length, LOOKUP_SPLIT_MAX));
+  const parts = Array.from({ length: count }, (_, i) =>
+    locators.slice(Math.floor((i * locators.length) / count), Math.floor(((i + 1) * locators.length) / count)));
+  if (count > 1) logLine("v1_lookup_split", { parts: count, keys: locators.length, ...ids });
+  const asked = await Promise.all(parts.map((part, i) => v1AskFleet(env, ctx, sha, part, order, i)));
+
+  // A 4xx is this request being wrong, which every worker would say.
+  // Passed through verbatim so the caller reads scan's own reason.
+  const refused = asked.find((answer) => answer.status !== 200);
+  if (refused) return v1Body(env, refused.body, refused.status, refused.worker, 0, refused.source);
+
+  // Nobody could answer a chunk. Not a 5xx: the caller asked what we know about
+  // some packages, and "we could not find out" is an answer about each of them —
+  // one their policy is entitled to treat differently from "nobody has analyzed
+  // this". A 503 here collapses those two, and a client that catches errors and
+  // proceeds fails open on both.
+  const rows = asked.flatMap((answer, i) => {
+    if (answer.body !== null) return rowsIn(answer.body);
+    if (!parts[i].length) return [v1Unavailable(sha, null, answer.cause)];
+    return parts[i].map((item) => v1Unavailable(locator ? sha : null, item, answer.cause));
+  });
+  // One chunk keeps the shape its worker answered in; several are joined.
+  const answered = asked.length === 1 && asked[0].body !== null
+    ? asked[0].body
+    : JSON.stringify(rows.length === 1 ? rows[0] : rows);
+  const workers = asked.filter((answer) => answer.worker);
+  const worker = [...new Set(workers.map((answer) => answer.worker))].join(",") || null;
+  // The deepest layer any chunk reached, because the batch cost that much.
+  const source = workers
+    .map((answer) => beamlineSource(answer.source))
+    .reduce((deepest, next) => (deepest && CACHE_LAYERS.get(deepest) >= CACHE_LAYERS.get(next) ? deepest : next), null);
+
+  const document = v1DocumentBody(answered);
+  const stored = document || answered;
+  const body = document ? v1BudgetedBody(document, budget, locator) : (v1BudgetedBody(answered, budget, locator) || answered);
+  const maxAge = v1MaxAge(env, stored);
+  const res = v1Body(env, body, 200, worker, maxAge, source);
+  if (!maxAge) return res;
+  // The asked-for key and every resolved alias are stored together; the
+  // digest the answer names is
+  // stored here. A lookup by PURL that reached a worker has just learned
+  // the artifact's identity, and the next caller who knows only that
+  // identity should not have to reach a worker to learn the same thing.
+  // Skipped when they are the same key — a sha lookup has nothing to add.
+  waitUntil(ctx, cacheV1Aliases(env, cache, origin, path, locator, stored, follow));
+  return res;
+}
+
+// Ask the workers in turn until one answers one chunk of a lookup.
+//
+// Sequential rather than raced, and one worker rather than all of them: a v1
+// lookup spends no analysis slot, and since every worker defers to the same
+// corpus when it does not know, they now give the same answer. Broadcasting
+// would multiply the load behind them to learn nothing.
+/**
+ * @param {Record<string, unknown>} env
+ * @param {Ctx} ctx
+ * @param {string} sha
+ * @param {Locator[]} locators - this chunk's
+ * @param {string[]} first - the fleet in the order the first pass tries it
+ * @param {number} turn - which chunk this is; it starts that far down the order
+ * @returns {Promise<{status: number, body: string|null, worker: string|null,
+ *   source: string|null, cause?: string}>} what a worker said, or a null body
+ *   and the cause when nobody could say
+ */
+async function v1AskFleet(env, ctx, sha, locators, first, turn) {
+  const ids = v1LocatorIds(ctx.rid, sha, locators);
   // Scan is asked by locator alone. Its corpus holds one verdict per artifact
   // rather than one per policy, so sending a policy it does not take would only
   // invite it to reject the question. What comes back is filed under the policy
   // this request resolved to, which is the question the caller actually asked.
   const askPath = v1CachePath(sha, locators, null);
+  const want = Math.max(1, locators.length);
   const t0 = Date.now();
   let cause = "unreachable";
   // The last worker that answered `unavailable`. Held rather than returned so
@@ -1055,13 +1165,13 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
   let outage = null;
 
   for (let attempt = 0; ; attempt++) {
-    const workers = await lookupOrder(env, ctx, scanWorkers(env, ctx.pin), ids);
-    if (!workers.length) {
+    const order = attempt ? await lookupOrder(env, ctx, scanWorkers(env, ctx.pin), ids) : first;
+    if (!order.length) {
       cause = "no_workers";
       break;
     }
-
-    for (const base of workers) {
+    const start = turn % order.length;
+    for (const base of [...order.slice(start), ...order.slice(0, start)]) {
       const worker = hostOf(base);
       try {
         const answered = await fetchTimeout(
@@ -1086,17 +1196,25 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
           logLine("v1_lookup", { src: "scan", status: 404, worker, no_route: true, ...ids });
           continue;
         }
-        // Any other 4xx is this request being wrong, which the next worker would
-        // also say. Passed through verbatim so the caller reads scan's own reason.
         if (answered.status >= 400 && answered.status < 500) {
           breakerFor(base).ok();
           const source = beamlineSource(answered.source);
           logLine("v1_lookup", { src: source, status: answered.status, worker, ms: Date.now() - t0, ...ids });
-          return v1Body(env, answered.body, answered.status, worker, 0, source);
+          return { status: answered.status, body: answered.body, worker, source };
         }
         if (answered.status !== 200) {
           breakerFor(base).fail();
           logLine("v1_lookup", { src: "scan", status: answered.status, worker, retry: true, ...ids });
+          continue;
+        }
+        // Fewer rows than were asked for is the same fact as a 404, one layer
+        // down: a worker that reads only the last of several digests answers
+        // one of them and leaves the rest of the batch unanswered. Tried
+        // elsewhere, for the same reason, rather than relayed as if complete.
+        const rows = rowsIn(answered.body);
+        if (rows.length !== want) {
+          breakerFor(base).fail();
+          logLine("v1_lookup", { src: "scan", status: 200, worker, rows: rows.length, asked: want, ...ids });
           continue;
         }
         breakerFor(base).ok();
@@ -1119,25 +1237,13 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
         // outage somewhere else.
         // Any one row unreachable makes the whole reply one this service
         // should not rest on, whether one locator was asked or several.
-        if (rowsIn(answered.body).some(isOutage)) {
+        if (rows.some(isOutage)) {
           logLine("v1_lookup", { src: source, status: 200, worker, unavailable: true, ms: Date.now() - t0, ...ids });
           outage = { body: answered.body, worker, source };
           continue;
         }
         logLine("v1_lookup", { src: source, status: 200, worker, ms: Date.now() - t0, ...ids });
-        const document = v1DocumentBody(answered.body);
-        const stored = document || answered.body;
-        const body = document ? v1BudgetedBody(document, budget, locator) : (v1BudgetedBody(answered.body, budget, locator) || answered.body);
-        const res = v1Body(env, body, 200, worker, v1MaxAge(env, stored), source);
-        if (!v1MaxAge(env, stored)) return res;
-        // The asked-for key and every resolved alias are stored together; the
-        // digest the answer names is
-        // stored here. A lookup by PURL that reached a worker has just learned
-        // the artifact's identity, and the next caller who knows only that
-        // identity should not have to reach a worker to learn the same thing.
-        // Skipped when they are the same key — a sha lookup has nothing to add.
-        waitUntil(ctx, cacheV1Aliases(env, cache, origin, path, locator, stored, follow));
-        return res;
+        return { status: 200, body: answered.body, worker, source };
       } catch (err) {
         // A caller who hung up aborted this fetch; the worker did nothing
         // wrong, and charging its breaker for it takes a healthy worker out
@@ -1154,29 +1260,17 @@ async function v1Ask(env, ctx, cache, cacheKey, path, sha, locators, budget, fol
     await sleep(wait, ctx);
   }
 
-  // Nobody could answer. Not a 5xx: the caller asked what we know about some
-  // packages, and "we could not find out" is an answer about each of them —
-  // one their policy is entitled to treat differently from "nobody has analyzed
-  // this". A 503 here collapses those two, and a client that catches errors and
-  // proceeds fails open on both.
   // A worker did answer, and what it said was that it could not find out.
   // Its account beats one invented here: it knows which corpus address failed
   // and this service does not, and the caller reading `cause` is reading the
-  // reason rather than our guess at it.
+  // reason rather than our guess at it. Normalized like any other answer by
+  // the caller: only the reason is scan's; the shape is this service's to keep.
   if (outage) {
     logLine("v1_lookup", { src: outage.source, status: 200, worker: outage.worker, unavailable: true, relayed: true, ms: Date.now() - t0, ...ids });
-    // Normalized like any other answer. Only the reason is scan's; the shape is
-    // this service's to keep, and a caller should not have to read one spelling
-    // on an outage and another on a verdict.
-    const document = v1DocumentBody(outage.body);
-    const body = (document && v1BudgetedBody(document, budget, locator)) || document || outage.body;
-    return v1Body(env, body, 200, outage.worker, 0, outage.source);
+    return { status: 200, ...outage };
   }
   logLine("v1_lookup", { src: "none", status: 200, unavailable: true, cause, ms: Date.now() - t0, ...ids });
-  const rows = [];
-  if (sha && !locators.length) rows.push(v1Unavailable(sha, null, cause));
-  for (const item of locators) rows.push(v1Unavailable(locators.length === 1 && sha ? sha : null, item, cause));
-  return v1Body(env, JSON.stringify(rows.length === 1 ? rows[0] : rows), 200, null, 0);
+  return { status: 200, body: null, worker: null, source: null, cause };
 }
 
 // A decision we could not reach a worker to make. Carries nothing about the
@@ -1200,7 +1294,7 @@ function v1Unavailable(sha, locator, cause = null) {
     status: "unavailable",
     cause,
     purl: locator?.type === "purl" ? locator.value : null,
-    sha256: sha || null,
+    sha256: sha || (locator?.type === "sha256" ? locator.value : null),
     severity: "unknown",
     fires_at: null,
     reason: null,
@@ -1475,7 +1569,7 @@ function v1LocatorIds(rid, sha, locators) {
   const first = locators?.[0];
   return {
     rid,
-    sha256: sha || undefined,
+    sha256: sha || (first?.type === "sha256" ? first.value : undefined),
     purl: first?.type === "purl" ? first.value : undefined,
     url: first?.type === "url" ? first.value : undefined,
   };
@@ -2835,11 +2929,18 @@ async function v1Dispatch(env, ctx, job, pass) {
         ...ids,
       });
     };
+    // Filed under the worker that said it, which after a handover is not the
+    // one in the response headers.
+    const answered = (who, outcome) => {
+      const credited = new Headers(streamed);
+      if (who) credited.set("X-Beamline-Worker", who);
+      writePoint(env, ROUTE_ANSWER, credited, ecosystemOf(url), outcome, Date.now() - t0, ctx.org);
+    };
     return new Response(
       annotatedV1Stream(
         upstream.body,
         budget,
-        { requestId: ctx.rid, locator, startedAt: t0, ids, settled, full },
+        { requestId: ctx.rid, locator, startedAt: t0, ids, settled, answered, full },
         cacheDecision,
         // Only the analyze path resumes. It is the only one that holds a stream
         // long enough for its worker to be taken away mid-answer — a lookup is
@@ -3019,6 +3120,8 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   let finished = false;
   let handovers = 0;
   let refusals = 0;
+  // Set once an `unretrievable` has been held for another worker to check.
+  let secondOpinion = false;
   // Every worker this request has already been on. A resume goes to the rest
   // first: two workers refusing in turn used to bounce the request between
   // them while a third with room was never asked.
@@ -3036,15 +3139,43 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   // travel backwards.
   const phase = { name: null, startedElapsed: 0, lastElapsed: 0, floor: 0, changedAt: Date.now() };
 
+  // File one worker's answer for the fleet view. Telemetry must never take a
+  // stream down with it.
+  const answered = (outcome) => {
+    try {
+      meta.answered?.(serving ? hostOf(serving) : null, outcome);
+    } catch (err) {
+      logLine("v1_analyze_answer", { recorded: false, err: errText(err), ...meta.ids });
+    }
+  };
+
   const encodeLine = (line, terminalOutage = false) => {
     const row = parseJson(line);
     const unavailable = isOutage(row);
     // Package refusals survive a healthier worker. An unqualified outage is
     // about this worker: hold it until another worker has had a chance, so the
     // caller still sees exactly one terminal answer.
-    const retryable = unavailable && !["unretrievable", "too_large", "invalid_artifact", "unsupported_artifact"].includes(row.reason);
+    //
+    // `unretrievable` is both. A package that is really gone is gone
+    // everywhere, but a worker whose registry egress breaks says it about
+    // everything: rdu2 answered it for left-pad, itoa and six in 1.7s each
+    // while it reported itself healthy (2026-10-23). So one other worker is
+    // asked, and its answer stands either way. Not charged to the breaker:
+    // a caller naming packages that do not exist would otherwise eject
+    // every healthy worker in turn.
+    const doubted = unavailable && row.reason === "unretrievable" && !secondOpinion;
+    const retryable = unavailable && (doubted || !PACKAGE_REFUSALS.has(row.reason));
+    // What this worker said, once per worker: a held outage is filed when it
+    // arrives, not again when it is finally relayed.
+    const outcome = unavailable ? (PACKAGE_REFUSALS.has(row.reason) ? row.reason : "unavailable") : "analyzed";
     if (retryable && !terminalOutage) {
-      if (serving && !outage) breakerFor(serving).fail();
+      answered(outcome);
+      if (doubted) {
+        secondOpinion = true;
+        logLine("v1_analyze_unretrievable", { worker: serving ? hostOf(serving) : undefined, ...meta.ids });
+      } else if (serving && !outage) {
+        breakerFor(serving).fail();
+      }
       outage = line;
       if (!abandoned) return [];
     }
@@ -3055,6 +3186,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     // after this line and may cancel the stream before an EOF-driven flush.
     if (annotated.decision && !decisionSeen) {
       decisionSeen = true;
+      if (!retryable && !terminalOutage) answered(outcome);
       // The worker finished what it took on. Charged to whoever is serving the
       // stream now, which after a handover is not who started it.
       if (serving && !retryable) breakerFor(serving).ok();
@@ -3123,7 +3255,11 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   // different worker could contradict, so the answer is still owed and can
   // still be gone and got. After it, there is nothing left to resume.
   const handover = async (why) => {
-    if (decisionSeen || !resume) return false;
+    if (decisionSeen) return false;
+    // A held outage was filed when it arrived; everything else here is this
+    // worker leaving without an answer, whether or not anyone replaces it.
+    if (why !== "unavailable") answered(why);
+    if (!resume) return false;
     // The worker took the request and did not finish it. Charged here rather
     // than at the 200, which only ever proved we could reach it and route to
     // it: a node being upgraded accepts every request and drops every stream,

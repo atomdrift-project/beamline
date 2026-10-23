@@ -111,7 +111,17 @@ A versionless lookup retains its newest-analysis behavior. Use `sha256` for
 the verdict on specific bytes; an exact-artifact answer does not populate the
 release's PURL cache.
 
-Over 50 packages is a `413`. There is no batch limit on `/v1/analyze` because it
+Repeat `sha256` the same way to ask about several exact artifacts — a
+directory of files, say. One digest pairs with a `purl` naming the same bytes;
+several digests are several artifacts, so they cannot be combined with `purl`
+or `url` (`400 multiple_locators`), and they answer with a list in the order
+asked.
+
+A batch that misses the cache is split across the workers and asked in
+parallel, so the list may be assembled from several of them. A share no worker
+could answer comes back `unavailable` row by row; the rest are still answered.
+
+Over 50 packages or digests is a `413`. There is no batch limit on `/v1/analyze` because it
 takes one package.
 
 For an exact URL, use one `url` parameter. The response includes `url` exactly
@@ -513,7 +523,7 @@ There is no `503` for a package we could not reach a worker for. That is a
 | `X-Request-Id` | Send your own to correlate with our logs. |
 | `X-Beamline-Source` | `cache`, `kv`, `scan:index`, `scan:cached`, `scan:bloom`, `scan:replica`, `scan:primary`, `scan:analysis`, `none`. Operators only. |
 | `X-Cache-Layer` | How deep the answer came from, `0`–`6`. Absent when nothing answered. Operators only. |
-| `X-Beamline-Worker` | Which worker answered. For operators. |
+| `X-Beamline-Worker` | Which worker answered; a batch split across the fleet lists each, comma-separated. For operators. |
 | `X-Beamline-Follow` | The `follow` policy that actually answered, when a wider stored policy served a narrower question. Absent on an exact match. |
 | `Cache-Control` | See below. |
 | `Content-Type` | `application/json`; `x-ndjson` from `/v1/analyze`. |

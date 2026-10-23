@@ -2741,6 +2741,121 @@ test("v1: exact URL aliases URL and SHA keys while the PURL asks about the relea
   }
 });
 
+test("v1: several sha256 values are several artifacts, asked together and answered as a list", async () => {
+  const shas = ["1".repeat(64), "2".repeat(64), "3".repeat(64)];
+  let asked = null;
+  const scan = await mockBackend({
+    v1: (url) => {
+      asked = url.searchParams.getAll("sha256");
+      return asked.map((sha256) => ({ decision: "allow", sha256, severity: "benign", fires_at: -1, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z" }));
+    },
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  try {
+    const query = shas.map((sha) => `sha256=${sha.toUpperCase()}`).join("&");
+    const res = await handle(new Request(`http://beamline/v1/lookup?${query}`), env, noopCtx());
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(Array.isArray(body), "a repeated key answers with a list");
+    assert.deepEqual(body.map((row) => row.sha256), shas, "in the order asked");
+    assert.deepEqual(asked, shas, "one worker request carries every digest, normalized");
+    assert.equal(scan.hits.v1, 1);
+  } finally {
+    await scan.close();
+  }
+});
+
+// A worker's verdict on one digest, as the batch tests below answer it.
+function allowRow(sha256) {
+  return { decision: "allow", sha256, severity: "benign", fires_at: -1, findings: [], engine_version: "2.8.0", analyzed_at: "2026-08-01T00:00:00Z" };
+}
+
+// Answered the way scan answers: one digest is one object, several a list.
+function allowRows(url) {
+  const asked = url.searchParams.getAll("sha256");
+  return asked.length === 1 ? allowRow(asked[0]) : asked.map(allowRow);
+}
+
+test("v1 lookup: a batch is split across the fleet and answered in the order asked", async () => {
+  const shas = ["4", "5", "6", "7"].map((c) => c.repeat(64));
+  const asked = [];
+  const answer = (url) => {
+    asked.push(url.searchParams.getAll("sha256"));
+    return allowRows(url);
+  };
+  const a = await mockBackend({ v1: answer });
+  const b = await mockBackend({ v1: answer });
+  const env = testEnv(DEAD, { SCAN_URL: `${a.url},${b.url}` });
+  try {
+    const query = shas.map((sha) => `sha256=${sha}`).join("&");
+    const res = await handle(new Request(`http://beamline/v1/lookup?${query}`), env, waitCtx().ctx);
+    assert.equal(res.status, 200);
+    assert.deepEqual((await res.json()).map((row) => row.sha256), shas, "in the order asked");
+    assert.equal(a.hits.v1, 1, "each worker answered one share");
+    assert.equal(b.hits.v1, 1);
+    assert.deepEqual(asked.map((part) => part.length), [2, 2]);
+    assert.deepEqual(asked.flat().sort(), shas, "and every digest was asked exactly once");
+    assert.deepEqual(res.headers.get("X-Beamline-Worker").split(",").sort(), [hostOf(a.url), hostOf(b.url)].sort());
+  } finally {
+    await a.close();
+    await b.close();
+  }
+});
+
+// What a worker that reads only the last repeated sha256 says to a batch.
+test("v1 lookup: a worker that answers part of a batch is not taken at its word", async () => {
+  const shas = ["8", "9", "a", "b"].map((c) => c.repeat(64));
+  const partial = await mockBackend({ v1: (url) => allowRow(url.searchParams.getAll("sha256").at(-1)) });
+  const whole = await mockBackend({ v1: allowRows });
+  const env = testEnv(DEAD, { SCAN_URL: `${partial.url},${whole.url}` });
+  try {
+    const query = shas.map((sha) => `sha256=${sha}`).join("&");
+    const res = await handle(new Request(`http://beamline/v1/lookup?${query}`), env, waitCtx().ctx);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body.map((row) => row.sha256), shas);
+    assert.ok(body.every((row) => row.status === "analyzed"), "every digest answered, none dropped");
+    assert.equal(partial.hits.v1, 1, "the short answer was asked once");
+    assert.equal(whole.hits.v1, 2, "and its share was asked again elsewhere");
+  } finally {
+    await partial.close();
+    await whole.close();
+  }
+});
+
+test("v1 lookup: a share nobody can answer is unavailable by digest, and the rest still answer", async () => {
+  const shas = ["c", "d", "e", "f"].map((c) => c.repeat(64));
+  const answer = (url) => (url.searchParams.getAll("sha256").includes(shas[3]) ? { status: 500 } : allowRows(url));
+  const a = await mockBackend({ v1: answer });
+  const b = await mockBackend({ v1: answer });
+  const env = testEnv(DEAD, { SCAN_URL: `${a.url},${b.url}` });
+  try {
+    const query = shas.map((sha) => `sha256=${sha}`).join("&");
+    const res = await handle(new Request(`http://beamline/v1/lookup?${query}`), env, waitCtx().ctx);
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body.map((row) => row.status), ["analyzed", "analyzed", "unavailable", "unavailable"]);
+    assert.deepEqual(body.map((row) => row.sha256), shas, "an unavailable row still names its digest");
+    assert.match(res.headers.get("cache-control"), /no-store/, "an outage is not cached");
+  } finally {
+    await a.close();
+    await b.close();
+  }
+});
+
+test("v1: a sha256 batch is validated as a whole", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const ask = async (query) => {
+    const res = await handle(new Request(`http://beamline/v1/lookup?${query}`), env, noopCtx());
+    return { status: res.status, code: (await res.json()).error?.code };
+  };
+  const two = `sha256=${"a".repeat(64)}&sha256=${"b".repeat(64)}`;
+  assert.deepEqual(await ask(`${two}&purl=pkg%3Anpm%2Fx%401.0.0`), { status: 400, code: "multiple_locators" });
+  assert.deepEqual(await ask(`sha256=${"a".repeat(64)}&sha256=nothex`), { status: 400, code: "invalid_sha256" });
+  const many = Array.from({ length: 51 }, (_, i) => `sha256=${i.toString(16).padStart(64, "0")}`).join("&");
+  assert.deepEqual(await ask(many), { status: 413, code: "too_many_packages" });
+});
+
 test("v1: URL and PURL cannot be combined, and URLs are validated", async () => {
   const env = testEnv(DEAD, { SCAN_URL: DEAD });
   const mixed = await handle(
@@ -4241,7 +4356,7 @@ test("v1 analyze: a streamed infrastructure outage falls back before emitting a 
 });
 
 test("v1 analyze: package refusals remain terminal and do not eject healthy workers", async () => {
-  for (const reason of ["unretrievable", "too_large", "invalid_artifact", "unsupported_artifact"]) {
+  for (const reason of ["too_large", "invalid_artifact", "unsupported_artifact"]) {
     _test.reset();
     const refused = await mockBackend({ analyzeStream: [CUT_FRAME, JSON.stringify({ decision: "unavailable", reason })] });
     const spare = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
@@ -4254,6 +4369,54 @@ test("v1 analyze: package refusals remain terminal and do not eject healthy work
     } finally {
       await Promise.all([refused.close(), spare.close()]);
     }
+  }
+});
+
+// rdu2, 2026-10-23: its registry egress broke and it answered `unretrievable`
+// for left-pad, itoa and six, while every other worker fetched them.
+test("v1 analyze: unretrievable asks one other worker, which answers instead", async () => {
+  _test.reset();
+  const cutOff = await mockBackend({ analyzeStream: [CUT_FRAME, '{"decision":"unavailable","reason":"unretrievable"}'] });
+  const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+  const points = [];
+  const env = { ...testEnv(DEAD, { SCAN_URL: `${cutOff.url},${healthy.url}` }),
+    BEAMLINE_AE: { writeDataPoint: (point) => points.push(point) } };
+  try {
+    const frames = await analyzeFrames(env);
+    assert.equal(frames.at(-1).status, "analyzed");
+    assert.equal(frames.filter((f) => f.status || f.decision).length, 1, "the doubted refusal leaked before the verdict");
+    assert.equal(cutOff.hits.analyze, 1);
+    assert.equal(healthy.hits.analyze, 1);
+    assert.equal(_test.breakerFor(cutOff.url).open(), false);
+    // The caller never saw the refusal; the fleet view must.
+    const answers = points.filter((p) => p.blobs[0] === "analyze:answer").map((p) => [p.blobs[3], p.blobs[5]]);
+    assert.deepEqual(answers, [
+      [new URL(cutOff.url).host, "unretrievable"],
+      [new URL(healthy.url).host, "analyzed"],
+    ]);
+  } finally {
+    await Promise.all([cutOff.close(), healthy.close()]);
+  }
+});
+
+test("v1 analyze: unretrievable from a second worker stands, and nobody's breaker pays for it", async () => {
+  _test.reset();
+  const workers = await Promise.all([1, 2, 3].map(() => mockBackend({
+    analyzeStream: [CUT_FRAME, '{"decision":"unavailable","reason":"unretrievable"}'],
+  })));
+  const env = testEnv(DEAD, { SCAN_URL: workers.map((w) => w.url).join(",") });
+  try {
+    for (let i = 0; i < _test.BREAKER_FAILS; i++) {
+      const frames = await analyzeFrames(env);
+      assert.equal(frames.at(-1).status, "unavailable");
+      assert.equal(frames.at(-1).reason, "unretrievable");
+      assert.equal(frames.filter((f) => f.status || f.decision).length, 1);
+    }
+    const hits = workers.reduce((sum, w) => sum + w.hits.analyze, 0);
+    assert.equal(hits, 2 * _test.BREAKER_FAILS, "each request asks exactly one other worker");
+    for (const w of workers) assert.equal(_test.breakerFor(w.url).open(), false, "a missing package ejected a worker");
+  } finally {
+    await Promise.all(workers.map((w) => w.close()));
   }
 });
 
@@ -4307,8 +4470,33 @@ test("v1 analyze: a fleet of streamed outages returns one unavailable and opens 
     }
     for (const w of workers) assert.equal(_test.breakerFor(w.url).open(), true, "200 acceptance erased failure history");
     assert.ok(!points.some((p) => p.blobs[0] === "analyze:verdict"), "an outage was timed as a verdict");
+    // Each worker said it once per request; relaying the held outage is not a
+    // second answer.
+    const answers = points.filter((p) => p.blobs[0] === "analyze:answer");
+    assert.equal(answers.length, 2 * _test.BREAKER_FAILS);
+    assert.ok(answers.every((p) => p.blobs[5] === "unavailable"));
   } finally {
     await Promise.all(workers.map((w) => w.close()));
+  }
+});
+
+test("v1 analyze: a worker that leaves without an answer is filed under why", async () => {
+  _test.reset();
+  const cut = await mockBackend({ analyzeStream: [CUT_FRAME] });
+  const healthy = await mockBackend({ analyzeStream: [CUT_FRAME, CUT_DECISION] });
+  const points = [];
+  const env = { ...testEnv(DEAD, { SCAN_URL: `${cut.url},${healthy.url}` }),
+    BEAMLINE_AE: { writeDataPoint: (point) => points.push(point) } };
+  try {
+    const frames = await analyzeFrames(env);
+    assert.equal(frames.at(-1).status, "analyzed");
+    const answers = points.filter((p) => p.blobs[0] === "analyze:answer").map((p) => [p.blobs[3], p.blobs[5]]);
+    assert.deepEqual(answers, [
+      [new URL(cut.url).host, "eof"],
+      [new URL(healthy.url).host, "analyzed"],
+    ]);
+  } finally {
+    await Promise.all([cut.close(), healthy.close()]);
   }
 });
 
@@ -4740,7 +4928,8 @@ test("v1 analyze: the run is timed to the verdict, not to the headers", async ()
     assert.equal(frames.at(-1).status, "analyzed", "the caller never got a decision");
 
     const byRoute = new Map(points.map((p) => [p.blobs[0], p]));
-    assert.deepEqual([...byRoute.keys()].sort(), ["analyze", "analyze:verdict"]);
+    assert.deepEqual([...byRoute.keys()].sort(), ["analyze", "analyze:answer", "analyze:verdict"]);
+    assert.equal(byRoute.get("analyze:answer").blobs[5], "analyzed");
 
     const headers = byRoute.get("analyze");
     const verdict = byRoute.get("analyze:verdict");
