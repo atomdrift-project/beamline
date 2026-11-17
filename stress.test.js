@@ -119,7 +119,6 @@ test("route metrics count expected misses as successful requests", () => {
 test("classify treats a missing envelope as a bug, saturation as a note", () => {
   assert.equal(_test.classify({ status: 200 }), "ok");
   assert.equal(_test.classify({ status: 200, issues: ["sha"] }), "bug");
-  assert.equal(_test.classify({ status: 404 }), "miss", "read-only /lookup: a miss is an answer, not a defect");
   assert.equal(_test.classify({ status: 400 }), "bug");
   assert.equal(_test.classify({ status: 500 }), "bug");
   assert.equal(_test.classify({ status: 503 }), "note");
@@ -140,34 +139,6 @@ test("stream failures retain backend provenance", () => {
   assert.equal(_test.classify(failure), "bug");
   assert.equal(failure.source, "scan:analysis");
   assert.equal(failure.worker, "scan-rdu.isotope13.ai");
-});
-
-test("checkApi accepts a documented 200 and rejects ml/raw and hits on clean", () => {
-  const sha = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
-  const headers = {
-    get(name) {
-      return {
-        "x-sha256": sha,
-        "x-beamline-source": "scan:primary",
-        "content-type": "application/json",
-        "cache-control": "public, max-age=86400",
-      }[name];
-    },
-  };
-  const clean = { sha, purl: "pkg:npm/left-pad@1.3.0", lvl: -1, eng: "2.7.2" };
-  assert.deepEqual(_test.checkApi(200, headers, clean, "pkg:npm/left-pad@1.3.0", "public"), []);
-  // An authenticated caller must never be handed a publicly cacheable verdict:
-  // beamline stores its own copy as public, and that rewrite once reached the
-  // client on every cache hit.
-  assert.ok(_test.checkApi(200, headers, clean, "pkg:npm/left-pad@1.3.0", "private").length);
-  const priv = { get: (n) => (n === "cache-control" ? "private, max-age=3600" : headers.get(n)) };
-  assert.deepEqual(_test.checkApi(200, priv, clean, "pkg:npm/left-pad@1.3.0", "private"), []);
-  assert.ok(_test.checkApi(200, headers, { sha, lvl: -1, ml: { lvl: -1 } }, null).length);
-  assert.ok(_test.checkApi(200, headers, { sha, lvl: -1, hits: [{ id: "x", crit: 5 }] }, null).length);
-  assert.ok(_test.checkApi(200, headers, { sha, lvl: 3, hits: [{ id: "x", crit: 2 }] }, null).length);
-  assert.deepEqual(_test.checkApi(202, { get: (n) => (n === "retry-after" ? "5" : "") }, { state: "pending" }, null), []);
-  assert.ok(_test.checkApi(202, { get: () => "" }, { error: "pending analysis" }, null).length);
-  assert.deepEqual(_test.checkApi(404, { get: () => "" }, { error: "unknown sample" }, null), []);
 });
 
 test("mixJobs round-robins ecosystems up to the cap", () => {

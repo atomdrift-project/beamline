@@ -28,8 +28,6 @@ const LOOKUP_TIMEOUT_MS = 3_000;
 const BREAKER_FAILS = 5;
 const BREAKER_COOL_MS = 10_000;
 const MEMORY_CACHE_MAX = 1024;
-const HIT_LIMIT = 3;
-const HIT_MIN_CRIT = 3;
 const SCAN_RETRIES = 5;
 // The share of an analysis's own budget that may be spent waiting for a slot.
 // Half: a caller who allows thirty minutes for an answer would rather spend
@@ -410,7 +408,7 @@ const CUSTOMER_TOKEN_RE = /^i13_[a-z]+[0-9]*_[0-9a-z]{26}$/;
 // cutoff is the same date again, kept here so an expiration left off the row
 // cannot keep one alive. Past it nothing is looked up and this can go.
 const LEGACY_TOKEN_RE = /^x-[a-z0-9]+(?:-[a-z0-9]+)+$/;
-const LEGACY_TOKENS_UNTIL = Date.UTC(2026, 10, 5);
+const LEGACY_TOKENS_UNTIL = Date.UTC(2026, 11, 1);
 
 // Which of an org's tokens made a request, without the token: the first 64
 // bits of its SHA-256, in hex. Dash computes the same thing for each token it
@@ -1526,7 +1524,7 @@ function rowsIn(body) {
  */
 function v1DecisionSha(body) {
   const row = parseJson(body);
-  const sha = row && typeof row === "object" ? (row.sha256 || shaFromEnvelope(row)) : null;
+  const sha = row && typeof row === "object" ? row.sha256 : fullResult(body)?.artifact.sha256;
   return typeof sha === "string" && SHA_RE.test(sha) ? sha : null;
 }
 
@@ -1815,13 +1813,13 @@ function newerEngine(candidate, incumbent) {
 
 /**
  * @param {string} body
- * @param {boolean} [full=false] - accept only a full envelope
+ * @param {boolean} [full=false] - accept only a full result
  * @returns {string|null} the canonical document, or null when it is not one
  */
 function v1DocumentBody(body, full = false) {
+  if (full) return fullResult(body) ? fullResultText(body) : null;
   const row = parseJson(body);
   if (!row || typeof row !== "object") return null;
-  if (full) return isFullEnvelope(row) ? JSON.stringify(row) : null;
   if (Array.isArray(row)) {
     if (!row.every((item) => item && typeof item === "object")) return null;
     return JSON.stringify(row.map((item) => canonicalV1Row(item)));
@@ -2003,15 +2001,35 @@ function v1CachedVerdict(body) {
   return row;
 }
 
+// The full result `full=1` asks for: the version 8 body scan uploads to
+// hopper. JSON lines — a header naming how many file lines follow, the file
+// lines with the scanned artifact first, then one report line for each file
+// line that names a report. Checked whole, so a body cut short in transit is
+// never relayed from the cache or filed there.
 /**
- * @param {unknown} row
- * @returns {boolean}
+ * @param {string|null} body
+ * @returns {{header: object, artifact: object}|null} null when it is not one
  */
-function isFullEnvelope(row) {
-  return !!row && typeof row === "object" && !Array.isArray(row)
-    && !!row.ml && typeof row.ml === "object" && !Array.isArray(row.ml)
-    && typeof row.ml.eng === "string" && row.ml.eng.length > 0
-    && !!row.raw && typeof row.raw === "object" && !Array.isArray(row.raw);
+function fullResult(body) {
+  if (typeof body !== "string") return null;
+  const lines = body.split("\n").filter((line) => line.trim());
+  const header = parseJson(lines[0]);
+  if (!header || typeof header !== "object" || header.v !== 8) return null;
+  if (!Number.isInteger(header.files) || header.files < 1) return null;
+  const files = lines.slice(1, 1 + header.files).map((line) => parseJson(line));
+  if (files.length !== header.files) return null;
+  if (!files.every((file) => file && typeof file === "object" && !Array.isArray(file))) return null;
+  const reports = files.filter((file) => typeof file.report === "string").length;
+  if (lines.length !== 1 + header.files + reports) return null;
+  return { header, artifact: files[0] };
+}
+
+/**
+ * @param {string} body - a full result
+ * @returns {string} its lines, each ending in a newline
+ */
+function fullResultText(body) {
+  return `${body.split("\n").filter((line) => line.trim()).join("\n")}\n`;
 }
 
 /**
@@ -2021,8 +2039,7 @@ function isFullEnvelope(row) {
  */
 function v1CachedAnalyzeAnswer(body, full = false) {
   if (!full) return v1CachedVerdict(body);
-  const row = parseJson(body);
-  return isFullEnvelope(row) ? row : null;
+  return fullResult(body);
 }
 
 // One row saying the fleet could not find out, in either spelling scan has
@@ -2061,9 +2078,11 @@ function isOutage(row) {
  * @returns {number} seconds; 0 means do not cache
  */
 function v1MaxAge(env, body) {
+  // A full result is only ever an analysis's: a verdict, kept as one.
+  if (fullResult(body)) return numEnv(env, "VERDICT_MAX_AGE", V1_VERDICT_MAX_AGE);
   const rows = rowsIn(body);
   if (rows.some(isOutage)) return 0;
-  if (rows.some((item) => !isFullEnvelope(item) && (item?.status !== "analyzed" || !item?.engine_version))) return V1_NO_ENGINE_MAX_AGE;
+  if (rows.some((item) => item?.status !== "analyzed" || !item?.engine_version)) return V1_NO_ENGINE_MAX_AGE;
   return numEnv(env, "VERDICT_MAX_AGE", V1_VERDICT_MAX_AGE);
 }
 
@@ -3111,6 +3130,10 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   let reader = stream.getReader();
   let buffered = "";
   let decisionSeen = false;
+  // A full result's lines, from its header on, once one has started: the
+  // answer is the whole body, so it is filed only when the stream ends.
+  let body = null;
+  let filed = false;
   // Set once the caller has gone and the stream is being read for the decision
   // alone. Carried into the telemetry so an abandoned run is not counted as one
   // somebody waited for.
@@ -3150,6 +3173,11 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
   };
 
   const encodeLine = (line, terminalOutage = false) => {
+    if (body) {
+      // The rest of a full result: relayed untouched, and kept to be filed.
+      body.push(line);
+      return [encoder.encode(`${line}\n`)];
+    }
     const row = parseJson(line);
     const unavailable = isOutage(row);
     // Package refusals survive a healthier worker. An unqualified outage is
@@ -3181,6 +3209,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     }
     const annotated = annotatedV1Lines(line, budget, meta, phase);
     if (annotated.refused) refused = true;
+    if (annotated.body && !decisionSeen) body = [line];
     // A decision is terminal by contract. Register its short cache write as
     // soon as we observe it: callers are entitled to stop reading immediately
     // after this line and may cancel the stream before an EOF-driven flush.
@@ -3198,7 +3227,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
       } catch (err) {
         logLine("v1_analyze_verdict", { recorded: false, err: errText(err), ...meta.ids });
       }
-      if (onDecision && !unavailable) {
+      if (onDecision && !unavailable && !annotated.body) {
         try {
           onDecision(annotated.decision);
         } catch (err) {
@@ -3207,6 +3236,18 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
       }
     }
     return annotated.lines.map((row) => encoder.encode(`${row}\n`));
+  };
+
+  // File a full result once its stream has ended. A body the worker never
+  // finished is not filed: the check in `cacheV1Decision` would refuse it.
+  const fileBody = () => {
+    if (!body || filed || !onDecision) return;
+    filed = true;
+    try {
+      onDecision(`${body.join("\n")}\n`);
+    } catch (err) {
+      logLine("v1_cache_write", { stored: false, reason: "schedule_failed", err: errText(err) });
+    }
   };
 
   const push = (line, terminalOutage = false) => {
@@ -3342,7 +3383,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     abandoned = true;
     const deadline = Date.now() + (orphan?.budgetMs || ORPHAN_BUDGET_MS);
     try {
-      while (!decisionSeen && Date.now() < deadline) {
+      while ((!decisionSeen || (body && !filed)) && Date.now() < deadline) {
         const result = await readChunk();
         if (result.done) {
           // Same trailing-line flush the read loop does: the decision is
@@ -3352,6 +3393,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
             encodeLine(buffered);
             buffered = "";
           }
+          fileBody();
           break;
         }
         buffered += decoder.decode(result.value, { stream: true });
@@ -3359,7 +3401,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
         buffered = lines.pop() ?? "";
         for (const line of lines) {
           encodeLine(line);
-          if (decisionSeen) break;
+          if (decisionSeen && !body) break;
         }
       }
     } catch {
@@ -3428,6 +3470,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
           // A clean close with no decision is a truncation too: a worker taken
           // down between frames shuts its side politely and says nothing.
           if (!decisionSeen && (await handover(refused ? "refused" : "eof"))) continue;
+          fileBody();
           finished = true;
           continue;
         }
@@ -3436,7 +3479,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
         buffered = lines.pop() ?? "";
         for (const line of lines) {
           push(line);
-          if (outage || decisionSeen) break;
+          if (outage || (decisionSeen && !body)) break;
         }
         await recoverOutage();
       }
@@ -3452,7 +3495,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
     // waiting on, and let the decision land in the cache as it would have.
     async cancel(reason) {
       finished = true;
-      if (!decisionSeen && orphan) {
+      if ((!decisionSeen || (body && !filed)) && orphan) {
         orphan.register(drainToDecision());
         return;
       }
@@ -3470,7 +3513,7 @@ function annotatedV1Stream(stream, budget, meta, onDecision = null, resume = nul
  * @param {number} budget
  * @param {StreamMeta} meta
  * @param {Phase} phase - advanced in place
- * @returns {{lines: string[], decision: string|null, refused?: boolean}}
+ * @returns {{lines: string[], decision: string|null, refused?: boolean, body?: boolean}}
  */
 function annotatedV1Lines(line, budget, meta, phase) {
   const row = parseJson(line);
@@ -3487,9 +3530,17 @@ function annotatedV1Lines(line, budget, meta, phase) {
   const totalElapsed = reported == null ? phase.lastElapsed : reported + phase.floor;
   if (Number.isFinite(totalElapsed)) phase.lastElapsed = totalElapsed;
 
+  // A full result's header is the terminal event of a `full=1` stream, and
+  // the start of the answer: every line after it belongs to the result and
+  // goes out as it arrived.
+  if (meta.full && row.v === 8) {
+    const done = phaseCompletion(meta, phase);
+    return { lines: [...(done ? [JSON.stringify(done)] : []), line], decision: line, body: true };
+  }
+
   // A decision is the terminal event. Close the last reported phase in its own
   // frame so clients never have to infer completion from the decision shape.
-  if (Object.prototype.hasOwnProperty.call(row, "decision") || isOutage(row) || (meta.full && isFullEnvelope(row))) {
+  if (Object.prototype.hasOwnProperty.call(row, "decision") || isOutage(row)) {
     const done = phaseCompletion(meta, phase);
     return {
       lines: [...(done ? [JSON.stringify(done)] : []), budgetedV1Line(line, budget, meta.locator)],
@@ -5003,140 +5054,6 @@ function clientScope(env, maxAge) {
   return `${(env.BEAMLINE_TOKEN || "").trim() ? "private" : "public"}, max-age=${maxAge}`;
 }
 
-/**
- * @param {object|null} envelope - a full scan report
- * @param {string|null} sha
- * @param {string|null} purl
- * @returns {object}
- */
-function customerView(envelope, sha, purl) {
-  const ml = envelope && envelope.ml;
-  const out = {};
-  const hex = (sha && SHA_RE.test(sha) && sha) || shaFromEnvelope(envelope);
-  if (hex) out.sha = hex;
-  if (purl) out.purl = purl;
-  if (ml && ml.lvl != null) out.lvl = ml.lvl;
-  if (ml && ml.eng) out.eng = ml.eng;
-  const why = llmWhy(envelope && envelope.llm);
-  if (why) out.why = why;
-  if (out.lvl !== -1) {
-    const hits = topHits(envelope && envelope.raw, purl);
-    if (hits.length) out.hits = hits;
-  }
-  return out;
-}
-
-/**
- * @param {unknown} llm
- * @returns {string}
- */
-function llmWhy(llm) {
-  if (!llm) return "";
-  if (typeof llm === "string") return llm.trim();
-  const text = llm.interpretation || llm.why || "";
-  return typeof text === "string" ? text.trim() : "";
-}
-
-/**
- * @param {object|null} raw - the report's `raw` section
- * @param {string|null} purl
- * @returns {object[]} at most HIT_LIMIT, most critical first
- */
-function topHits(raw, purl) {
-  const files = (raw && (raw.files || raw.fs)) || [];
-  const rows = [];
-  const seen = new Set();
-  for (const entry of files) {
-    const traits = (entry && (entry.traits || entry.findings)) || [];
-    const file = hitFile(entry && entry.path);
-    const ident = identPkg(entry);
-    for (const trait of traits) {
-      const crit = Number(trait && trait.crit);
-      const id = trait && trait.id;
-      if (!id || !Number.isFinite(crit) || crit < HIT_MIN_CRIT) continue;
-      // Native matches only. A finding with `from` is the same match reported
-      // again on an enclosing archive — the member's own copy carries the real
-      // path and offset, and we walk every file — or a cross-file composite,
-      // which has no single place to point at.
-      if (Array.isArray(trait.from) && trait.from.length) continue;
-      const pkg = (trait.dep && trait.dep.locator) || purl || ident || "";
-      const key = `${id}\0${file}\0${pkg}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const hit = { id, crit };
-      if (trait.desc) hit.desc = trait.desc;
-      if (file) hit.file = file;
-      if (pkg) hit.pkg = pkg;
-      const at = hitLocation(entry, id, trait);
-      if (at.off != null) hit.off = at.off;
-      if (at.line != null) hit.line = at.line;
-      rows.push(hit);
-    }
-  }
-  rows.sort((a, b) => b.crit - a.crit || a.id.localeCompare(b.id));
-  return rows.slice(0, HIT_LIMIT);
-}
-
-// Where a match fired. The context windows carry a note per match holding its
-// exact byte offset; the window's `line` labels its first byte, which is the
-// line to quote for a match inside it. Binary windows have no line structure.
-// A report whose context was trimmed falls back to the finding's own first
-// evidence span, which locates it without naming a line.
-/**
- * @param {object|null} file
- * @param {string} id
- * @param {object|null} trait
- * @returns {{off: number|null, line: number|null}}
- */
-function hitLocation(file, id, trait) {
-  for (const context of (file && file.ctx) || []) {
-    for (const note of (context && context.n) || []) {
-      if (note && note.i === id) {
-        return { off: num(note.o), line: num(context.line) };
-      }
-    }
-  }
-  const span = trait && Array.isArray(trait.spans) && trait.spans[0];
-  return { off: Array.isArray(span) ? num(span[0]) : null, line: null };
-}
-
-/**
- * @param {unknown} value
- * @returns {number|null}
- */
-function num(value) {
-  return Number.isFinite(Number(value)) ? Number(value) : null;
-}
-
-/**
- * @param {unknown} path
- * @returns {string} the innermost member's path
- */
-function hitFile(path) {
-  if (!path) return "";
-  let inner = String(path);
-  if (inner.includes("!!")) inner = inner.split("!!").pop();
-  else if (inner.includes("!")) inner = inner.split("!").pop();
-  return inner.replace(/^\/+/, "") || "";
-}
-
-/**
- * @param {object|null} file
- * @returns {string} `name@version`, or ""
- */
-function identPkg(file) {
-  const ident = (file && (file.ident || file.identity)) || {};
-  if (!ident.name) return "";
-  return ident.version ? `${ident.name}@${ident.version}` : ident.name;
-}
-/**
- * @param {object|null} body
- * @returns {string} lowercase, or ""
- */
-function shaFromEnvelope(body) {
-  const sha = body?.raw?.files?.[0]?.sha;
-  return typeof sha === "string" ? sha.toLowerCase() : "";
-}
 // Scan is reached over ordinary fetch: each worker sits behind a Cloudflare
 // Tunnel with a public hostname, so the edge does the routing.
 //
@@ -5535,10 +5452,6 @@ export const _test = {
   rotate,
   scanWorkers,
   breakerFor,
-  hitLocation,
-  shaFromEnvelope,
-  customerView,
-  topHits,
   SHA_RE,
   DEFAULT_SCAN_TIMEOUT_MS,
   LOOKUP_TIMEOUT_MS,
@@ -5547,6 +5460,7 @@ export const _test = {
   makeBreaker,
   memoryCache,
   annotatedV1Stream,
+  fullResult,
   tokenEq,
   tokenList,
   addressSubject,

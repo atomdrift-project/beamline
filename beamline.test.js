@@ -137,7 +137,7 @@ test("GET / serves the public API documentation", async () => {
   assert.match(body, /class="meanings"/);
   assert.match(body, /<code>status<\/code> describes whether Beamline has an assessment/);
   assert.match(body, /status: "analyzed"/);
-  assert.match(body, /terminal line contains <code>status<\/code>, or <code>ml<\/code> and <code>raw<\/code> when <code>full=1<\/code>/);
+  assert.match(body, /terminal line contains <code>status<\/code>, or with <code>full=1<\/code> the result begins at the line carrying <code>"v":8<\/code>/);
   assert.match(body, /runner\.has-response/);
   assert.match(body, /runner\.hasAttribute\("data-stream"\) \? output\.scrollHeight : 0/);
   assert.match(body, /data-path="\/v1\/lookup\?url=/);
@@ -550,31 +550,40 @@ test("v1 analyze: follow is normalized and forwarded", async () => {
   }
 });
 
-test("v1 analyze: full=1 returns the scan envelope and uses a separate cache entry", async () => {
+// A version 8 body, as scan's `full=1` sends it: the header, the artifact's
+// line, one member's, and the artifact's report line.
+const FULL_RESULT = [
+  `{"v":8,"scan":{"engine":"3.0.0","ruleset":"5298e","level":25,"at":"2026-11-12T00:00:00Z"},"files":2}`,
+  `{"sha256":"${HELLO_SHA}","size":5,"type":"npm","verdict":{"outcome":"ok","class":"benign","fires_at":-1,"by":"ml"},`
+    + `"ml":{"class":"benign","fires_at":-1,"prob":0.01,"model":"v20"},"report":"r1","contents":{"children":[1],"paths":["package/index.js"]}}`,
+  `{"sha256":"${"b".repeat(64)}","size":3,"type":"javascript","verdict":{"outcome":"ok","class":"benign","fires_at":-1,"by":"ml"},`
+    + `"ml":{"class":"benign","fires_at":-1,"prob":0.02,"model":"v20"}}`,
+  `{"traits":[{"id":"a::root","crit":2}]}`,
+];
+
+test("v1 analyze: full=1 relays the version 8 body whole and caches it apart", async () => {
   const purl = "pkg:npm/app@1.0.0";
   const queries = [];
-  const envelope = {
-    status: "analyzed",
-    ml: { v: "7", eng: "2.9.1", lvl: -1, prob: 0, files: [], version: "test", analyzed_at: "2026-09-09T00:00:00Z" },
-    raw: { v: "8", files: [{ sha: HELLO_SHA, path: "app.tgz", traits: [] }] },
-  };
   const compact = {
     decision: "allow",
     fires_at: -1,
     purl,
     sha256: HELLO_SHA,
-    engine_version: "2.9.1",
-    analyzed_at: "2026-09-09T00:00:00Z",
+    engine_version: "3.0.0",
+    analyzed_at: "2026-11-12T00:00:00Z",
   };
   const scan = await mockBackend({
     onAnalyzeQuery: (url) => queries.push(url.search),
-    analyzeStream: (url) => [JSON.stringify(url.searchParams.get("full") === "1" ? envelope : compact)],
+    analyzeStream: (url) => url.searchParams.get("full") === "1"
+      ? [`{"state":"analyzing","elapsed_ms":1002,"phase":"unpack","purl":"${purl}"}`, ...FULL_RESULT]
+      : [JSON.stringify(compact)],
   });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   const ask = (full) => new Request(
     `http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}${full ? "&full=1" : ""}`,
     { method: "POST" },
   );
+  const whole = `${FULL_RESULT.join("\n")}\n`;
   try {
     const compactCtx = waitCtx();
     const firstCompact = await handle(ask(false), env, compactCtx.ctx);
@@ -583,12 +592,16 @@ test("v1 analyze: full=1 returns the scan envelope and uses a separate cache ent
 
     const fullCtx = waitCtx();
     const firstFull = await handle(ask(true), env, fullCtx.ctx);
-    assert.deepEqual(JSON.parse((await firstFull.text()).trim()), envelope);
+    const streamed = await firstFull.text();
+    const lines = streamed.trim().split("\n");
+    const header = lines.findIndex((line) => JSON.parse(line).v === 8);
+    assert.ok(header > 0, "progress came first, then the body");
+    assert.deepEqual(lines.slice(header), FULL_RESULT, "every line of the body, untouched, ends the stream");
     await fullCtx.flush();
 
     const cachedFull = await handle(ask(true), env, noopCtx());
     assert.equal(cachedFull.headers.get("x-beamline-source"), "cache");
-    assert.deepEqual(JSON.parse((await cachedFull.text()).trim()), envelope);
+    assert.equal(await cachedFull.text(), whole);
 
     const cachedCompact = await handle(ask(false), env, noopCtx());
     assert.equal(cachedCompact.headers.get("x-beamline-source"), "cache");
@@ -599,6 +612,36 @@ test("v1 analyze: full=1 returns the scan envelope and uses a separate cache ent
   } finally {
     await scan.close();
   }
+});
+
+test("v1 analyze: a full result cut short is relayed but never cached", async () => {
+  const purl = "pkg:npm/cut@1.0.0";
+  const scan = await mockBackend({ analyzeStream: () => FULL_RESULT.slice(0, 2) });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  const ask = () => new Request(`http://beamline/v1/analyze?purl=${encodeURIComponent(purl)}&full=1`, { method: "POST" });
+  try {
+    const ctx = waitCtx();
+    const first = await handle(ask(), env, ctx.ctx);
+    assert.match(await first.text(), /"v":8/);
+    await ctx.flush();
+    const again = await handle(ask(), env, waitCtx().ctx);
+    await again.text();
+    assert.equal(scan.hits.analyze, 2, "a body missing its lines was served from the cache");
+  } finally {
+    await scan.close();
+  }
+});
+
+test("a full result is checked whole", () => {
+  const whole = `${FULL_RESULT.join("\n")}\n`;
+  const keys = _test.v1CacheAliasPaths("http://beamline", "/v1/analyze?purl=x&full=1", null, whole, "none", null, true)
+    .map((key) => key.url);
+  assert.ok(keys.some((url) => url.includes(`sha256=${HELLO_SHA}`) && url.includes("full=1")), `filed under its digest: ${keys}`);
+  assert.equal(_test.fullResult(whole)?.artifact.sha256, HELLO_SHA);
+  assert.equal(_test.fullResult(FULL_RESULT.slice(0, 3).join("\n")), null, "a report line missing");
+  assert.equal(_test.fullResult(`${whole}{"extra":1}\n`), null, "a line too many");
+  assert.equal(_test.fullResult(FULL_RESULT[0].replace('"v":8', '"v":7')), null);
+  assert.equal(_test.fullResult('{"status":"analyzed","ml":{"eng":"2.9.1"},"raw":{}}'), null, "the old envelope");
 });
 
 // The default is a statement about what the caller already knows. A PURL is a
@@ -2935,126 +2978,6 @@ test("v1: a failing worker falls through to a healthy one", async () => {
   } finally {
     await Promise.all([sick.close(), well.close()]);
   }
-});
-
-test("hits carry the byte offset and line the match fired on", () => {
-  const envl = {
-    ml: { lvl: 3, eng: "2.8.0" },
-    raw: {
-      files: [
-        {
-          path: "evil.tgz!!lib/install.js",
-          traits: [
-            { id: "objectives/execution/shell/bash", crit: 5, desc: "Spawns bash" },
-            { id: "objectives/exfil", crit: 4, desc: "POSTs env", spans: [[512, 20]] },
-          ],
-          ctx: [
-            { ln: 100, line: 10, n: [{ i: "objectives/execution/shell/bash", o: 109, z: 4 }] },
-          ],
-        },
-      ],
-    },
-  };
-  const view = _test.customerView(envl, HELLO_SHA, "pkg:npm/evil@1.0.0");
-  // The note holds the exact byte; the window it sits in names the line.
-  assert.equal(view.hits[0].off, 109);
-  assert.equal(view.hits[0].line, 10);
-  // No note for this one, so its own evidence span locates it — with no line
-  // to claim, rather than a guessed one.
-  assert.equal(view.hits[1].off, 512);
-  assert.equal(view.hits[1].line, undefined);
-});
-
-test("an inherited finding is not repeated as its own hit", () => {
-  const envl = {
-    ml: { lvl: 4, eng: "2.8.0" },
-    raw: {
-      files: [
-        {
-          // The archive reports the member's finding a second time, pointing
-          // back at it — the same match, without the path or offset.
-          path: "evil.tgz",
-          traits: [{ id: "objectives/exfil", crit: 4, desc: "POSTs env", from: [{ file: 2 }] }],
-        },
-        {
-          path: "evil.tgz!!lib/install.js",
-          traits: [{ id: "objectives/exfil", crit: 4, desc: "POSTs env", spans: [[512, 20]] }],
-        },
-      ],
-    },
-  };
-  const view = _test.customerView(envl, HELLO_SHA, "pkg:npm/evil@1.0.0");
-  assert.equal(view.hits.length, 1, "one match, reported once");
-  assert.equal(view.hits[0].file, "lib/install.js", "the member that actually matched");
-  assert.equal(view.hits[0].off, 512);
-});
-
-test("customer view is sha/purl/lvl/eng plus at most three notable hits", () => {
-  const envl = {
-    ml: { lvl: 3, eng: "2.7.2" },
-    llm: { interpretation: "Postinstall launches a reverse shell." },
-    raw: {
-      v: "8",
-      files: [
-        {
-          path: "evil.tgz!!lib/install.js",
-          ident: { name: "evil", version: "1.0.0" },
-          traits: [
-            { id: "baseline/noise", crit: 2, desc: "ignore" },
-            { id: "objectives/execution/shell/bash", crit: 5, desc: "Spawns bash from a npm postinstall hook" },
-            { id: "objectives/persist", crit: 4, desc: "Writes a cron entry" },
-            { id: "objectives/exfil", crit: 3, desc: "POSTs env to a paste site" },
-            { id: "objectives/other", crit: 3, desc: "should not appear" },
-          ],
-        },
-      ],
-    },
-  };
-  const view = _test.customerView(envl, HELLO_SHA, "pkg:npm/evil@1.0.0");
-  assert.deepEqual(view, {
-    sha: HELLO_SHA,
-    purl: "pkg:npm/evil@1.0.0",
-    lvl: 3,
-    eng: "2.7.2",
-    why: "Postinstall launches a reverse shell.",
-    hits: [
-      {
-        id: "objectives/execution/shell/bash",
-        crit: 5,
-        desc: "Spawns bash from a npm postinstall hook",
-        file: "lib/install.js",
-        pkg: "pkg:npm/evil@1.0.0",
-      },
-      {
-        id: "objectives/persist",
-        crit: 4,
-        desc: "Writes a cron entry",
-        file: "lib/install.js",
-        pkg: "pkg:npm/evil@1.0.0",
-      },
-      {
-        id: "objectives/exfil",
-        crit: 3,
-        desc: "POSTs env to a paste site",
-        file: "lib/install.js",
-        pkg: "pkg:npm/evil@1.0.0",
-      },
-    ],
-  });
-});
-
-test("clean samples have no hits even if traits are present", () => {
-  const view = _test.customerView(
-    {
-      ml: { lvl: -1, eng: "beamline" },
-      raw: { files: [{ path: "a.js", traits: [{ id: "x", crit: 5, desc: "nope" }] }] },
-    },
-    HELLO_SHA,
-    null,
-  );
-  assert.equal(view.lvl, -1);
-  assert.equal(view.hits, undefined);
-  assert.equal(view.why, undefined);
 });
 
 function testEnv(url, extra = {}) {
@@ -5895,20 +5818,22 @@ test("a legacy token is a customer until its cutoff, and nobody after it", async
   const env = { ...testEnv("http://unused"), TOKENS_KV: kv, QUOTA };
   const request = () => quotaRequest({ authorization: `Bearer ${legacy}`, "cf-connecting-ip": "203.0.113.9" });
 
-  t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 10, 4, 23, 59) });
+  t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 10, 30, 23, 59) });
   await handle(request(), env, {});
   assert.deepEqual(QUOTA.asked.at(-1), { name: "org:legacyorg", limit: _test.TIER_QUOTAS.free.limit });
 
   // Whatever the namespace still holds: an expiration left off the row must
   // not keep the token alive.
-  t.mock.timers.setTime(Date.UTC(2026, 10, 5));
+  t.mock.timers.setTime(Date.UTC(2026, 11, 1));
   const reads = kv.reads;
   await handle(request(), env, {});
   assert.equal(kv.reads, reads, "a legacy token was looked up past its cutoff");
   assert.deepEqual(QUOTA.asked.at(-1), { name: "ip:203.0.113.9", limit: _test.ANONYMOUS_QUOTA });
 });
 
-test("only the legacy shape is looked up, not anything that starts like it", async () => {
+test("only the legacy shape is looked up, not anything that starts like it", async (t) => {
+  // Before the legacy cutoff, when a token of that shape is still looked up.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 10, 30) });
   const kv = tokenKV();
   const env = { ...testEnv("http://unused"), TOKENS_KV: kv };
   const bogus = ["x-example", "x-Example-2026-01", "x--2026-01", "x-example-2026-01-", "y-example-2026-01", `x-${"ab-".repeat(21)}c`];

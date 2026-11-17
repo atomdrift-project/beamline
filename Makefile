@@ -25,7 +25,6 @@ WORKERS     ?=
 BENCH_FILE  ?=
 BENCH_OUT   ?=
 DRY_RUN     ?=
-API         ?= v1
 BEAMLINE_URL ?= https://api.isotope13.ai
 BEAMLINE_TOKEN ?=
 # SCAN_TOKEN is a backend credential. Server-side BEAMLINE_TOKEN is client
@@ -52,18 +51,24 @@ KV_NAMESPACE ?= beamline
 # prints it. Not dash's own KV, which holds identities and is bound to dash alone.
 TOKENS ?=
 
-.PHONY: lint test stress-test pop-test fleet-bench kv-create deploy-cf
+.PHONY: lint test postdoc-e2e stress-test pop-test fleet-bench kv-create deploy-cf
 
 # Parse every file, then oxlint. No lint config is checked in: the defaults
 # are the standard, and the tree stays free of npm packages.
 lint:
-	@for f in beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs scripts/route-ab.mjs scripts/fleet-bench.mjs scripts/fleet-bench.test.mjs scripts/deploy-cf.mjs beamline.test.js stress.test.js; do \
+	@for f in beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs scripts/route-ab.mjs scripts/fleet-bench.mjs scripts/fleet-bench.test.mjs scripts/postdoc-e2e.test.mjs scripts/deploy-cf.mjs beamline.test.js stress.test.js; do \
 	  node --check "$$f" || exit 1; \
 	done
-	npx --yes $(OXLINT) --deny-warnings beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs scripts/route-ab.mjs scripts/fleet-bench.mjs scripts/fleet-bench.test.mjs scripts/deploy-cf.mjs beamline.test.js stress.test.js
+	npx --yes $(OXLINT) --deny-warnings beamline.js docs.js local.js stress.js tok.js scripts/route-bench.mjs scripts/route-ab.mjs scripts/fleet-bench.mjs scripts/fleet-bench.test.mjs scripts/postdoc-e2e.test.mjs scripts/deploy-cf.mjs beamline.test.js stress.test.js
 
 test:
 	node --test
+
+# Beamline in front of a real postdoc, with no hopper behind either: starts
+# `postdoc serve` (POSTDOC_BIN, default postdoc on PATH) and runs
+# scripts/postdoc-e2e.test.mjs against it. See that file for the knobs.
+postdoc-e2e:
+	sh scripts/postdoc-e2e.sh
 
 # Start a local beamline (unless BEAMLINE_URL is already set or :$(PORT) is up),
 # pull 100 npm / PyPI / crates / Go PURLs, then run lookup and analyze phases
@@ -102,7 +107,7 @@ stress-test:
 	  fi; \
 	fi; \
 	set +e; \
-	N="$(N)" SAMPLES="$(SAMPLES)" REPEAT="$(REPEAT)" CONCURRENCY="$(CONCURRENCY)" STRESS_ROUTE="$(STRESS_ROUTE)" API="$(API)" BEAMLINE_URL="$$url" BEAMLINE_TOKEN="$(BEAMLINE_TOKEN)" \
+	N="$(N)" SAMPLES="$(SAMPLES)" REPEAT="$(REPEAT)" CONCURRENCY="$(CONCURRENCY)" STRESS_ROUTE="$(STRESS_ROUTE)" BEAMLINE_URL="$$url" BEAMLINE_TOKEN="$(BEAMLINE_TOKEN)" \
 	  SCAN_URL="$(SCAN_URL)" HOPPER_URL="$(HOPPER_URL)" STRESS_OUT="$(STRESS_OUT)" POPULAR="$(POPULAR)" \
 	  HOPPER_TOKEN="$(HOPPER_TOKEN)" SCAN_TOKEN="$(SCAN_TOKEN)" ANALYZE_MISSES="$(ANALYZE_MISSES)" \
 	  node stress.js; \

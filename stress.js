@@ -31,11 +31,6 @@ const hopperToken = (process.env.HOPPER_TOKEN || "").trim() || readToken("hopper
 const scanUrl = trimSlash((process.env.SCAN_URL || "").split(",")[0]);
 const hopperUrl = trimSlash(process.env.HOPPER_URL);
 const outPath = process.env.STRESS_OUT || "";
-// Which surface to exercise. v1 is the default because it is the one under
-// development and the one a customer will hold; API=legacy still reaches the
-// older routes while they exist, so a run can be pointed at either without
-// keeping two harnesses in step.
-const api = (process.env.API || "v1").trim().toLowerCase() === "legacy" ? "legacy" : "v1";
 const popular = process.env.POPULAR === "1";
 const analyzeMisses = process.env.ANALYZE_MISSES === "1";
 const stressRoute = (process.env.STRESS_ROUTE || "combined").trim().toLowerCase();
@@ -125,7 +120,7 @@ async function main() {
   // The combined run checks the v1 contract once before both phases. A
   // route-only analyze pass is often used to finish or repeat a long run, so
   // do not spend another analysis slot on the one-off upload probe there.
-  const contract = api === "v1" && stressRoute !== "analyze" ? await contractProbe() : [];
+  const contract = stressRoute !== "analyze" ? await contractProbe() : [];
 
   // POPULAR=1 swaps the live registry feeds for the fixed list above.
   if (popular) {
@@ -198,19 +193,19 @@ async function named(eco, fn) {
 async function pingBackends() {
   const beam = await probe(`${beamlineUrl}/healthz`);
   const scan = scanUrl ? await probe(`${scanUrl}/_/health`) : "skipped";
-  const hopper = await probe(`${hopperUrl}/healthz`);
-  const hopperAlt = hopper === "ok" ? hopper : await probe(`${hopperUrl}/_/health`);
-  if (hopperToken) {
-    // /healthz is auth-exempt on hopper, so prove the credential works before a
-    // whole run turns into 401s that look like misses.
+  const hopper = hopperUrl ? await probe(`${hopperUrl}/_/health`) : "skipped";
+  if (hopperUrl && hopperToken) {
+    // /_/health is auth-exempt on hopper, so prove the credential works before a
+    // whole run turns into 401s that look like misses: look up a digest that
+    // cannot exist, which answers 404 to a good token and 401 to a bad one.
     const probeSha = "0".repeat(64);
     const auth = { authorization: `Bearer ${hopperToken}` };
-    const reach = await probe(`${hopperUrl}/api/sample/${probeSha}`, auth);
+    const reach = await probe(`${hopperUrl}/v1/lookup?sha256=${probeSha}`, auth);
     if (reach === "401" || reach === "403") {
       process.stderr.write(`warning: hopper rejected our token (${reach})\n`);
     }
   }
-  process.stderr.write(`health   beamline=${beam} scan=${scan} hopper=${hopperAlt}\n`);
+  process.stderr.write(`health   beamline=${beam} scan=${scan} hopper=${hopper}\n`);
   if (beam !== "ok") throw new Error(`beamline healthz: ${beam}`);
   if (scanUrl && scan !== "ok" && scan !== "saturated" && scan !== "degraded") {
     process.stderr.write(`warning: scan health is ${scan}\n`);
@@ -223,18 +218,6 @@ async function pingBackends() {
       process.stderr.write(`scan     version=${info.version || "?"} slots=${info.slots ?? "?"}\n`);
     } catch {
       // info is optional
-    }
-    try {
-      const ap = await fetch(`${scanUrl}/analyze-purl`, {
-        method: "GET",
-        headers: { "user-agent": UA },
-        signal: AbortSignal.timeout(4000),
-      });
-      if (ap.status === 404) {
-        process.stderr.write("warning: scan has no /analyze-purl — PURL lookups 404 until this worker is upgraded\n");
-      }
-    } catch {
-      // preflight is optional
     }
   }
 }
@@ -360,45 +343,30 @@ export async function fetchGo(limit) {
 // Ask what is known; if nothing is, ask for the work. The analyze call carries
 // the PURL and no bytes, so scan resolves the artifact from the registry itself
 // and the provenance it grafts into the report comes from the same fetch.
+//
+// A lookup that nobody has analyzed answers 200 with `status: unanalyzed`
+// rather than a 404, so what counts as a miss is a field rather than a status —
+// which is the whole point of the contract and therefore worth exercising
+// exactly as a client would read it.
 async function submit(item) {
   if (stressRoute === "lookup") return submitLookup(item);
   if (stressRoute === "analyze") return submitAnalyze(item);
-  return api === "v1" ? submitV1(item) : submitLegacy(item);
-}
-
-async function submitLookup(item) {
-  const path = api === "v1" ? "/v1/lookup" : "/lookup";
-  return ask(item, `${beamlineUrl}${path}?purl=${encodeURIComponent(item.purl)}`, "GET");
-}
-
-async function submitAnalyze(item) {
-  if (api === "v1") {
-    return askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}${followParam}`);
-  }
-  return ask(item, `${beamlineUrl}/analyze?purl=${encodeURIComponent(item.purl)}`, "POST");
-}
-
-async function submitLegacy(item) {
-  const looked = await ask(item, `${beamlineUrl}/lookup?purl=${encodeURIComponent(item.purl)}`, "GET");
-  const answered = !analyzeMisses || looked.status !== 404 ? looked : null;
-  if (answered) return { ...answered, both: await bothProbe(item, answered) };
-  const analyzed = await ask(item, `${beamlineUrl}/analyze?purl=${encodeURIComponent(item.purl)}`, "POST");
-  return { ...analyzed, analyzed: true, lookupMs: looked.ms, both: await bothProbe(item, analyzed) };
-}
-
-// The v1 shape of the same pass. A lookup that nobody has analyzed answers 200
-// with `status: unanalyzed` rather than a 404, so what counts as a miss is a
-// field rather than a status — which is the whole point of the contract and
-// therefore worth exercising exactly as a client would read it.
-async function submitV1(item) {
-  const looked = await ask(item, `${beamlineUrl}/v1/lookup?purl=${encodeURIComponent(item.purl)}`, "GET");
+  const looked = await ask(item, `${beamlineUrl}/v1/lookup?purl=${encodeURIComponent(item.purl)}`);
   // Only a real verdict counts as known. `unanalyzed` is the miss this pass exists
   // to fill, and `unavailable` is our own failure — treating either as an
   // answer would skip the analysis and report an outage as a cache hit.
   const known = looked.artifactStatus === "analyzed";
-  if (!analyzeMisses || known) return { ...looked, both: await bothProbeV1(item, looked) };
+  if (!analyzeMisses || known) return { ...looked, both: await bothProbe(item, looked) };
   const analyzed = await askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}${followParam}`);
-  return { ...analyzed, analyzed: true, lookupMs: looked.ms, both: await bothProbeV1(item, analyzed) };
+  return { ...analyzed, analyzed: true, lookupMs: looked.ms, both: await bothProbe(item, analyzed) };
+}
+
+async function submitLookup(item) {
+  return ask(item, `${beamlineUrl}/v1/lookup?purl=${encodeURIComponent(item.purl)}`);
+}
+
+async function submitAnalyze(item) {
+  return askStream(item, `${beamlineUrl}/v1/analyze?purl=${encodeURIComponent(item.purl)}${followParam}`);
 }
 
 // Re-ask with both keys, which is the shape a real client is in after its first
@@ -407,51 +375,35 @@ async function submitV1(item) {
 // moment apart — the only comparison that controls for what the corpus holds.
 //
 // Skipped when the first answer produced no digest; there is nothing to pair.
-async function bothProbeV1(item, prior) {
-  if (!prior?.sha || !/^[0-9a-f]{64}$/.test(prior.sha)) return null;
-  const url = `${beamlineUrl}/v1/lookup?purl=${encodeURIComponent(item.purl)}&sha256=${prior.sha}`;
-  const probed = await ask(item, url, "GET");
-  return { ms: probed.ms, status: probed.status, source: probed.source };
-}
-
 async function bothProbe(item, prior) {
   if (!prior?.sha || !/^[0-9a-f]{64}$/.test(prior.sha)) return null;
-  const url = `${beamlineUrl}/lookup?purl=${encodeURIComponent(item.purl)}&sha256=${prior.sha}`;
-  const probed = await ask(item, url, "GET");
+  const url = `${beamlineUrl}/v1/lookup?purl=${encodeURIComponent(item.purl)}&sha256=${prior.sha}`;
+  const probed = await ask(item, url);
   return { ms: probed.ms, status: probed.status, source: probed.source };
 }
 
-async function ask(item, url, method) {
+async function ask(item, url) {
   const headers = { "accept-encoding": "gzip" };
   if (token) headers.authorization = `Bearer ${token}`;
   const t0 = Date.now();
   try {
-    const resp = await get(url, timeoutMs + 10_000, headers, method);
+    const resp = await get(url, timeoutMs + 10_000, headers);
     const ms = Date.now() - t0;
     const body = await readJson(resp);
-    // Whether we authenticated decides the scope the answer must carry, and
-    // only the caller knows that — so it is passed in rather than read from
-    // module state, which would make the check untestable either way.
-    const issues =
-      api === "v1"
-        ? checkV1(resp.status, body, item.purl)
-        : checkApi(resp.status, resp.headers, body, item.purl, token ? "private" : "public");
     return row(item, {
       ms,
       status: resp.status,
-      artifactStatus: body && body.status,
+      artifactStatus: body?.status,
       source: resp.headers.get("x-beamline-source") || "",
       worker: resp.headers.get("x-beamline-worker") || "",
-      sha: (body && (body.sha || body.sha256)) || resp.headers.get("x-sha256") || "",
+      sha: body?.sha256 || resp.headers.get("x-sha256") || "",
       encoding: resp.headers.get("content-encoding") || "",
-      error: body && body.error,
-      detail: body && body.detail,
-      state: body && body.state,
-      lvl: body && (body.lvl ?? body.fires_at),
-      eng: body && (body.eng || body.engine_version),
-      why: Boolean(body && (body.why || body.reason)),
-      hits: body && (body.hits || body.findings) ? (body.hits || body.findings).length : 0,
-      issues,
+      error: body?.error?.code || body?.error,
+      lvl: body?.fires_at,
+      eng: body?.engine_version,
+      why: Boolean(body?.reason),
+      hits: body?.findings ? body.findings.length : 0,
+      issues: checkV1(resp.status, body, item.purl),
     });
   } catch (err) {
     const why = reason(err);
@@ -582,21 +534,6 @@ async function gunzip(u8) {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-const ALLOWED_200 = new Set(["sha", "purl", "lvl", "eng", "why", "hits"]);
-// `off` and `line` are documented hit fields (API.md: "off is the byte offset
-// of the match within file, and line its 1-based source line"). They were
-// missing here, so every response carrying a located hit — which is the useful
-// kind — was reported as an API violation. The harness was stale, not the API.
-const ALLOWED_HIT = new Set(["id", "crit", "file", "pkg", "desc", "off", "line"]);
-const SOURCES = new Set([
-  "cache",
-  "kv",
-  "scan:bloom",
-  "scan:analysis",
-  "scan:replica",
-  "scan:primary",
-  "none",
-]);
 // Every key a v1 decision carries, and every key it may carry — the contract is
 // that the shape never moves, so a field appearing or vanishing is a defect
 // rather than a variation.
@@ -606,8 +543,6 @@ const V1_STATUSES = new Set(["analyzed", "unanalyzed", "unavailable"]);
 // write a retry policy against.
 const V1_CAUSES = new Set(["saturated", "mixed", "unreachable", "no_workers"]);
 const V1_SEVERITIES = new Set(["benign", "suspicious", "hostile", "unknown"]);
-const SHA_RE = /^[0-9a-f]{64}$/;
-const DOC_STATUS = new Set([200, 202, 400, 401, 413, 415, 422, 404, 429, 503, 504, 500]);
 
 // A v1 assessment, checked as a client would have to read it.
 //
@@ -649,88 +584,6 @@ function checkV1(status, body, askedPurl) {
   if (askedPurl && body.purl && body.purl !== askedPurl) {
     issues.push(`answered about ${body.purl}, asked about ${askedPurl}`);
   }
-  return issues;
-}
-
-function checkApi(status, headers, body, askedPurl, scope) {
-  const issues = [];
-  const h = headers && typeof headers.get === "function" ? headers : new Headers(headers || {});
-  if (!DOC_STATUS.has(status)) issues.push(`status ${status} not in API.md`);
-  if (status === 200) {
-    // API.md: "public, max-age=… / private if authenticated". Beamline stores
-    // its own copy as public because Cloudflare will not hold a private one,
-    // and that rewrite once reached the client: an authenticated verdict came
-    // back marked cacheable by every shared cache on the way. A fresh reply
-    // and a cached one are the same response here, so both are checked.
-    const cc = h.get("cache-control") || "";
-    if (scope && !cc.startsWith(scope)) {
-      issues.push(`cache-control "${cc || "absent"}" should be ${scope} (${h.get("x-beamline-source") || "?"})`);
-    }
-    return check200(h, body, askedPurl, issues);
-  }
-  if (status === 202) {
-    if (!body || body.state !== "pending") issues.push("202 needs {state:pending}");
-    if (body && body.error) issues.push("202 must not use error");
-    if (!h.get("retry-after")) issues.push("202 needs Retry-After");
-    return issues;
-  }
-  if (!body || typeof body.error !== "string" || !body.error) issues.push("error body needs error string");
-  if (body && body.error === "") issues.push("empty error");
-  return issues;
-}
-
-function check200(h, body, askedPurl, issues) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    issues.push("200 body must be an object");
-    return issues;
-  }
-  for (const k of Object.keys(body)) {
-    if (!ALLOWED_200.has(k)) issues.push(`unexpected field ${k}`);
-  }
-  if (body.ml || body.raw || body.llm) issues.push("cleave/ml/llm must not appear");
-  if (!SHA_RE.test(body.sha || "")) issues.push("sha must be 64 hex");
-  const hdrSha = (h.get("x-sha256") || "").toLowerCase();
-  if (body.sha && !hdrSha) issues.push("missing X-SHA256");
-  if (hdrSha && body.sha && hdrSha !== body.sha) issues.push("X-SHA256 != sha");
-  if (body.purl != null) {
-    if (typeof body.purl !== "string" || !body.purl) issues.push("purl empty");
-    else if (askedPurl && body.purl !== askedPurl) issues.push("purl mismatch");
-  }
-  if (typeof body.lvl !== "number" || !Number.isFinite(body.lvl)) issues.push("lvl required");
-  else if (body.lvl < -1) issues.push("lvl < -1");
-  if (body.eng != null && (typeof body.eng !== "string" || body.eng === "")) issues.push("eng empty");
-  if (body.why != null && (typeof body.why !== "string" || body.why === "")) issues.push("why empty");
-  if (body.lvl === -1 && body.hits != null) issues.push("hits forbidden when lvl=-1");
-  if (body.hits != null) {
-    if (!Array.isArray(body.hits)) issues.push("hits must be an array");
-    else if (body.hits.length > 3) issues.push("hits cap is 3");
-    else {
-      for (const hit of body.hits) issues.push(...checkHit(hit));
-    }
-  }
-  const src = h.get("x-beamline-source") || "";
-  if (src && !SOURCES.has(src)) issues.push(`bad X-Beamline-Source ${src}`);
-  const ct = h.get("content-type") || "";
-  if (!ct.includes("application/json")) issues.push("Content-Type");
-  if (!h.get("cache-control")) issues.push("Cache-Control");
-  return issues;
-}
-
-function checkHit(hit) {
-  const issues = [];
-  if (!hit || typeof hit !== "object") return ["hit not object"];
-  for (const k of Object.keys(hit)) {
-    if (!ALLOWED_HIT.has(k)) issues.push(`hit unexpected ${k}`);
-  }
-  if (typeof hit.id !== "string" || !hit.id) issues.push("hit.id");
-  if (hit.crit !== 3 && hit.crit !== 4 && hit.crit !== 5) issues.push("hit.crit must be 3|4|5");
-  for (const k of ["file", "pkg", "desc"]) {
-    if (hit[k] != null && (typeof hit[k] !== "string" || hit[k] === "")) issues.push(`hit.${k} empty`);
-  }
-  // Either may be absent — a binary window carries no line structure — but a
-  // present one has to be a real position.
-  if (hit.off != null && (!Number.isInteger(hit.off) || hit.off < 0)) issues.push("hit.off not a byte offset");
-  if (hit.line != null && (!Number.isInteger(hit.line) || hit.line < 1)) issues.push("hit.line not 1-based");
   return issues;
 }
 
@@ -779,10 +632,6 @@ function classify(r) {
     if (r.artifactStatus === "unavailable") return "note";
     return "ok";
   }
-  // /lookup is read-only, so a 404 is the correct answer for something nothing
-  // has analyzed yet — a fact about the corpus, not a defect. It gets its own
-  // bucket because the hit rate is the number this run exists to report.
-  if (r.status === 404) return "miss";
   if (r.status === 400) return "bug";
   if (r.status >= 500 && r.status !== 503 && r.status !== 504) return "bug";
   return "note";
@@ -794,7 +643,7 @@ function logRow(r) {
   const src = (r.source || "-").padEnd(6);
   const eco = r.eco.padEnd(6);
   const ms = String(r.ms).padStart(6);
-  let extra = r.status === 200 ? `lvl=${r.lvl}${r.why ? " why" : ""}` : `${r.status} ${r.error || r.state || ""}`;
+  let extra = r.status === 200 ? `lvl=${r.lvl}${r.why ? " why" : ""}` : `${r.status} ${r.error || ""}`;
   if (r.artifactStatus) extra = `${r.artifactStatus} ${extra}`;
   if (r.frames !== undefined) extra += ` frames=${r.frames}${r.firstMs ? ` first=${r.firstMs}ms` : ""}`;
   if (r.worker) extra += ` worker=${r.worker}`;
@@ -828,9 +677,9 @@ function summarize(rows) {
     const lats = served.filter((r) => r.worker === w).map((r) => r.ms).sort((a, b) => a - b);
     workerLatency[w] = { n: lats.length, p50: percentile(lats, 50), p95: percentile(lats, 95), max: lats[lats.length - 1] };
   }
-  // How many verdicts arrived with an interpretation (`why` on the legacy
-  // route, `reason` on v1). Only rows carrying a level are verdicts: an
-  // `unanalyzed` answer has nothing to explain and would only dilute the rate.
+  // How many verdicts arrived with an interpretation (`reason`). Only rows
+  // carrying a level are verdicts: an `unanalyzed` answer has nothing to
+  // explain and would only dilute the rate.
   const verdicts = ok.filter((r) => r.lvl != null);
   const why = {
     n: verdicts.length,
@@ -911,7 +760,7 @@ function printReport(rows, summary, feedErrors) {
   if (summary.bugs.length) {
     process.stdout.write("bugs\n");
     for (const r of summary.bugs) {
-      process.stdout.write(`  ${r.status} ${r.error || r.state || ""}  ${r.purl}${r.issues && r.issues.length ? `  [${r.issues.join("; ")}]` : ""}\n`);
+      process.stdout.write(`  ${r.status} ${r.error || ""}  ${r.purl}${r.issues && r.issues.length ? `  [${r.issues.join("; ")}]` : ""}\n`);
     }
   }
   if (feedErrors.length) process.stdout.write(`feed errors: ${feedErrors.length}\n`);
@@ -1247,6 +1096,5 @@ export const _test = {
   POPULAR,
   popularJobs,
   repeatJobs,
-  checkApi,
   mixJobs,
 };
