@@ -2073,7 +2073,7 @@ test("v1 analyze: a decision naming no digest still caches under its PURL", asyn
 });
 
 // The TTL a caller is told is derived from the answer, never read back from
-// the cache. Measured on api.isotope13.ai: an entry written `max-age=60` reads
+// the cache. Measured on api.atomdrift.org: an entry written `max-age=60` reads
 // back `max-age=14400`, because the zone's edge TTL overrides the worker's. Our
 // own eviction still honours the 60s, so the effect was purely to tell callers
 // to hold a one-minute answer for four hours.

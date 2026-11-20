@@ -127,7 +127,7 @@ function docsHtml(authRequired) {
           <article class="hero-point"><strong class="hero-point-title">Built for what is not known yet</strong><p>Analyze packages, exact downloads, and uploaded artifacts—not just files that already appear on a threat list.</p></article>
           <article class="hero-point"><strong class="hero-point-title">Open-source foundation</strong><p>Beamline is based on the open-source <a href="https://atomdrift.org/">Atomdrift project</a>.</p></article>
         </div>
-        <div class="facts"><span class="fact"><strong>Endpoint</strong> https://api.isotope13.ai</span><span class="fact"><strong>Auth</strong> Anonymous / Bearer Token</span><span class="fact"><strong>Formats</strong> JSON + NDJSON</span></div>
+        <div class="facts"><span class="fact"><strong>Endpoint</strong> https://api.atomdrift.org</span><span class="fact"><strong>Auth</strong> Anonymous / Bearer Token</span><span class="fact"><strong>Formats</strong> JSON + NDJSON</span></div>
         <table class="endpoint-table" aria-label="Endpoint summary"><thead><tr><th>Method</th><th>Route</th><th>Use it for</th></tr></thead><tbody>
           <tr><td>GET</td><td>/v1/lookup</td><td>Ask whether an artifact is already known.</td></tr>
           <tr><td>POST</td><td>/v1/analyze</td><td>Analyze a PURL, exact URL, or uploaded bytes.</td></tr>
@@ -142,7 +142,7 @@ function docsHtml(authRequired) {
         <div class="route-example"><code>GET /v1/lookup?purl=…</code></div>
         <div class="runner" data-runner data-method="GET" data-path="/v1/lookup?purl=pkg%3Anpm%2Faxios%401.19.0">
           <div class="request"><button class="run-button" type="button" aria-label="Run PURL lookup example">Run</button><pre><code>curl -sS \
-  "https://api.isotope13.ai/v1/lookup?purl=pkg%3Anpm%2Faxios%401.19.0"</code></pre></div>
+  "https://api.atomdrift.org/v1/lookup?purl=pkg%3Anpm%2Faxios%401.19.0"</code></pre></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
         <p class="muted">URL-encode PURLs. Repeat <code>purl</code> for up to 50 packages. One PURL returns an object; several return a list.</p>
@@ -150,7 +150,7 @@ function docsHtml(authRequired) {
         <div class="route-example"><code>GET /v1/lookup?url=…</code></div>
         <div class="runner" data-runner data-method="GET" data-path="/v1/lookup?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz">
           <div class="request"><button class="run-button" type="button" aria-label="Run exact URL lookup example">Run</button><pre><code>curl -sS \
-  "https://api.isotope13.ai/v1/lookup?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz"</code></pre></div>
+  "https://api.atomdrift.org/v1/lookup?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz"</code></pre></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
         <p class="muted">URL-encode the <code>url</code> query parameter value.</p>
@@ -158,7 +158,7 @@ function docsHtml(authRequired) {
         <div class="route-example"><code>GET /v1/lookup?sha256=…</code></div>
         <div class="runner" data-runner data-method="GET" data-path="/v1/lookup?sha256=dd46efaa38534ef67370ac3ebc6151e4cf475fdb4bb68f8e2003b432d11d92c2">
           <div class="request"><button class="run-button" type="button" aria-label="Run SHA-256 lookup example">Run</button><pre><code>curl -sS \
-  "https://api.isotope13.ai/v1/lookup?sha256=dd46efaa38534ef67370ac3ebc6151e4cf475fdb4bb68f8e2003b432d11d92c2"</code></pre></div>
+  "https://api.atomdrift.org/v1/lookup?sha256=dd46efaa38534ef67370ac3ebc6151e4cf475fdb4bb68f8e2003b432d11d92c2"</code></pre></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
       </section>
@@ -169,14 +169,14 @@ function docsHtml(authRequired) {
         <div class="route-example"><code>POST /v1/analyze?purl=…</code></div>
         <div class="runner" data-runner data-method="POST" data-stream data-path="/v1/analyze?purl=pkg%3Acargo%2Ftokio%401.40.0">
           <div class="request"><button class="run-button" type="button" aria-label="Run PURL analysis example">Run</button><pre><code>curl -sN -X POST \
-  "https://api.isotope13.ai/v1/analyze?purl=pkg%3Acargo%2Ftokio%401.40.0"</code></pre></div>
+  "https://api.atomdrift.org/v1/analyze?purl=pkg%3Acargo%2Ftokio%401.40.0"</code></pre></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
         <h3 id="analyze-url"><a class="heading-link" href="#analyze-url">Exact URL <span class="new-label">New</span></a></h3>
         <div class="route-example"><code>POST /v1/analyze?url=…</code></div>
         <div class="runner" data-runner data-method="POST" data-stream data-path="/v1/analyze?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz">
           <div class="request"><button class="run-button" type="button" aria-label="Run exact URL analysis example">Run</button><pre><code>curl -sN -X POST \
-  "https://api.isotope13.ai/v1/analyze?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz"</code></pre></div>
+  "https://api.atomdrift.org/v1/analyze?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz"</code></pre></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
         <p>Beamline fetches the exact URL and returns its SHA-256. The response includes a PURL when one is known.</p>
@@ -189,7 +189,7 @@ function docsHtml(authRequired) {
           <div class="request"><button class="run-button" type="button" aria-label="Run content upload example">Run</button><pre><code>curl -sN -X POST \
   --data-binary @sample.tgz \
   -H "Content-Type: application/octet-stream" \
-  "https://api.isotope13.ai/v1/analyze"</code></pre>
+  "https://api.atomdrift.org/v1/analyze"</code></pre>
           <div class="file-picker"><label for="beamline-file">Choose a local sample</label><input id="beamline-file" type="file"></div></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
@@ -202,7 +202,7 @@ function docsHtml(authRequired) {
         <div class="route-example"><code>POST /v1/flush?purl=…</code></div>
         <div class="runner" data-runner data-method="POST" data-path="/v1/flush?purl=pkg%3Anpm%2Faxios%401.19.0">
           <pre><code>curl -X POST \\
-  "https://api.isotope13.ai/v1/flush?purl=pkg%3Anpm%2Faxios%401.19.0"</code></pre></div>
+  "https://api.atomdrift.org/v1/flush?purl=pkg%3Anpm%2Faxios%401.19.0"</code></pre></div>
         <p>An artifact is filed under more than one key: one per <a href="#follow">follow policy</a>, one per response shape, and one per name that reaches it. A flush clears all of them, then follows the answers it found to the artifact's other names — its digest, its download URL, the PURL Scan normalized it to — and clears those too. The response reports what it reached.</p>
         <p>Flushing something that was never cached is not an error. It returns <code>200</code> with <code>keys_dropped: 0</code>.</p>
       </section>
@@ -223,7 +223,7 @@ POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
           <tr><td>none</td><td>Nothing else.</td><td>URL</td></tr><tr><td>dependencies</td><td>Dependencies in manifests and lockfiles.</td><td>—</td></tr><tr><td>references</td><td>Packages and URLs in install or download commands.</td><td>PURL, SHA-256</td></tr><tr><td>ci-actions</td><td>Third-party CI actions and their dependencies.</td><td>—</td></tr><tr><td>all</td><td>Everything above.</td><td>Upload</td></tr>
         </tbody></table>
         <pre><code>curl -sN -X POST \
-  "https://api.isotope13.ai/v1/analyze?purl=pkg%3Anpm%2Faxios%401.19.0&amp;follow=all"</code></pre>
+  "https://api.atomdrift.org/v1/analyze?purl=pkg%3Anpm%2Faxios%401.19.0&amp;follow=all"</code></pre>
         <p>Omit <code>?follow=</code> to use the default above.</p>
       </section>
 
@@ -264,7 +264,7 @@ POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
           <pre><code>curl -sN -X POST --get \
   --data-urlencode "url=${"${EXACT_URL}"}" \
   --data "follow=none" \
-  "https://api.isotope13.ai/v1/analyze"</code></pre>
+  "https://api.atomdrift.org/v1/analyze"</code></pre>
           <p class="muted">Keep the returned <code>sha256</code> and cache the result too.</p>
         </section>
       </section>

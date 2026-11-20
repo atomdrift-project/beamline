@@ -131,7 +131,7 @@ HOPPER_URL=… SCAN_URL=… node local.js
 HOPPER_URL=… SCAN_URL=… make deploy-cf
 ```
 
-`make stress-test` targets `https://api.isotope13.ai` by default and does not
+`make stress-test` targets `https://api.atomdrift.org` by default and does not
 need `SCAN_URL`; set `BEAMLINE_URL=` explicitly when you want it to start a
 local beamline, in which case `SCAN_URL` is required. The stress client uses
 `BEAMLINE_TOKEN` when non-empty, otherwise the first non-empty line of

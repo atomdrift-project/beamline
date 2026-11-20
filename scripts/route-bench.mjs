@@ -9,7 +9,7 @@
 //   node scripts/route-bench.mjs pkg:pypi/idna@3.7 pkg:cargo/serde@1.0.210
 //   node scripts/route-bench.mjs --file purls.txt --trials 2
 //
-// BEAMLINE  base URL          (default https://poc.api.isotope13.ai)
+// BEAMLINE  base URL          (default https://poc.api.atomdrift.org)
 // TOKEN     bearer            (default: first line of ~/.tok/beamline)
 //
 // Only trials scan actually served are scored: a verdict answered from
@@ -37,7 +37,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { cleartextRemote } from "../tok.js";
 
-const BEAMLINE = (process.env.BEAMLINE || "https://poc.api.isotope13.ai").replace(/\/$/, "");
+const BEAMLINE = (process.env.BEAMLINE || "https://poc.api.atomdrift.org").replace(/\/$/, "");
 const TOKEN =
   process.env.TOKEN ||
   (() => {

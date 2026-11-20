@@ -16,7 +16,7 @@
 //
 //   node scripts/route-ab.mjs --file purls.txt [--concurrency 2] [--seed 1]
 //
-// BEAMLINE  base URL   (default https://poc.api.isotope13.ai)
+// BEAMLINE  base URL   (default https://poc.api.atomdrift.org)
 // TOKEN     bearer     (default: first line of ~/.tok/beamline)
 //
 // Only analyses scan actually served are scored. A PURL this fleet has already
@@ -34,7 +34,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { cleartextRemote } from "../tok.js";
 
-const BEAMLINE = (process.env.BEAMLINE || "https://poc.api.isotope13.ai").replace(/\/$/, "");
+const BEAMLINE = (process.env.BEAMLINE || "https://poc.api.atomdrift.org").replace(/\/$/, "");
 const TOKEN =
   process.env.TOKEN ||
   (() => {

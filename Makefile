@@ -25,7 +25,7 @@ WORKERS     ?=
 BENCH_FILE  ?=
 BENCH_OUT   ?=
 DRY_RUN     ?=
-BEAMLINE_URL ?= https://api.isotope13.ai
+BEAMLINE_URL ?= https://api.atomdrift.org
 BEAMLINE_TOKEN ?=
 # SCAN_TOKEN is a backend credential. Server-side BEAMLINE_TOKEN is client
 # policy and is environment-only: an unset value leaves the API open.

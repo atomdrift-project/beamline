@@ -1007,7 +1007,7 @@ async function handleV1Lookup(env, ctx, url) {
     // Derived from the answer, never read back from the cache.
     //
     // What comes back is whatever the platform decided to store the directive
-    // as, which is not what we asked for: measured on api.isotope13.ai, an
+    // as, which is not what we asked for: measured on api.atomdrift.org, an
     // entry written `max-age=60` reads back `max-age=14400`, because the zone's
     // edge TTL overrides the worker's. Our own eviction still honours the 60s —
     // an `unanalyzed` really is gone a minute later — but the caller was being

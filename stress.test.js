@@ -9,7 +9,7 @@ test("a bearer token never crosses a network in the clear", () => {
   for (const url of ["http://api.example.com", "http://10.0.0.5:8080", "http://127.example.com"]) {
     assert.equal(cleartextRemote(url), true, url);
   }
-  for (const url of ["https://api.isotope13.ai", "http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080", "", "not a url"]) {
+  for (const url of ["https://api.atomdrift.org", "http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080", "", "not a url"]) {
     assert.equal(cleartextRemote(url), false, url);
   }
 });

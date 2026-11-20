@@ -21,7 +21,7 @@
 //   node scripts/fleet-bench.mjs --per-worker 96          # same count everywhere, each at its own width
 //   node scripts/fleet-bench.mjs --concurrency 8 --workers scan-lax.isotope13.ai --file purls.txt
 //
-// BEAMLINE_URL  base URL  (default https://api.isotope13.ai)
+// BEAMLINE_URL  base URL  (default https://api.atomdrift.org)
 // BEAMLINE_TOKEN bearer   (default: first line of ~/.tok/beamline)
 //
 // Only analyses scan actually ran on the pinned worker are scored. A verdict
@@ -79,7 +79,7 @@ async function main() {
   const only = opt("--workers", "").split(",").map((w) => w.trim()).filter(Boolean);
   const dryRun = args.includes("--dry-run");
 
-  const base = (process.env.BEAMLINE_URL || "https://api.isotope13.ai").replace(/\/+$/, "");
+  const base = (process.env.BEAMLINE_URL || "https://api.atomdrift.org").replace(/\/+$/, "");
   const token = (process.env.BEAMLINE_TOKEN || "").trim() || readToken("beamline");
   if (token && cleartextRemote(base)) {
     throw new Error(`${base} is plain http to a remote host; refusing to send a bearer token over it. Use https.`);
