@@ -12,7 +12,7 @@ function docsHtml(authRequired) {
   <title>Beamline API · software supply-chain malware detection · atomdrift</title>
   <style>
     @font-face { font-family: Oxanium; src: url("https://atomdrift.org/assets/fonts/Oxanium-Bold.ttf") format("truetype"); font-display: swap; font-weight: 700; }
-    :root { --ink:#0a0a0a; --mid:#404040; --light:#6b7280; --paper:#fff; --mist:#f5f5f5; --line:#e8e8e8; --blue:#2563eb; --toxic:#d0ff00; --toxic-muted:#9abe25; --toxic-dark:#4a6b0f; --toxic-dim:rgba(208,255,0,.14); --code:#fafaf9; --code-line:#e8e8e8; --code-ink:#0a0a0a; --code-muted:#6b7280; --max:1180px; }
+    :root { --ink:#0a0a0a; --mid:#404040; --light:#6b7280; --paper:#fff; --mist:#f5f5f5; --line:#e8e8e8; --blue:#2563eb; --toxic:#d0ff00; --toxic-muted:#9abe25; --toxic-dark:#4a6b0f; --toxic-dim:rgba(208,255,0,.14); --code:#fafaf9; --code-line:#e8e8e8; --code-ink:#0a0a0a; --code-muted:#52525b; --max:1180px; }
     * { box-sizing:border-box; }
     html { scroll-behavior:smooth; }
     body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.65 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif; -webkit-font-smoothing:antialiased; }
@@ -25,13 +25,13 @@ function docsHtml(authRequired) {
     .brand-accent { color:var(--toxic-muted); }
     .brand-product { color:var(--light); }
     .toxic-stripe { background:linear-gradient(90deg,var(--toxic) 0%,var(--toxic-muted) 50%,transparent 100%); height:4px; }
-    .topbar a { color:var(--mid); font-size:13px; text-decoration:none; }
+    .topbar a { color:var(--mid); font-size:14px; text-decoration:none; }
     .topbar a:hover { color:var(--blue); }
     .shell { display:grid; gap:clamp(36px,4vw,52px); grid-template-columns:136px minmax(0,1fr); margin:0 auto; max-width:var(--max); padding:70px 40px 110px; }
     .toc { position:sticky; top:28px; align-self:start; }
-    .toc-label,.eyebrow { color:var(--toxic-dark); font-size:10px; font-weight:700; letter-spacing:1.8px; text-transform:uppercase; }
+    .toc-label,.eyebrow { color:var(--toxic-dark); font-size:12px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; }
     .toc-label { margin-bottom:15px; }
-    .toc a { border-left:1px solid var(--line); color:var(--mid); display:block; font-size:13px; padding:5px 0 5px 14px; text-decoration:none; }
+    .toc a { border-left:1px solid var(--line); color:var(--mid); display:block; font-size:14px; padding:5px 0 5px 14px; text-decoration:none; }
     .toc a:hover { border-color:var(--toxic-muted); color:var(--ink); }
     .content { min-width:0; }
     h1,h2,h3 { font-family:Oxanium,ui-sans-serif,sans-serif; font-weight:700; letter-spacing:-1.5px; line-height:1.1; }
@@ -42,12 +42,12 @@ function docsHtml(authRequired) {
     .heading-link { color:inherit; display:inline-block; text-decoration:none; }
     .heading-link::after { color:var(--toxic-dark); content:"#"; font:600 .55em/1 ui-monospace,SFMono-Regular,Menlo,monospace; margin-left:.45em; opacity:0; }
     .heading-link:hover::after,.heading-link:focus-visible::after { opacity:1; }
-    .new-label { background:var(--toxic-dim); border:1px solid var(--toxic-muted); border-radius:999px; color:var(--toxic-dark); display:inline-block; font:700 10px/1 Inter,ui-sans-serif,system-ui,sans-serif; letter-spacing:.8px; margin-left:8px; padding:4px 7px 3px; text-transform:uppercase; vertical-align:.25em; }
+    .new-label { background:var(--toxic-dim); border:1px solid var(--toxic-muted); border-radius:999px; color:var(--toxic-dark); display:inline-block; font:700 12px/1 Inter,ui-sans-serif,system-ui,sans-serif; letter-spacing:.6px; margin-left:8px; padding:4px 8px 3px; text-transform:uppercase; vertical-align:.25em; }
     p { color:var(--mid); margin:0 0 18px; max-width:none; }
     .lead { font-size:19px; line-height:1.6; max-width:820px; }
     .eyebrow { margin-bottom:8px; }
     .facts { display:flex; flex-wrap:wrap; gap:9px; margin:28px 0 42px; }
-    .fact { background:var(--mist); border:1px solid var(--line); color:var(--mid); font-size:12px; overflow-wrap:anywhere; padding:7px 10px; }
+    .fact { background:var(--mist); border:1px solid var(--line); color:var(--mid); font-size:13px; overflow-wrap:anywhere; padding:7px 10px; }
     .fact strong { color:var(--ink); font-weight:600; }
     .hero-points { display:grid; gap:24px; grid-template-columns:repeat(3,minmax(0,1fr)); margin:34px 0 42px; }
     .hero-point { border-top:2px solid var(--toxic-muted); padding-top:11px; }
@@ -55,33 +55,33 @@ function docsHtml(authRequired) {
     .hero-point p { font-size:14px; line-height:1.5; margin:6px 0 0; }
     .endpoint-table { border-collapse:collapse; margin:22px 0 0; width:100%; }
     .endpoint-table th,.endpoint-table td { border-bottom:1px solid var(--line); padding:12px 8px 12px 0; text-align:left; vertical-align:top; }
-    .endpoint-table th { color:var(--light); font-size:11px; letter-spacing:1px; text-transform:uppercase; }
-    .endpoint-table td:first-child { color:var(--toxic-dark); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; white-space:nowrap; }
+    .endpoint-table th { color:var(--light); font-size:12px; letter-spacing:1px; text-transform:uppercase; }
+    .endpoint-table td:first-child { color:var(--toxic-dark); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:14px; white-space:nowrap; }
     .endpoint-table td:last-child { color:var(--mid); font-size:14px; }
     .endpoint-table + p { margin-top:18px; }
-    .route-example { color:var(--code-muted); font-size:12px; margin:-2px 0 10px; overflow-wrap:anywhere; }
-    .route-example code { color:var(--code-ink); white-space:normal; }
+    .route-example { color:var(--code-muted); font-size:13px; margin:-2px 0 10px; overflow-wrap:anywhere; }
+    .route-example code { background:none; color:var(--code-ink); font-size:inherit; padding:0; white-space:normal; }
     code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
     code { color:var(--ink); font-size:.92em; }
     :not(pre) > code { background:var(--mist); border-radius:3px; padding:1px 5px; }
-    pre { background:var(--code); border:1px solid var(--code-line); border-left:3px solid var(--toxic-muted); border-radius:7px; color:var(--code-ink); font-size:12px; line-height:1.65; margin:18px 0 24px; overflow-x:auto; padding:18px 20px; tab-size:2; }
-    pre code { color:inherit; }
+    pre { background:var(--code); border:1px solid var(--code-line); border-left:3px solid var(--toxic-muted); border-radius:7px; color:var(--code-ink); font-size:13px; line-height:1.6; margin:18px 0 24px; overflow-x:auto; padding:18px 20px; tab-size:2; }
+    pre code { color:inherit; font-size:inherit; }
     .runner { margin:18px 0 26px; }
     .request { align-items:start; background:var(--code); border:1px solid var(--code-line); border-left:3px solid var(--toxic-muted); border-radius:8px; display:grid; grid-template-columns:minmax(0,1fr) auto; overflow:hidden; }
-    .request pre { border:0; border-radius:0; grid-column:1; grid-row:1; margin:0; min-width:0; overflow-wrap:anywhere; padding:18px 8px 18px 20px; white-space:pre-wrap; }
-    .run-button { background:var(--toxic); border:1px solid var(--toxic); border-radius:6px; color:var(--ink); cursor:pointer; font:600 13px/1.2 Inter,ui-sans-serif,system-ui,sans-serif; grid-column:2; grid-row:1; margin:9px; min-height:44px; min-width:64px; padding:10px 16px; }
-    .run-button:hover { background:var(--toxic-muted); border-color:var(--toxic-muted); }
+    .request pre { border:0; border-radius:0; grid-column:1; grid-row:1; margin:0; min-width:0; padding:18px 8px 18px 20px; }
+    .run-button { background:var(--toxic); border:1px solid var(--toxic-dark); border-radius:6px; color:var(--ink); cursor:pointer; font:600 15px/1.2 Inter,ui-sans-serif,system-ui,sans-serif; grid-column:2; grid-row:1; margin:9px; min-height:44px; min-width:64px; padding:10px 16px; }
+    .run-button:hover { background:var(--toxic-muted); }
     .run-button:disabled { cursor:wait; opacity:.55; }
     .run-button:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
     .response { background:#fff; border:1px solid var(--code-line); border-radius:8px; display:none; margin-top:10px; overflow:hidden; }
     .runner.has-response .response { display:block; }
-    .response-head { align-items:center; color:var(--code-muted); display:flex; font-size:11px; font-weight:600; justify-content:space-between; letter-spacing:.8px; padding:10px 16px 0; text-transform:uppercase; }
+    .response-head { align-items:center; color:var(--code-muted); display:flex; font-size:12px; font-weight:600; justify-content:space-between; letter-spacing:.8px; padding:10px 16px 0; text-transform:uppercase; }
     .response-state { color:var(--toxic-dark); font-weight:500; letter-spacing:0; text-transform:none; }
-    .run-output { background:#fff; border:0; color:var(--code-ink); display:block; font-size:12px; margin:0; max-height:300px; overflow:auto; padding:12px 16px 16px; white-space:pre-wrap; }
+    .run-output { background:#fff; border:0; color:var(--code-ink); display:block; font-size:13px; margin:0; max-height:300px; overflow:auto; padding:12px 16px 16px; white-space:pre-wrap; }
     .run-output[data-state="error"] { border-left:3px solid #b00020; }
     .file-picker { align-items:center; display:flex; flex-wrap:wrap; gap:10px; grid-column:1 / -1; padding:12px 16px; }
-    .file-picker input { color:var(--code-ink); font-size:13px; max-width:100%; }
-    .file-picker label { color:var(--code-muted); font-size:12px; }
+    .file-picker input { color:var(--code-ink); font-size:14px; max-width:100%; }
+    .file-picker label { color:var(--code-muted); font-size:13px; }
     .note { background:var(--toxic-dim); border-left:3px solid var(--toxic-muted); color:var(--mid); margin:20px 0; padding:14px 17px; }
     .note strong { color:var(--ink); }
     .steps { counter-reset:step; list-style:none; margin:18px 0 22px; padding:0; }
@@ -92,12 +92,18 @@ function docsHtml(authRequired) {
     .meanings li::marker { color:var(--toxic-dark); }
     .muted { color:var(--light); font-size:14px; }
     .footer { border-top:1px solid var(--line); margin-top:78px; padding-top:24px; }
-    @media (max-width:800px) {
-      .topbar { align-items:flex-start; gap:12px; padding:18px 20px; }
-      .topbar a { font-size:12px; text-align:right; }
+    @media (max-width:1080px) {
+      .topbar { padding:18px 20px; }
       .shell { display:block; padding:42px 20px 72px; }
       .toc { margin-bottom:48px; position:static; }
-      .toc a { display:inline-block; margin:0 16px 8px 0; padding:0 0 0 10px; }
+      .toc a { align-items:center; display:inline-flex; margin:0 16px 0 0; min-height:44px; padding:0 0 0 10px; }
+    }
+    @media (max-width:800px) {
+      .topbar { align-items:flex-start; gap:12px; }
+      .topbar a { align-items:center; display:inline-flex; min-height:44px; text-align:right; }
+      .request { grid-template-columns:minmax(0,1fr); }
+      .request pre { overflow-wrap:anywhere; white-space:pre-wrap; }
+      .run-button { grid-column:1; grid-row:3; justify-self:start; margin:0 15px 15px; }
       h1 { font-size:clamp(36px,11vw,52px); }
       h2 { font-size:26px; margin-top:58px; }
       .lead { font-size:18px; }
@@ -105,10 +111,9 @@ function docsHtml(authRequired) {
       .endpoint-table { display:block; overflow-x:auto; }
       .endpoint-table th,.endpoint-table td { min-width:120px; }
       .route-example { margin-bottom:9px; }
-      pre { font-size:12px; padding:15px; }
+      pre { padding:15px; }
       .request pre { padding:15px 6px 15px 15px; }
       .file-picker { align-items:flex-start; flex-direction:column; }
-      .file-picker input { font-size:12px; }
     }
   </style>
 </head>
@@ -166,16 +171,18 @@ function docsHtml(authRequired) {
         <h3 id="lookup-url"><a class="heading-link" href="#lookup-url">Exact URL <span class="new-label">New</span></a></h3>
         <div class="route-example"><code>GET /v1/lookup?url=…</code></div>
         <div class="runner" data-runner data-method="GET" data-path="/v1/lookup?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz">
-          <div class="request"><button class="run-button" type="button" aria-label="Run exact URL lookup example">Run</button><pre><code>curl -sS \
-  "https://api.atomdrift.org/v1/lookup?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz"</code></pre></div>
+          <div class="request"><button class="run-button" type="button" aria-label="Run exact URL lookup example">Run</button><pre><code>curl -sS --get \
+  --data-urlencode "url=https://registry.npmjs.org/axios/-/axios-1.19.0.tgz" \
+  "https://api.atomdrift.org/v1/lookup"</code></pre></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
-        <p class="muted">URL-encode the <code>url</code> query parameter value.</p>
+        <p class="muted">URL-encode the <code>url</code> query parameter value; <code>--data-urlencode</code> does this for you.</p>
         <h3 id="lookup-sha256"><a class="heading-link" href="#lookup-sha256">SHA-256</a></h3>
         <div class="route-example"><code>GET /v1/lookup?sha256=…</code></div>
         <div class="runner" data-runner data-method="GET" data-path="/v1/lookup?sha256=dd46efaa38534ef67370ac3ebc6151e4cf475fdb4bb68f8e2003b432d11d92c2">
-          <div class="request"><button class="run-button" type="button" aria-label="Run SHA-256 lookup example">Run</button><pre><code>curl -sS \
-  "https://api.atomdrift.org/v1/lookup?sha256=dd46efaa38534ef67370ac3ebc6151e4cf475fdb4bb68f8e2003b432d11d92c2"</code></pre></div>
+          <div class="request"><button class="run-button" type="button" aria-label="Run SHA-256 lookup example">Run</button><pre><code>curl -sS --get \
+  -d sha256=dd46efaa38534ef67370ac3ebc6151e4cf475fdb4bb68f8e2003b432d11d92c2 \
+  "https://api.atomdrift.org/v1/lookup"</code></pre></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
       </section>
@@ -192,8 +199,9 @@ function docsHtml(authRequired) {
         <h3 id="analyze-url"><a class="heading-link" href="#analyze-url">Exact URL <span class="new-label">New</span></a></h3>
         <div class="route-example"><code>POST /v1/analyze?url=…</code></div>
         <div class="runner" data-runner data-method="POST" data-stream data-path="/v1/analyze?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz">
-          <div class="request"><button class="run-button" type="button" aria-label="Run exact URL analysis example">Run</button><pre><code>curl -sN -X POST \
-  "https://api.atomdrift.org/v1/analyze?url=https%3A%2F%2Fregistry.npmjs.org%2Faxios%2F-%2Faxios-1.19.0.tgz"</code></pre></div>
+          <div class="request"><button class="run-button" type="button" aria-label="Run exact URL analysis example">Run</button><pre><code>curl -sN -X POST --get \
+  --data-urlencode "url=https://registry.npmjs.org/axios/-/axios-1.19.0.tgz" \
+  "https://api.atomdrift.org/v1/analyze"</code></pre></div>
           <div class="response"><div class="response-head"><span>Response</span><span class="response-state">Ready</span></div><pre class="run-output" aria-live="polite"></pre></div>
         </div>
         <p>Beamline fetches the exact URL and returns its SHA-256. The response includes a PURL when one is known.</p>
@@ -218,7 +226,7 @@ function docsHtml(authRequired) {
         <p><code>POST /v1/flush</code> drops every cached answer for one artifact. Name it with <code>?purl=</code>, <code>?url=</code>, or <code>?sha256=</code> — whichever you have. Nothing is re-analyzed; the next lookup or analyze starts from scratch.</p>
         <div class="route-example"><code>POST /v1/flush?purl=…</code></div>
         <div class="runner" data-runner data-method="POST" data-path="/v1/flush?purl=pkg%3Anpm%2Faxios%401.19.0">
-          <pre><code>curl -X POST \\
+          <pre><code>curl -X POST \
   "https://api.atomdrift.org/v1/flush?purl=pkg%3Anpm%2Faxios%401.19.0"</code></pre></div>
         <p>An artifact is filed under more than one key: one per <a href="#follow">follow policy</a>, one per response shape, and one per name that reaches it. A flush clears all of them, then follows the answers it found to the artifact's other names — its digest, its download URL, the PURL Scan normalized it to — and clears those too. The response reports what it reached.</p>
         <p>Flushing something that was never cached is not an error. It returns <code>200</code> with <code>keys_dropped: 0</code>.</p>
@@ -239,8 +247,10 @@ POST /v1/analyze?url=…&amp;false_positive_budget=250</code></pre>
         <table class="endpoint-table" aria-label="Follow policy values and defaults"><thead><tr><th>Value</th><th>Retrieves</th><th>Default for</th></tr></thead><tbody>
           <tr><td>none</td><td>Nothing else.</td><td>URL</td></tr><tr><td>dependencies</td><td>Dependencies in manifests and lockfiles.</td><td>—</td></tr><tr><td>references</td><td>Packages and URLs in install or download commands.</td><td>PURL, SHA-256</td></tr><tr><td>ci-actions</td><td>Third-party CI actions and their dependencies.</td><td>—</td></tr><tr><td>all</td><td>Everything above.</td><td>Upload</td></tr>
         </tbody></table>
-        <pre><code>curl -sN -X POST \
-  "https://api.atomdrift.org/v1/analyze?purl=pkg%3Anpm%2Faxios%401.19.0&amp;follow=all"</code></pre>
+        <pre><code>curl -sN -X POST --get \
+  --data-urlencode "purl=pkg:npm/axios@1.19.0" \
+  -d follow=all \
+  "https://api.atomdrift.org/v1/analyze"</code></pre>
         <p>Omit <code>?follow=</code> to use the default above.</p>
       </section>
 
