@@ -124,6 +124,10 @@ could answer comes back `unavailable` row by row; the rest are still answered.
 Over 50 packages or digests is a `413`. There is no batch limit on `/v1/analyze` because it
 takes one package.
 
+`HEAD` takes the same parameters and returns the same status and headers with
+no body. It is a full lookup: it reads the cache, may ask a worker, and counts
+against your quota like a `GET`.
+
 For an exact URL, use one `url` parameter. The response includes `url` exactly
 as sent; it may also include a resolved `purl` and includes `sha256` when the
 analysis fetched the artifact successfully.

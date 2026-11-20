@@ -2412,6 +2412,25 @@ test("v1: every worker down answers unavailable, not an error", async () => {
   assert.equal(res.headers.get("cache-control"), "no-store", "an outage was made cacheable");
 });
 
+// HEAD is the GET without its body: same status, same headers, nothing to read.
+// Every other route keeps refusing it.
+test("v1: HEAD on lookup answers like GET with no body", async () => {
+  const env = testEnv(DEAD, { SCAN_URL: DEAD });
+  const path = "http://beamline/v1/lookup?purl=pkg%3Anpm%2Fleft-pad%401.3.0";
+  const get = await handle(new Request(path), env, waitCtx().ctx);
+  const head = await handle(new Request(path, { method: "HEAD" }), env, waitCtx().ctx);
+  assert.equal(head.status, get.status);
+  assert.equal(head.headers.get("content-type"), get.headers.get("content-type"));
+  assert.equal(head.headers.get("cache-control"), get.headers.get("cache-control"));
+  assert.equal(await head.text(), "", "a HEAD response carried a body");
+
+  const flush = await handle(new Request("http://beamline/v1/flush?purl=x", { method: "HEAD" }), env, waitCtx().ctx);
+  assert.equal(flush.status, 405);
+  const put = await handle(new Request(path, { method: "PUT" }), env, waitCtx().ctx);
+  assert.equal(put.status, 405);
+  assert.equal(put.headers.get("allow"), "GET, HEAD");
+});
+
 // The answer scan gives is the answer the caller gets: beamline adds delivery
 // headers and nothing else. Anything it rewrote here would be a second opinion
 // about a verdict, from the one service that did not compute it.

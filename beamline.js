@@ -817,8 +817,13 @@ async function dispatch(request, env, host, caller) {
       return await handleV1Analyze(request, env, ctx, url);
     }
     if (url.pathname === "/v1/lookup") {
-      if (request.method !== "GET") return methodNotAllowed("GET");
-      return await handleV1Lookup(env, ctx, url);
+      // HEAD is the same lookup with the body left off: a caller probing
+      // whether an answer exists reads the status and headers it would get.
+      if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
+      const response = await handleV1Lookup(env, ctx, url);
+      if (request.method !== "HEAD") return response;
+      await response.body?.cancel();
+      return new Response(null, response);
     }
     if (url.pathname === "/v1/flush") {
       if (request.method !== "POST") return methodNotAllowed("POST");
