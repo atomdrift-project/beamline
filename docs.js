@@ -9,26 +9,30 @@ function docsHtml(authRequired) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Beamline is an API for finding 0-day malware in the software supply chain, with a false-positive policy you control.">
-  <title>Beamline API · software supply-chain malware detection · isotope¹³</title>
+  <title>Beamline API · software supply-chain malware detection · atomdrift</title>
   <style>
     @font-face { font-family: Oxanium; src: url("https://atomdrift.org/assets/fonts/Oxanium-Bold.ttf") format("truetype"); font-display: swap; font-weight: 700; }
-    :root { --ink:#0d0008; --mid:#4a2040; --light:#6e6e73; --paper:#fff; --mist:#fdf5fc; --pink:#ff00cc; --pink-dark:#9f005f; --line:rgba(255,0,204,.22); --code:#f2f2f7; --code-ink:#1d1d1f; --code-muted:#6e6e73; --max:1180px; }
+    :root { --ink:#0a0a0a; --mid:#404040; --light:#6b7280; --paper:#fff; --mist:#f5f5f5; --line:#e8e8e8; --blue:#2563eb; --toxic:#d0ff00; --toxic-muted:#9abe25; --toxic-dark:#4a6b0f; --toxic-dim:rgba(208,255,0,.14); --code:#fafaf9; --code-line:#e8e8e8; --code-ink:#0a0a0a; --code-muted:#6b7280; --max:1180px; }
     * { box-sizing:border-box; }
     html { scroll-behavior:smooth; }
     body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.65 Inter,ui-sans-serif,system-ui,-apple-system,sans-serif; -webkit-font-smoothing:antialiased; }
-    a { color:inherit; }
-    a:focus-visible { outline:3px solid var(--pink); outline-offset:3px; }
-    .topbar { align-items:center; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; margin:0 auto; max-width:var(--max); padding:22px 40px; }
-    .brand { font-family:Oxanium,ui-sans-serif,sans-serif; font-size:21px; letter-spacing:-.7px; }
-    .brand sup { color:var(--pink); font-size:11px; margin-left:1px; }
+    a { color:var(--blue); text-decoration-thickness:1px; text-underline-offset:2px; }
+    a:hover { text-decoration-thickness:2px; }
+    a:focus-visible { outline:2px solid var(--blue); outline-offset:2px; border-radius:2px; }
+    .topbar { align-items:center; display:flex; justify-content:space-between; margin:0 auto; max-width:var(--max); padding:22px 40px; }
+    .topbar .brand, .topbar .brand:hover { align-items:center; color:var(--ink); display:flex; font-family:Oxanium,ui-sans-serif,sans-serif; font-size:22px; gap:10px; letter-spacing:-.5px; line-height:1; text-decoration:none; }
+    .topbar .brand svg { flex-shrink:0; height:34px; width:34px; }
+    .brand-accent { color:var(--toxic-muted); }
+    .brand-product { color:var(--light); }
+    .toxic-stripe { background:linear-gradient(90deg,var(--toxic) 0%,var(--toxic-muted) 50%,transparent 100%); height:4px; }
     .topbar a { color:var(--mid); font-size:13px; text-decoration:none; }
-    .topbar a:hover { color:var(--pink-dark); }
+    .topbar a:hover { color:var(--blue); }
     .shell { display:grid; gap:clamp(36px,4vw,52px); grid-template-columns:136px minmax(0,1fr); margin:0 auto; max-width:var(--max); padding:70px 40px 110px; }
     .toc { position:sticky; top:28px; align-self:start; }
-    .toc-label,.eyebrow { color:var(--pink-dark); font-size:10px; font-weight:700; letter-spacing:1.8px; text-transform:uppercase; }
+    .toc-label,.eyebrow { color:var(--toxic-dark); font-size:10px; font-weight:700; letter-spacing:1.8px; text-transform:uppercase; }
     .toc-label { margin-bottom:15px; }
     .toc a { border-left:1px solid var(--line); color:var(--mid); display:block; font-size:13px; padding:5px 0 5px 14px; text-decoration:none; }
-    .toc a:hover { border-color:var(--pink); color:var(--pink-dark); }
+    .toc a:hover { border-color:var(--toxic-muted); color:var(--ink); }
     .content { min-width:0; }
     h1,h2,h3 { font-family:Oxanium,ui-sans-serif,sans-serif; font-weight:700; letter-spacing:-1.5px; line-height:1.1; }
     h1 { font-size:clamp(38px,6vw,62px); margin:14px 0 18px; }
@@ -36,9 +40,9 @@ function docsHtml(authRequired) {
     h3 { font-size:19px; letter-spacing:-.7px; margin:36px 0 10px; }
     section[id],h3[id] { scroll-margin-top:24px; }
     .heading-link { color:inherit; display:inline-block; text-decoration:none; }
-    .heading-link::after { color:var(--pink-dark); content:"#"; font:600 .55em/1 ui-monospace,SFMono-Regular,Menlo,monospace; margin-left:.45em; opacity:0; }
+    .heading-link::after { color:var(--toxic-dark); content:"#"; font:600 .55em/1 ui-monospace,SFMono-Regular,Menlo,monospace; margin-left:.45em; opacity:0; }
     .heading-link:hover::after,.heading-link:focus-visible::after { opacity:1; }
-    .new-label { background:var(--mist); border:1px solid var(--pink); border-radius:999px; color:var(--pink-dark); display:inline-block; font:700 10px/1 Inter,ui-sans-serif,system-ui,sans-serif; letter-spacing:.8px; margin-left:8px; padding:4px 7px 3px; text-transform:uppercase; vertical-align:.25em; }
+    .new-label { background:var(--toxic-dim); border:1px solid var(--toxic-muted); border-radius:999px; color:var(--toxic-dark); display:inline-block; font:700 10px/1 Inter,ui-sans-serif,system-ui,sans-serif; letter-spacing:.8px; margin-left:8px; padding:4px 7px 3px; text-transform:uppercase; vertical-align:.25em; }
     p { color:var(--mid); margin:0 0 18px; max-width:none; }
     .lead { font-size:19px; line-height:1.6; max-width:820px; }
     .eyebrow { margin-bottom:8px; }
@@ -46,45 +50,46 @@ function docsHtml(authRequired) {
     .fact { background:var(--mist); border:1px solid var(--line); color:var(--mid); font-size:12px; overflow-wrap:anywhere; padding:7px 10px; }
     .fact strong { color:var(--ink); font-weight:600; }
     .hero-points { display:grid; gap:24px; grid-template-columns:repeat(3,minmax(0,1fr)); margin:34px 0 42px; }
-    .hero-point { border-top:2px solid var(--pink); padding-top:11px; }
+    .hero-point { border-top:2px solid var(--toxic-muted); padding-top:11px; }
     .hero-point-title { color:var(--ink); display:block; font-size:14px; font-weight:700; }
     .hero-point p { font-size:14px; line-height:1.5; margin:6px 0 0; }
     .endpoint-table { border-collapse:collapse; margin:22px 0 0; width:100%; }
     .endpoint-table th,.endpoint-table td { border-bottom:1px solid var(--line); padding:12px 8px 12px 0; text-align:left; vertical-align:top; }
     .endpoint-table th { color:var(--light); font-size:11px; letter-spacing:1px; text-transform:uppercase; }
-    .endpoint-table td:first-child { color:var(--pink-dark); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; white-space:nowrap; }
+    .endpoint-table td:first-child { color:var(--toxic-dark); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; white-space:nowrap; }
     .endpoint-table td:last-child { color:var(--mid); font-size:14px; }
     .endpoint-table + p { margin-top:18px; }
     .route-example { color:var(--code-muted); font-size:12px; margin:-2px 0 10px; overflow-wrap:anywhere; }
     .route-example code { color:var(--code-ink); white-space:normal; }
     code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
-    code { color:var(--pink-dark); font-size:.92em; }
-    pre { background:var(--code); border:1px solid #d1d1d6; border-left:3px solid var(--pink); border-radius:7px; color:var(--code-ink); font-size:12px; line-height:1.65; margin:18px 0 24px; overflow-x:auto; padding:18px 20px; tab-size:2; }
+    code { color:var(--ink); font-size:.92em; }
+    :not(pre) > code { background:var(--mist); border-radius:3px; padding:1px 5px; }
+    pre { background:var(--code); border:1px solid var(--code-line); border-left:3px solid var(--toxic-muted); border-radius:7px; color:var(--code-ink); font-size:12px; line-height:1.65; margin:18px 0 24px; overflow-x:auto; padding:18px 20px; tab-size:2; }
     pre code { color:inherit; }
     .runner { margin:18px 0 26px; }
-    .request { align-items:start; background:var(--code); border:1px solid #d1d1d6; border-left:3px solid var(--pink); border-radius:8px; display:grid; grid-template-columns:minmax(0,1fr) auto; overflow:hidden; }
+    .request { align-items:start; background:var(--code); border:1px solid var(--code-line); border-left:3px solid var(--toxic-muted); border-radius:8px; display:grid; grid-template-columns:minmax(0,1fr) auto; overflow:hidden; }
     .request pre { border:0; border-radius:0; grid-column:1; grid-row:1; margin:0; min-width:0; overflow-wrap:anywhere; padding:18px 8px 18px 20px; white-space:pre-wrap; }
-    .run-button { background:var(--pink-dark); border:0; border-radius:6px; color:#fff; cursor:pointer; font:600 13px/1.2 Inter,ui-sans-serif,system-ui,sans-serif; grid-column:2; grid-row:1; margin:9px; min-height:44px; min-width:64px; padding:10px 16px; }
-    .run-button:hover { background:#760046; }
+    .run-button { background:var(--toxic); border:1px solid var(--toxic); border-radius:6px; color:var(--ink); cursor:pointer; font:600 13px/1.2 Inter,ui-sans-serif,system-ui,sans-serif; grid-column:2; grid-row:1; margin:9px; min-height:44px; min-width:64px; padding:10px 16px; }
+    .run-button:hover { background:var(--toxic-muted); border-color:var(--toxic-muted); }
     .run-button:disabled { cursor:wait; opacity:.55; }
-    .run-button:focus-visible { outline:3px solid var(--pink); outline-offset:2px; }
-    .response { background:#fff; border:1px solid #d1d1d6; border-radius:8px; display:none; margin-top:10px; overflow:hidden; }
+    .run-button:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
+    .response { background:#fff; border:1px solid var(--code-line); border-radius:8px; display:none; margin-top:10px; overflow:hidden; }
     .runner.has-response .response { display:block; }
     .response-head { align-items:center; color:var(--code-muted); display:flex; font-size:11px; font-weight:600; justify-content:space-between; letter-spacing:.8px; padding:10px 16px 0; text-transform:uppercase; }
-    .response-state { color:var(--pink-dark); font-weight:500; letter-spacing:0; text-transform:none; }
+    .response-state { color:var(--toxic-dark); font-weight:500; letter-spacing:0; text-transform:none; }
     .run-output { background:#fff; border:0; color:var(--code-ink); display:block; font-size:12px; margin:0; max-height:300px; overflow:auto; padding:12px 16px 16px; white-space:pre-wrap; }
     .run-output[data-state="error"] { border-left:3px solid #b00020; }
     .file-picker { align-items:center; display:flex; flex-wrap:wrap; gap:10px; grid-column:1 / -1; padding:12px 16px; }
     .file-picker input { color:var(--code-ink); font-size:13px; max-width:100%; }
     .file-picker label { color:var(--code-muted); font-size:12px; }
-    .note { background:var(--mist); border-left:3px solid var(--pink); color:var(--mid); margin:20px 0; padding:14px 17px; }
+    .note { background:var(--toxic-dim); border-left:3px solid var(--toxic-muted); color:var(--mid); margin:20px 0; padding:14px 17px; }
     .note strong { color:var(--ink); }
     .steps { counter-reset:step; list-style:none; margin:18px 0 22px; padding:0; }
     .steps li { counter-increment:step; margin:12px 0; padding-left:32px; position:relative; }
-    .steps li::before { color:var(--pink-dark); content:counter(step); font-family:Oxanium,sans-serif; left:0; position:absolute; top:1px; }
+    .steps li::before { color:var(--toxic-dark); content:counter(step); font-family:Oxanium,sans-serif; left:0; position:absolute; top:1px; }
     .meanings { margin:0 0 18px; padding-left:22px; }
     .meanings li { color:var(--mid); margin:8px 0; }
-    .meanings li::marker { color:var(--pink-dark); }
+    .meanings li::marker { color:var(--toxic-dark); }
     .muted { color:var(--light); font-size:14px; }
     .footer { border-top:1px solid var(--line); margin-top:78px; padding-top:24px; }
     @media (max-width:800px) {
@@ -109,9 +114,21 @@ function docsHtml(authRequired) {
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">isotope<sup>13</sup> / beamline</div>
+    <a class="brand" href="https://atomdrift.org/">
+      <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+        <circle cx="50" cy="50" r="6" fill="#3b82f6"/>
+        <ellipse cx="50" cy="50" rx="38" ry="14" fill="none" stroke="#0a0a0a" stroke-width="1.5" transform="rotate(-30 50 50)"/>
+        <ellipse cx="50" cy="50" rx="38" ry="14" fill="none" stroke="#0a0a0a" stroke-width="1.5" transform="rotate(30 50 50)"/>
+        <ellipse cx="50" cy="50" rx="38" ry="14" fill="none" stroke="#0a0a0a" stroke-width="1.5" transform="rotate(90 50 50)"/>
+        <circle cx="18" cy="28" r="3.5" fill="#d0ff00"/>
+        <circle cx="82" cy="28" r="3.5" fill="#d0ff00"/>
+        <circle cx="50" cy="88" r="3.5" fill="#d0ff00"/>
+      </svg>
+      <span>atom<span class="brand-accent">drift</span> <span class="brand-product">/ beamline</span></span>
+    </a>
     <a href="https://lab.atomdrift.org/">Browse sample data →</a>
   </header>
+  <div class="toxic-stripe"></div>
   <div class="shell">
     <aside class="toc" aria-label="Contents">
       <div class="toc-label">On this page</div>

@@ -143,7 +143,10 @@ test("GET / serves the public API documentation", async () => {
   assert.match(body, /data-path="\/v1\/lookup\?url=/);
   assert.match(body, /data-path="\/v1\/lookup\?sha256=/);
   assert.match(body, /application\/x-ndjson/);
-  assert.match(body, /--code:#f2f2f7/);
+  assert.match(body, /--code:#fafaf9/);
+  assert.match(body, /<title>[^<]*· atomdrift<\/title>/);
+  assert.match(body, /atom<span class="brand-accent">drift<\/span>/);
+  assert.doesNotMatch(body, /isotope<sup>13|isotope¹³/);
   assert.match(body, /grid-template-columns:136px minmax\(0,1fr\)/);
   assert.match(body, /p \{[^}]*max-width:none/);
   assert.doesNotMatch(body, /healthz/);
