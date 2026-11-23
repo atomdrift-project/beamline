@@ -5679,27 +5679,35 @@ function quotaStorage() {
 
 const takeQuota = async (quota, limit) => (await quota.fetch(new Request(`https://quota/?limit=${limit}`))).json();
 
-test("quota: an hour serves exactly its limit, and refusals are not counted", async () => {
+test("quota: a day serves exactly its limit, and refusals are not counted", async () => {
   const storage = quotaStorage();
   const quota = new Quota({ storage });
   for (let i = 0; i < 3; i++) assert.equal((await takeQuota(quota, 3)).allowed, true);
   for (let i = 0; i < 2; i++) assert.equal((await takeQuota(quota, 3)).allowed, false);
-  assert.equal(storage.rows.get("hour").count, 3);
+  assert.equal(storage.rows.get("day").count, 3);
   const { reset } = await takeQuota(quota, 3);
-  assert.equal(reset % 3_600_000, 0, "the reset is the top of the hour");
-  assert.ok(reset > Date.now() && reset - Date.now() <= 3_600_000);
-  assert.equal(storage.alarm, reset, "the row is collected when its hour ends");
+  assert.equal(reset % 86_400_000, 0, "the reset is UTC midnight");
+  assert.ok(reset > Date.now() && reset - Date.now() <= 86_400_000);
+  assert.equal(storage.alarm, reset, "the row is collected when its day ends");
 });
 
-test("quota: a new hour starts from zero, and the alarm clears only a finished one", async () => {
+test("quota: a new day starts from zero, and the alarm clears only a finished one", async () => {
   const storage = quotaStorage();
   const quota = new Quota({ storage });
-  const hour = Math.floor(Date.now() / 3_600_000);
-  storage.rows.set("hour", { hour: hour - 1, count: 99 });
-  assert.equal((await takeQuota(quota, 1)).allowed, true, "last hour's spend carried over");
+  const day = Math.floor(Date.now() / 86_400_000);
+  storage.rows.set("day", { day: day - 1, count: 99 });
+  assert.equal((await takeQuota(quota, 1)).allowed, true, "yesterday's spend carried over");
   await quota.alarm();
-  assert.equal(storage.rows.get("hour").count, 1, "the alarm deleted the hour in progress");
-  storage.rows.set("hour", { hour: hour - 1, count: 1 });
+  assert.equal(storage.rows.get("day").count, 1, "the alarm deleted the day in progress");
+  storage.rows.set("day", { day: day - 1, count: 1 });
+  await quota.alarm();
+  assert.equal(storage.rows.size, 0);
+});
+
+test("quota: the alarm of an object last counted hourly clears it", async () => {
+  const storage = quotaStorage();
+  const quota = new Quota({ storage });
+  storage.rows.set("hour", { hour: Math.floor(Date.now() / 3_600_000) - 1, count: 7 });
   await quota.alarm();
   assert.equal(storage.rows.size, 0);
 });
@@ -5764,7 +5772,7 @@ test("quota: each tier is counted per org at its own limit, and told how to upgr
   }
   assert.deepEqual(
     Object.fromEntries(Object.entries(_test.TIER_QUOTAS).map(([k, v]) => [k, v.limit])),
-    { free: 2_048, supporter: 4_096, business: 10_000, poc: 10_000, oem: 100_000 },
+    { free: 1_024, supporter: 2_048, superfan: 4_096, business: 20_000, poc: 20_000, enhanced: 100_000, oem: 1_000_000 },
   );
 });
 
@@ -5774,7 +5782,7 @@ test("quota: anonymous callers are counted by address and told to get a token", 
   const res = await handle(quotaRequest({ "cf-connecting-ip": "2001:db8:1:2::7" }), env, {});
   assert.equal(res.status, 429);
   assert.deepEqual(QUOTA.asked, [{ name: "ip:2001:db8:1:2::/64", limit: _test.ANONYMOUS_QUOTA }]);
-  assert.equal(_test.ANONYMOUS_QUOTA, 2_500);
+  assert.equal(_test.ANONYMOUS_QUOTA, 512);
   assert.equal(
     (await res.json()).error.message,
     "anonymous quota exceeded, visit https://dash.isotope13.io/ for a token",

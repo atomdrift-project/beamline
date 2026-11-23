@@ -426,14 +426,14 @@ async function fingerprint(token) {
   return Array.from(new Uint8Array(digest, 0, 8), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-// Hourly request quotas: per org for a customer token, per address for
+// Daily request quotas: per org for a customer token, per address for
 // everyone else.
 //
 // Counted in the Quota Durable Object, one per subject, because nothing else
-// on the platform counts globally over an hour: the rate-limit binding counts
-// per colo, over ten or sixty seconds. The window is the clock hour, which lets
-// a caller spend up to twice its quota across an hour boundary; that is the
-// price of a reset time anyone can state.
+// on the platform counts globally over a day: the rate-limit binding counts
+// per colo, over ten or sixty seconds. The window is the UTC day, which lets
+// a caller spend up to twice its quota across midnight; that is the price of
+// a reset time anyone can state.
 //
 // Our own tokens are not counted: the precache pass and the stress harness are
 // load we chose. A token that is neither ours nor a customer's is counted
@@ -443,21 +443,28 @@ async function fingerprint(token) {
 // binding, an object that throws, one that has not replied within
 // QUOTA_WAIT_MS — the request is served and the failure logged. An outage of
 // the counter must not become an outage of the API.
-const QUOTA_HOUR_MS = 3_600_000;
+const QUOTA_DAY_MS = 86_400_000;
 const QUOTA_WAIT_MS = 1_000;
 const QUOTA_DASH = "https://dash.isotope13.io/";
 const QUOTA_SUPPORT = "support@isotope13.ai";
-const ANONYMOUS_QUOTA = 2_500;
+// Half of Community, so a free token is always worth getting. Public uploads
+// are 5 a day without a token, on paper only: nothing counts uploads yet.
+const ANONYMOUS_QUOTA = 512;
 // Keyed by the tier dash writes into `tok:`, named as dash shows it, and the
-// same numbers dash draws usage against: change one, change both. `poc` is the
-// exception: it is not sold, and only the hand-written legacy rows below carry
-// it. A tier beamline does not know is held to the floor rather than refused.
+// same numbers dash draws usage against: change one, change both. The keys
+// outlive the names — `business` is Basic, `oem` is Critical — because
+// renaming one would rewrite every `tok:` row. `poc` is the exception: it is
+// not sold, only hand-written legacy rows carry it, and it keeps Basic's quota
+// as it always kept Business's. A tier beamline does not know is held to the
+// floor rather than refused.
 const TIER_QUOTAS = {
-  free: { name: "community", limit: 2_048 },
-  supporter: { name: "supporter", limit: 4_096 },
-  business: { name: "business", limit: 10_000 },
-  poc: { name: "poc", limit: 10_000 },
-  oem: { name: "critical", limit: 100_000 },
+  free: { name: "community", limit: 1_024 },
+  supporter: { name: "supporter", limit: 2_048 },
+  superfan: { name: "superfan", limit: 4_096 },
+  business: { name: "basic", limit: 20_000 },
+  poc: { name: "poc", limit: 20_000 },
+  enhanced: { name: "enhanced", limit: 100_000 },
+  oem: { name: "critical", limit: 1_000_000 },
 };
 
 /**
@@ -465,7 +472,7 @@ const TIER_QUOTAS = {
  * @param {Record<string, unknown>} env
  * @param {Caller} caller
  * @param {string} rid
- * @returns {Promise<Response|null>} a 429 once the caller's hour is spent, else null
+ * @returns {Promise<Response|null>} a 429 once the caller's day is spent, else null
  */
 async function enforceQuota(request, env, caller, rid) {
   const ns = env.QUOTA;
@@ -539,13 +546,13 @@ function addressSubject(ip) {
   return `${groups.slice(0, 4).map((group) => parseInt(group, 16).toString(16)).join(":")}::/64`;
 }
 
-// One subject's hour: the Durable Object behind enforceQuota.
+// One subject's day: the Durable Object behind enforceQuota.
 //
 // A plain class answering fetch, not an RPC DurableObject, because that needs
 // `cloudflare:workers` and neither `node local.js` nor the tests can import
 // it. The count is stored rather than held in memory, so an object evicted
-// mid-hour does not hand its caller a fresh quota; the alarm deletes it once
-// the hour is over, so an address seen once does not leave a row forever.
+// mid-day does not hand its caller a fresh quota; the alarm deletes it once
+// the day is over, so an address seen once does not leave a row forever.
 // Storage reads and writes hold the input gate, so two requests cannot both
 // read the same count.
 export class Quota {
@@ -555,25 +562,27 @@ export class Quota {
   }
 
   /**
-   * @param {Request} request - `?limit=` is the subject's hourly quota
+   * @param {Request} request - `?limit=` is the subject's daily quota
    * @returns {Promise<Response>} `{allowed, reset}`, reset in epoch ms
    */
   async fetch(request) {
     const limit = Number(new URL(request.url).searchParams.get("limit"));
-    const hour = Math.floor(Date.now() / QUOTA_HOUR_MS);
-    const reset = (hour + 1) * QUOTA_HOUR_MS;
-    const row = await this.storage.get("hour");
-    const used = row?.hour === hour ? row.count : 0;
+    const day = Math.floor(Date.now() / QUOTA_DAY_MS);
+    const reset = (day + 1) * QUOTA_DAY_MS;
+    const row = await this.storage.get("day");
+    const used = row?.day === day ? row.count : 0;
     // A refused request is not counted: the quota is what was served.
     if (used >= limit) return Response.json({ allowed: false, reset });
-    await this.storage.put("hour", { hour, count: used + 1 });
+    await this.storage.put("day", { day, count: used + 1 });
     if (used === 0) await this.storage.setAlarm(reset);
     return Response.json({ allowed: true, reset });
   }
 
+  // No row at all is an object last written when quotas were hourly, under
+  // another key, whose alarm is the only one it will ever get.
   async alarm() {
-    const row = await this.storage.get("hour");
-    if (row && row.hour < Math.floor(Date.now() / QUOTA_HOUR_MS)) await this.storage.deleteAll();
+    const row = await this.storage.get("day");
+    if (!row || row.day < Math.floor(Date.now() / QUOTA_DAY_MS)) await this.storage.deleteAll();
   }
 }
 

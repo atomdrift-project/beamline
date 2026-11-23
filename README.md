@@ -107,11 +107,12 @@ The lookup is cached at the edge for 60 seconds, so that is the revocation
 latency: a token deleted in the dashboard keeps working in whichever colos
 already hold it, for up to a minute.
 
-The tier is also the hourly quota, enforced by the `Quota` Durable Object
-bound as `QUOTA` in `wrangler.toml`: 2,500 requests without a token, then
-2,048 / 4,096 / 10,000 / 100,000 for free, supporter, business and oem, and
-10,000 for `poc`, which dash does not sell and only hand-written legacy tokens
-carry.
+The tier is also the daily quota, counted per UTC day by the `Quota` Durable
+Object bound as `QUOTA` in `wrangler.toml`: 512 requests without a token,
+then 1,024 / 2,048 / 4,096 / 20,000 / 100,000 / 1,000,000 for free
+(Community), supporter, superfan, business (Basic), enhanced and oem
+(Critical), and 20,000 for `poc`, which dash does not sell and only
+hand-written legacy tokens carry.
 Customers are counted per org, everyone else per address, and our own
 `BEAMLINE_TOKEN` not at all. The limiter fails open: if the object cannot
 answer within a second, the request is served and `quota_unavailable` logged.

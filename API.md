@@ -33,21 +33,23 @@ credentials for its backends.
 
 ## Quotas
 
-Requests are counted per clock hour: per org for a customer token, and per
+Requests are counted per UTC day: per org for a customer token, and per
 address otherwise (an IPv6 caller by its /64). Documentation and health routes
 are not counted, and neither is a refused request.
 
-| caller | requests per hour |
+| caller | requests per day |
 | --- | --- |
-| No token | 2,500 |
-| Community | 2,048 |
-| Supporter | 4,096 |
-| Business | 10,000 |
-| POC | 10,000 |
-| Critical | 100,000 |
+| No token | 512 |
+| Community | 1,024 |
+| Supporter | 2,048 |
+| Superfan | 4,096 |
+| Basic | 20,000 |
+| POC | 20,000 |
+| Enhanced | 100,000 |
+| Critical | 1,000,000 |
 
 Past it, every request is a `429` with code `quota_exceeded` and a
-`Retry-After` naming the seconds until the hour turns. Get a token, or a larger
+`Retry-After` naming the seconds until UTC midnight. Get a token, or a larger
 quota, at https://dash.isotope13.io/; past Critical, write to
 support@isotope13.ai.
 
@@ -515,7 +517,7 @@ without a package-level assessment.
 | 404 | No such route. |
 | 405 | Right route, wrong method. `Allow` names the one that works. |
 | 413 | Too many packages. |
-| 429 | `quota_exceeded`: your hourly quota is spent. Wait out `Retry-After`. Otherwise at capacity: retry; it is jittered on our side. |
+| 429 | `quota_exceeded`: your daily quota is spent. Wait out `Retry-After`. Otherwise at capacity: retry; it is jittered on our side. |
 
 There is no `503` for a package we could not reach a worker for. That is a
 `200` carrying `unavailable`.
