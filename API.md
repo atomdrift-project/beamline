@@ -16,20 +16,27 @@ POST /v1/analyze?sha256={64hex}&refresh=1     reconcile Hopper; analyze if stale
 POST /v1/analyze                              analysis slot; streams. The
                                               artifact may be the raw body
 POST /v1/flush?purl=|url=|sha256={64hex}      forget every cached answer for
-                                              one artifact
+                                              one artifact; token required
 
 GET  /healthz    (also /_/health)             liveness; no token required
-GET  /_/routes                                the router's own reasoning
+GET  /_/routes                                the router's own reasoning;
+                                              token required
 ```
 
 Only `/v1/analyze` costs anything, and only when the answer is not already
 known.
 
 Client authentication is optional. If `BEAMLINE_TOKEN` is set, API routes
-require `Authorization: Bearer …`; if it is absent, no client token is checked.
-The documentation and health routes are public either way. A client token
-authenticates you to us and travels no further; beamline holds separate
-credentials for its backends.
+require `Authorization: Bearer …`; if it is absent, lookups and analyses take no
+token. The documentation and health routes are public either way.
+
+Operational requests take a token either way: `/v1/flush`, `/_/routes`, and
+any request carrying `X-Beamline-Pin`. Any token beamline recognizes will do —
+a customer token from https://dash.isotope13.io/ or one in `BEAMLINE_TOKEN`.
+Without one they are a `401`, refused before the quota counts them.
+
+A client token authenticates you to us and travels no further; beamline holds
+separate credentials for its backends.
 
 ## Quotas
 
@@ -281,10 +288,12 @@ held.
 ## POST /v1/flush
 
 Drops every cached answer for one artifact. Name it with `?purl=`, `?url=`, or
-`?sha256=` — exactly one, the same locators `/v1/lookup` takes.
+`?sha256=` — exactly one, the same locators `/v1/lookup` takes. It needs a
+bearer token even on a deployment whose other routes are open.
 
 ```
-$ curl -X POST 'https://api.atomdrift.org/v1/flush?purl=pypi/ddtrace@3.18.1'
+$ curl -X POST -H "Authorization: Bearer $TOKEN" \
+    'https://api.atomdrift.org/v1/flush?purl=pypi/ddtrace@3.18.1'
 {"status":"flushed",
  "caches":{"edge":{"dropped":4},
            "kv":{"dropped":4},
@@ -513,7 +522,7 @@ without a package-level assessment.
 | --- | --- |
 | 200 | An assessment, or a list of them. Includes `unanalyzed` and `unavailable`. |
 | 400 | Your request. See `code`. |
-| 401 | Bad or missing bearer token when `BEAMLINE_TOKEN` is configured. |
+| 401 | Bad or missing bearer token: on any route when `BEAMLINE_TOKEN` is configured, and on `/v1/flush`, `/_/routes`, or with `X-Beamline-Pin` always. |
 | 404 | No such route. |
 | 405 | Right route, wrong method. `Allow` names the one that works. |
 | 413 | Too many packages. |

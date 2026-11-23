@@ -2424,7 +2424,7 @@ test("v1: HEAD on lookup answers like GET with no body", async () => {
   assert.equal(head.headers.get("cache-control"), get.headers.get("cache-control"));
   assert.equal(await head.text(), "", "a HEAD response carried a body");
 
-  const flush = await handle(new Request("http://beamline/v1/flush?purl=x", { method: "HEAD" }), env, waitCtx().ctx);
+  const flush = await handle(withToken("/v1/flush?purl=x", { method: "HEAD" }), env, waitCtx().ctx);
   assert.equal(flush.status, 405);
   const put = await handle(new Request(path, { method: "PUT" }), env, waitCtx().ctx);
   assert.equal(put.status, 405);
@@ -3025,8 +3025,21 @@ function testEnv(url, extra = {}) {
     SCAN_RACE_DELAY_MS: extra.SCAN_RACE_DELAY_MS,
     SCAN_STREAM_IDLE_MS: extra.SCAN_STREAM_IDLE_MS,
     SCAN_STREAM_RESUMES: extra.SCAN_STREAM_RESUMES,
+    // Recognizes KNOWN_TOKEN as a customer and nothing else, so an anonymous
+    // request is still anonymous and the API is still open.
+    TOKENS_KV: tokenKV({ [`tok:${KNOWN_TOKEN}`]: JSON.stringify({ oid: "testorg", tier: "free" }) }),
     cache: extra.cache ?? _test.memoryCache(),
   };
+}
+
+// Operational requests — /v1/flush, /_/routes, X-Beamline-Pin — are refused
+// without a token the deployment recognizes, open API or not. A customer token
+// on an open deployment is how production is reached, so that is what a test
+// of an operational route sends.
+const KNOWN_TOKEN = "i13_xenon131_q8m2v7c4x1z9n5b3k6j0h2g4fd";
+
+function withToken(path, init = {}) {
+  return new Request(`http://beamline${path}`, { ...init, headers: { ...init.headers, authorization: `Bearer ${KNOWN_TOKEN}` } });
 }
 
 function noopCtx() {
@@ -3297,7 +3310,7 @@ test("/_/routes dry-runs the real ranking, per size bucket", async () => {
   const steady = await mockBackend({ stats: statsFor({ ms: 3000 }) });
   const env = testEnv(hopper.url, { SCAN_URL: `${specialist.url},${steady.url}` });
   try {
-    const res = await handle(new Request("http://beamline/_/routes"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes"), env, waitCtx().ctx);
     assert.equal(res.status, 200);
     const body = await res.json();
 
@@ -3324,7 +3337,7 @@ test("/_/routes says why a worker was excluded", async () => {
   const serving = await mockBackend({ stats: statsFor({ ms: 3000 }) });
   const env = testEnv(hopper.url, { SCAN_URL: `${loading.url},${serving.url}` });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?size=1mb"), env, waitCtx().ctx);
     const body = await res.json();
     assert.equal(body.routes.length, 1, "?size= answers for one bucket");
     assert.equal(body.routes[0].class, "le_1mb");
@@ -3345,17 +3358,56 @@ test("/_/routes rejects a size it cannot parse", async () => {
   const scan = await mockBackend({ stats: statsFor({}) });
   const env = testEnv(hopper.url, { SCAN_URL: scan.url });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?size=huge"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?size=huge"), env, waitCtx().ctx);
     assert.equal(res.status, 400);
   } finally {
     await Promise.all([hopper.close(), scan.close()]);
   }
 });
 
-test("/_/routes is behind the token gate", async () => {
-  const env = { ...testEnv("http://unused"), BEAMLINE_TOKEN: "secret" };
-  const res = await handle(new Request("http://beamline/_/routes"), env, waitCtx().ctx);
-  assert.equal(res.status, 401, "the route names every worker and its load");
+// Production runs without BEAMLINE_TOKEN. Before operational requests had a
+// gate of their own, /_/routes told anyone every worker's hostname, its load
+// and the corpus behind it, and /v1/flush dropped verdicts in every data
+// center for whoever asked.
+test("operational requests need a recognized token, even on an open API", async () => {
+  const SHA = "f".repeat(64);
+  const QUOTA = quotaNS();
+  const env = { ...testEnv(DEAD, { SCAN_URL: DEAD }), QUOTA };
+  const stored = new Request(`http://beamline${_test.v1CachePath(SHA, [], "references")}`);
+  await env.cache.put(stored, new Response("{}", { headers: { "content-type": "application/json", "cache-control": "public, max-age=3600" } }));
+  const lookup = "http://beamline/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0";
+  const ip = { "cf-connecting-ip": "203.0.113.7" };
+
+  const refused = [
+    ["flush", new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST", headers: ip })],
+    ["routes", new Request("http://beamline/_/routes", { headers: ip })],
+    ["pin", new Request(lookup, { headers: { ...ip, "x-beamline-pin": "scan-a.example" } })],
+    ["unknown customer token", new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST", headers: { ...ip, authorization: `Bearer i13_xenon131_${"a".repeat(26)}` } })],
+    ["not a token", new Request("http://beamline/_/routes", { headers: { ...ip, authorization: "Bearer nonsense" } })],
+  ];
+  for (const [what, request] of refused) {
+    const res = await handle(request, env, noopCtx());
+    assert.equal(res.status, 401, what);
+    assert.equal((await res.json()).error.code, "unauthorized", what);
+  }
+  assert.ok(await env.cache.match(stored), "a refused flush dropped the verdict anyway");
+  assert.equal(QUOTA.asked.length, 0, "a refused request was counted against the quota");
+
+  // Lookups stay open.
+  assert.notEqual((await handle(new Request(lookup, { headers: ip }), env, noopCtx())).status, 401);
+
+  // Any recognized token is enough: a customer's on an open deployment…
+  const flushed = await handle(withToken(`/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
+  assert.equal(flushed.status, 200);
+  assert.equal(await env.cache.match(stored), null);
+  const pinned = await handle(withToken("/v1/lookup?purl=pkg%3Anpm%2Fx%401.0.0", { headers: { "x-beamline-pin": "scan-a.example" } }), env, noopCtx());
+  assert.equal((await pinned.json()).error.code, "unknown_pin", "an admitted pin is checked, not refused");
+
+  // …and one of ours on a closed one, which still refuses everyone else.
+  const closed = { ...env, BEAMLINE_TOKEN: "ops-secret" };
+  assert.equal((await handle(new Request("http://beamline/_/routes"), closed, noopCtx())).status, 401);
+  const ours = new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST", headers: { authorization: "Bearer ops-secret" } });
+  assert.equal((await handle(ours, closed, noopCtx())).status, 200);
 });
 
 test("occupancy scales the estimate; queue depth is still not added to it", async () => {
@@ -3367,7 +3419,7 @@ test("occupancy scales the estimate; queue depth is still not added to it", asyn
   const busy = await mockBackend({ stats: statsFor({ slots: 4, free: 1, inFlight: 3, ms: 2000 }) });
   const env = testEnv(hopper.url, { SCAN_URL: busy.url });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?size=1mb"), env, waitCtx().ctx);
     const body = await res.json();
     // 2000 * (1 + 0.75), not 2000 and not 2000 + ceil(3/4)*2000.
     assert.equal(body.routes[0].dispatch[0].est_ms, 3500);
@@ -3389,10 +3441,10 @@ test("a dispatch inside the stats window raises the estimate until the next poll
   const idle = await mockBackend({ stats: statsFor({ slots: 4, free: 4, inFlight: 0, ms: 2000 }) });
   const env = testEnv(hopper.url, { SCAN_URL: idle.url });
   try {
-    const before = await (await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx)).json();
+    const before = await (await handle(withToken("/_/routes?size=1mb"), env, waitCtx().ctx)).json();
     assert.equal(before.routes[0].dispatch[0].est_ms, 2000);
     _test.noteDispatch(idle.url);
-    const after = await (await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx)).json();
+    const after = await (await handle(withToken("/_/routes?size=1mb"), env, waitCtx().ctx)).json();
     // 2000 * (1 + 1/4): one of four slots is ours, whatever the cached stats say.
     assert.equal(after.routes[0].dispatch[0].est_ms, 2500, "the router forgot what it had just sent");
   } finally {
@@ -3517,7 +3569,7 @@ test("an idle worker is scored on its latency alone", async () => {
   const idle = await mockBackend({ stats: statsFor({ slots: 8, free: 8, inFlight: 0, ms: 2000 }) });
   const env = testEnv(hopper.url, { SCAN_URL: idle.url });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?size=1mb"), env, waitCtx().ctx);
     const body = await res.json();
     assert.equal(body.routes[0].dispatch[0].est_ms, 2000, "nothing to penalize on an empty worker");
   } finally {
@@ -3534,7 +3586,7 @@ test("a nearly-full worker loses to a roomier one that is slower on paper", asyn
   const roomy = await mockBackend({ stats: statsFor({ slots: 64, free: 44, inFlight: 20, ms: 14000 }) });
   const env = testEnv(hopper.url, { SCAN_URL: `${tight.url},${roomy.url}` });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?size=1mb"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(route.dispatch[0].worker, hostOf(roomy.url), "sent work to a worker with one slot left");
     // 14000*(1+20/64)=18375 beats 10000*(1+15/16)=19375: the faster worker
@@ -3551,7 +3603,7 @@ test("/_/routes ages stats against a clock read after they are refreshed", async
   const scan = await mockBackend({ stats: statsFor({ ms: 1000 }) });
   const env = testEnv(hopper.url, { SCAN_URL: scan.url });
   try {
-    const res = await handle(new Request("http://beamline/_/routes"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes"), env, waitCtx().ctx);
     const body = await res.json();
     // A freshly polled worker is 0ms old, never -11ms.
     assert.ok(body.workers[0].stats_age_ms >= 0, `negative age: ${body.workers[0].stats_age_ms}`);
@@ -3567,7 +3619,7 @@ test("a worker that answers /_/stats with no history is not evidence", async () 
   const also = await mockBackend({ stats: statsFor({ ms: null }) });
   const env = testEnv(hopper.url, { SCAN_URL: `${cold.url},${also.url}` });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?size=none"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?size=none"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(route.informed, false, "a null average is a default, not knowledge");
   } finally {
@@ -3594,7 +3646,7 @@ test("an unsized estimate compares workers on one shared job mix", async () => {
   });
   const env = testEnv(hopper.url, { SCAN_URL: `${lucky.url},${unlucky.url}` });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?size=none"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?size=none"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     const [a, b] = route.dispatch;
     assert.equal(a.est_ms, b.est_ms, `identical workers scored differently: ${a.est_ms} vs ${b.est_ms}`);
@@ -3614,7 +3666,7 @@ test("a class a worker has never handled falls back to its own average", async (
   });
   const env = testEnv(hopper.url, { SCAN_URL: small.url });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?size=128mb"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?size=128mb"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(route.dispatch[0].est_ms, 9000, "predicted a 128MB job at its small-file speed");
   } finally {
@@ -3634,7 +3686,7 @@ test("one unlucky sample does not brand a worker slow", async () => {
   });
   const env = testEnv(hopper.url, { SCAN_URL: `${thin.url},${settled.url}` });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?type=pypi"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?type=pypi"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     const byWorker = Object.fromEntries(route.dispatch.map((d) => [d.worker, d.est_ms]));
     assert.equal(byWorker[hostOf(thin.url)], 5000, "n=1 was taken as evidence instead of falling back");
@@ -3651,10 +3703,10 @@ test("a class average is used once it has enough completions behind it", async (
   });
   const env = testEnv(hopper.url, { SCAN_URL: w.url });
   try {
-    const golang = await (await handle(new Request("http://beamline/_/routes?type=golang"), env, waitCtx().ctx)).json();
+    const golang = await (await handle(withToken("/_/routes?type=golang"), env, waitCtx().ctx)).json();
     assert.equal(golang.routes[0].dispatch[0].est_ms, 25000, "a well-sampled class average must win");
     // npm has no history at all here, so it falls back to the blended average.
-    const npm = await (await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx)).json();
+    const npm = await (await handle(withToken("/_/routes?type=npm"), env, waitCtx().ctx)).json();
     assert.equal(npm.routes[0].dispatch[0].est_ms, 9000);
   } finally {
     await Promise.all([hopper.close(), w.close()]);
@@ -3670,9 +3722,9 @@ test("an index probe is not predicted from an analysis average", async () => {
   });
   const env = testEnv(hopper.url, { SCAN_URL: w.url });
   try {
-    const lookup = await (await handle(new Request("http://beamline/_/routes?type=lookup"), env, waitCtx().ctx)).json();
+    const lookup = await (await handle(withToken("/_/routes?type=lookup"), env, waitCtx().ctx)).json();
     assert.equal(lookup.routes[0].dispatch[0].est_ms, 1, "900us should read as ~1ms, not the 40s analysis average");
-    const npm = await (await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx)).json();
+    const npm = await (await handle(withToken("/_/routes?type=npm"), env, waitCtx().ctx)).json();
     assert.equal(npm.routes[0].dispatch[0].est_ms, 40000, "the analysis class still uses the analysis average");
   } finally {
     await Promise.all([hopper.close(), w.close()]);
@@ -3687,7 +3739,7 @@ test("a worker that cannot be polled never outranks one that can", async () => {
   const honest = await mockBackend({ stats: statsFor({ ms: 8000 }) });
   const env = testEnv(hopper.url, { SCAN_URL: `${silent.url},${honest.url}` });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?type=npm"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(route.dispatch[0].worker, hostOf(honest.url), "silence outranked measurement");
     assert.equal(route.dispatch[1].worker, hostOf(silent.url));
@@ -3711,7 +3763,7 @@ test("the estimate prefers a worker's windowed p80 over its lifetime mean", asyn
   });
   const env = testEnv(hopper.url, { SCAN_URL: w.url, SCAN_TIMEOUT_MS: "600000" });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?type=npm"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(route.dispatch[0].est_ms, 9000, "the lifetime mean should not win over a live window");
   } finally {
@@ -3732,7 +3784,7 @@ test("a window with too few samples falls back to the mean", async () => {
   });
   const env = testEnv(hopper.url, { SCAN_URL: w.url });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?type=npm"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(route.dispatch[0].est_ms, 4000, "two samples are not a distribution");
   } finally {
@@ -3764,7 +3816,7 @@ test("an empty window is unknown, not slow", async () => {
   });
   const env = testEnv(hopper.url, { SCAN_URL: idle.url });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?type=npm"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(
       route.dispatch[0].est_ms,
@@ -3785,7 +3837,7 @@ test("a worker publishing no window still routes on its mean", async () => {
   });
   const env = testEnv(hopper.url, { SCAN_URL: old.url });
   try {
-    const res = await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx);
+    const res = await handle(withToken("/_/routes?type=npm"), env, waitCtx().ctx);
     const [route] = (await res.json()).routes;
     assert.equal(route.dispatch[0].est_ms, 6000);
     assert.equal(route.informed, true);
@@ -3820,15 +3872,15 @@ test("beamline reads the exact shape scan publishes", async () => {
   });
   const env = testEnv(hopper.url, { SCAN_URL: w.url, SCAN_TIMEOUT_MS: "600000" });
   try {
-    const npm = await (await handle(new Request("http://beamline/_/routes?type=npm"), env, waitCtx().ctx)).json();
+    const npm = await (await handle(withToken("/_/routes?type=npm"), env, waitCtx().ctx)).json();
     assert.equal(npm.routes[0].dispatch[0].est_ms, 7700, "per-type window not read");
 
-    const look = await (await handle(new Request("http://beamline/_/routes?type=lookup"), env, waitCtx().ctx)).json();
+    const look = await (await handle(withToken("/_/routes?type=lookup"), env, waitCtx().ctx)).json();
     assert.equal(look.routes[0].dispatch[0].est_ms, 2, "lookup window not read");
 
     // cargo has no per-type entry, so it falls back to the worker-wide window —
     // not to the 999999ms lifetime mean sitting right beside it.
-    const cargo = await (await handle(new Request("http://beamline/_/routes?type=cargo"), env, waitCtx().ctx)).json();
+    const cargo = await (await handle(withToken("/_/routes?type=cargo"), env, waitCtx().ctx)).json();
     assert.equal(cargo.routes[0].dispatch[0].est_ms, 4200, "worker-wide window not read");
   } finally {
     await Promise.all([hopper.close(), w.close()]);
@@ -4215,7 +4267,7 @@ test("v1: a URL carrying credentials is refused on every route", async () => {
   const env = testEnv(DEAD, { SCAN_URL: DEAD });
   const url = encodeURIComponent("https://user:hunter2@example.com/pkg.tgz");
   for (const [method, path] of [["GET", "/v1/lookup"], ["POST", "/v1/analyze"], ["POST", "/v1/flush"]]) {
-    const res = await handle(new Request(`http://beamline${path}?url=${url}`, { method }), env, waitCtx().ctx);
+    const res = await handle(withToken(`${path}?url=${url}`, { method }), env, waitCtx().ctx);
     assert.equal(res.status, 400, path);
     assert.equal((await res.json()).error.code, "invalid_url", path);
   }
@@ -5286,7 +5338,7 @@ test("flush drops every key an artifact is filed under, and its children", async
   const kvOnly = v1CachePath(null, [{ type: "url", value: URL_ }], "all");
   kv.set(await _test.kvKey(kvOnly), document);
 
-  const res = await handle(new Request(`http://beamline/v1/flush?purl=${encodeURIComponent("pypi/flushme@1.0.0")}`, { method: "POST" }), env, noopCtx());
+  const res = await handle(withToken(`/v1/flush?purl=${encodeURIComponent("pypi/flushme@1.0.0")}`, { method: "POST" }), env, noopCtx());
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.status, "flushed");
@@ -5337,7 +5389,7 @@ test("flush purges every examined key from the zone, and reports a purge that fa
     return answer();
   };
   try {
-    const res = await handle(new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
+    const res = await handle(withToken(`/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(body.caches, {
@@ -5361,7 +5413,7 @@ test("flush purges every examined key from the zone, and reports a purge that fa
 
     // A refusal is the caller's to see, because half a flush is not a flush.
     answer = () => new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }), { status: 403 });
-    const denied = await handle(new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
+    const denied = await handle(withToken(`/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
     assert.equal(denied.status, 502);
     assert.equal((await denied.json()).error.code, "purge_failed");
 
@@ -5369,7 +5421,7 @@ test("flush purges every examined key from the zone, and reports a purge that fa
     answer = () => {
       throw new TypeError("fetch failed");
     };
-    const dark = await handle(new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
+    const dark = await handle(withToken(`/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
     assert.equal(dark.status, 502);
   } finally {
     globalThis.fetch = realFetch;
@@ -5379,7 +5431,7 @@ test("flush purges every examined key from the zone, and reports a purge that fa
 test("flush validates its locator and refuses a GET", async () => {
   const env = testEnv(DEAD, { cache: _test.memoryCache() });
   const flush = (query, method = "POST") =>
-    handle(new Request(`http://beamline/v1/flush${query}`, { method }), env, noopCtx());
+    handle(withToken(`/v1/flush${query}`, { method }), env, noopCtx());
 
   assert.equal((await flush("", "GET")).status, 405);
   assert.equal((await flush("")).status, 400);
@@ -5555,7 +5607,7 @@ test("a zone purge that hits a transient 5xx is retried, not reported failed", a
       : new Response(JSON.stringify({ success: true, errors: [], result: {} }), { status: 200 });
   };
   try {
-    const res = await handle(new Request(`http://beamline/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
+    const res = await handle(withToken(`/v1/flush?sha256=${SHA}`, { method: "POST" }), env, noopCtx());
     assert.equal(res.status, 200);
     assert.equal((await res.json()).caches.zone.purge, "ok");
     assert.equal(calls, 2, "the 503 was retried once and the retry went through");
@@ -5616,7 +5668,7 @@ test("concurrent requests on a cold isolate share one stats poll per worker", as
   const scan = await mockBackend({ stats: statsFor() });
   const env = testEnv(DEAD, { SCAN_URL: scan.url });
   try {
-    await Promise.all([1, 2, 3].map(() => handle(new Request("http://beamline/_/routes?size=1mb"), env, waitCtx().ctx)));
+    await Promise.all([1, 2, 3].map(() => handle(withToken("/_/routes?size=1mb"), env, waitCtx().ctx)));
     assert.equal(scan.hits.stats, 1);
   } finally {
     await scan.close();

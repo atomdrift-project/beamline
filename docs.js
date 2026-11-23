@@ -153,7 +153,7 @@ function docsHtml(authRequired) {
         <table class="endpoint-table" aria-label="Endpoint summary"><thead><tr><th>Method</th><th>Route</th><th>Use it for</th></tr></thead><tbody>
           <tr><td>GET</td><td>/v1/lookup</td><td>Ask whether an artifact is already known.</td></tr>
           <tr><td>POST</td><td>/v1/analyze</td><td>Analyze a PURL, exact URL, or uploaded bytes.</td></tr>
-          <tr><td>POST</td><td>/v1/flush</td><td>Forget every cached answer for an artifact.</td></tr>
+          <tr><td>POST</td><td>/v1/flush</td><td>Forget every cached answer for an artifact. Token required.</td></tr>
         </tbody></table>
         ${authRequired ? '<div class="note"><strong>Authentication is required.</strong> Send your key as <code>Authorization: Bearer …</code>.</div>' : ""}
       </section>
@@ -224,9 +224,11 @@ function docsHtml(authRequired) {
 
       <section id="flush"><h2><a class="heading-link" href="#flush">Flush <span class="new-label">New</span></a></h2>
         <p><code>POST /v1/flush</code> drops every cached answer for one artifact. Name it with <code>?purl=</code>, <code>?url=</code>, or <code>?sha256=</code> — whichever you have. Nothing is re-analyzed; the next lookup or analyze starts from scratch.</p>
+        <p>Flush needs a bearer token even where the rest of the API is open: without one it is a <code>401</code>.</p>
         <div class="route-example"><code>POST /v1/flush?purl=…</code></div>
-        <div class="runner" data-runner data-method="POST" data-path="/v1/flush?purl=pkg%3Anpm%2Faxios%401.19.0">
+        <div class="runner">
           <pre><code>curl -X POST \
+  -H "Authorization: Bearer $TOKEN" \
   "https://api.atomdrift.org/v1/flush?purl=pkg%3Anpm%2Faxios%401.19.0"</code></pre></div>
         <p>An artifact is filed under more than one key: one per <a href="#follow">follow policy</a>, one per response shape, and one per name that reaches it. A flush clears all of them, then follows the answers it found to the artifact's other names — its digest, its download URL, the PURL Scan normalized it to — and clears those too. The response reports what it reached.</p>
         <p>Flushing something that was never cached is not an error. It returns <code>200</code> with <code>keys_dropped: 0</code>.</p>

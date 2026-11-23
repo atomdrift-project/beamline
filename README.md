@@ -121,7 +121,10 @@ answer within a second, the request is served and `quota_unavailable` logged.
 require a bearer token, or omit it to leave the API open. It is separate from
 customer tokens, which are always honoured: turning on customer tokens does not
 close an open API, and a deployment that sets `BEAMLINE_TOKEN` is still closed
-to everyone who is not a customer. `HOPPER_TOKEN` and
+to everyone who is not a customer. Operational requests — `/v1/flush`, `/_/routes`,
+and anything carrying `X-Beamline-Pin` — need a recognized token either way, so
+an open API is open for lookups and analyses, not for dropping caches, reading
+the fleet, or spending a scan slot on demand. `HOPPER_TOKEN` and
 `SCAN_TOKEN` are backend credentials; those may still come from the first
 non-empty line of `~/.tok/<service>`. The deploy recipe uploads backend
 credentials only, so a local token file cannot accidentally turn on client

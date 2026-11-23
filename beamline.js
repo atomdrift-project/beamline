@@ -763,8 +763,8 @@ async function dispatch(request, env, host, caller) {
     // X-Beamline-Pin: <host> forces dispatch to one worker and bypasses the
     // cache, so an experiment can time a specific backend on a specific sample.
     // It only restricts a choice beamline was already free to make, but it does
-    // spend a scan slot on demand — so it lives behind the token gate with
-    // everything else, and is bounded like any other caller-supplied header.
+    // spend a scan slot on demand — so it is operational, needs a token even on
+    // an open deployment, and is bounded like any other caller-supplied header.
     pin: cleanId(request.headers.get("x-beamline-pin")) || null,
     // eslint-disable-next-line no-control-regex
     filename: filename && filename.length <= 255 && !/[\x00-\x1f\x7f]/.test(filename) ? filename : null,
@@ -803,7 +803,15 @@ async function dispatch(request, env, host, caller) {
   // asked for a gate at all. So turning on customer tokens does not close an
   // open API, and a deployment that sets BEAMLINE_TOKEN is still closed to
   // everyone who is not a customer.
-  if (!caller?.known && tokenList(env.BEAMLINE_TOKEN).length) {
+  //
+  // Operational requests are gated even on an open API. A flush drops verdicts
+  // in every data center and spends a zone purge, /_/routes names every worker
+  // and the corpus behind it, and a pin spends a scan slot on demand — none of
+  // that is for a caller nobody can name. Refused before the quota, so a flood
+  // of them costs a header check and not a Durable Object round trip.
+  const operational = url.pathname === "/v1/flush" || url.pathname === "/_/routes" || ctx.pin !== null;
+  if (!caller?.known && (operational || tokenList(env.BEAMLINE_TOKEN).length)) {
+    logLine("unauthorized", { rid, path: url.pathname, operational, token: Boolean(caller?.token) });
     return v1Error(401, "unauthorized", "Send your API key as `Authorization: Bearer <key>`.");
   }
 
@@ -4834,8 +4842,8 @@ async function rankWorkers(env, ctx, workers, ids, hint) {
 // being fast at small packages and slow at large ones — the case a single
 // average hides and the reason routing is size-aware at all.
 //
-// Behind the token gate with everything else: this names every worker and its
-// current load.
+// Needs a token even on an open deployment: this names every worker and its
+// current load. See dispatch.
 /**
  * @param {Record<string, unknown>} env
  * @param {Ctx} ctx

@@ -44,8 +44,10 @@ const TUNABLES = [
 const env = Object.fromEntries(TUNABLES.map((name) => [name, process.env[name] || ""]));
 
 // The client token is deliberately environment-only: if BEAMLINE_TOKEN is not
-// passed, the API is open. SCAN_TOKEN still falls back to ~/.tok because it is
-// a backend credential, not a policy switch for callers.
+// passed, the API is open. With no TOKENS_KV here it is also the only token a
+// local run recognizes, so /v1/flush, /_/routes and X-Beamline-Pin answer no
+// one without it. SCAN_TOKEN still falls back to ~/.tok because it is a
+// backend credential, not a policy switch for callers.
 env.SCAN_TOKEN ||= readToken("scan");
 
 // Workaround, not design. On Node 26 fetch does not dispatch a second
