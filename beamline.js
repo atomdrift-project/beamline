@@ -446,7 +446,7 @@ async function fingerprint(token) {
 const QUOTA_DAY_MS = 86_400_000;
 const QUOTA_WAIT_MS = 1_000;
 const QUOTA_DASH = "https://dash.isotope13.io/";
-const QUOTA_SUPPORT = "support@isotope13.ai";
+const QUOTA_SUPPORT = "support@isotope13.io";
 // Half of Community, so a free token is always worth getting. Public uploads
 // are 5 a day without a token, on paper only: nothing counts uploads yet.
 const ANONYMOUS_QUOTA = 512;

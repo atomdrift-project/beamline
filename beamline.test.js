@@ -118,7 +118,7 @@ test("GET / serves the public API documentation", async () => {
   assert.match(body, /Transparent proxy integration/);
   assert.match(body, /<code>\?follow=references<\/code>/);
   assert.match(body, /downloads malware later/);
-  assert.match(body, /mailto:support@isotope13\.ai/);
+  assert.match(body, /mailto:support@isotope13\.io/);
   // Bump this when a badge is added or retired — it is here so a stale "New"
   // on a two-year-old section gets noticed.
   assert.equal((body.match(/class="new-label"/g) || []).length, 4);
@@ -5764,7 +5764,7 @@ test("quota: each tier is counted per org at its own limit, and told how to upgr
     assert.equal(
       error.message,
       tier === "oem"
-        ? "critical-tier quota exceeded, contact support@isotope13.ai"
+        ? "critical-tier quota exceeded, contact support@isotope13.io"
         : `${want.name}-tier quota exceeded, visit https://dash.isotope13.io/ to upgrade`,
     );
     const retry = Number(res.headers.get("retry-after"));

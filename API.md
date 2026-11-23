@@ -51,7 +51,7 @@ are not counted, and neither is a refused request.
 Past it, every request is a `429` with code `quota_exceeded` and a
 `Retry-After` naming the seconds until UTC midnight. Get a token, or a larger
 quota, at https://dash.isotope13.io/; past Critical, write to
-support@isotope13.ai.
+support@isotope13.io.
 
 ## Keys
 
