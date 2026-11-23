@@ -6,7 +6,7 @@
 // runs this against it.
 //
 //   POSTDOC_URL           a running `postdoc serve` started without --hopper
-//   POSTDOC_TOKEN         its bearer token, if it has one
+//   POSTDOC_TOKEN         its bearer token (postdoc always requires one)
 //   E2E_SLOW_ARTIFACT     a file slow enough to analyze that postdoc streams
 //                         progress before answering (checks the streamed
 //                         full result); skipped when unset

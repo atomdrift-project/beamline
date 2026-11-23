@@ -3664,7 +3664,7 @@ async function runningWorker(env, ctx, input, ids) {
   if (input.sha) keys.push(`sha256=${input.sha}`);
   if (input.type && input.value) keys.push(`${input.type}=${encodeURIComponent(input.value)}`);
   if (!workers.length || !keys.length) return null;
-  const path = `/status?${keys.join("&")}`;
+  const path = `/v1/status?${keys.join("&")}`;
   const asked = await Promise.all(workers.map((base) => statusAsk(env, ctx, path, base)));
   const busy = asked.find((answer) => answer?.state === "running");
   if (busy) {
@@ -3818,7 +3818,7 @@ function occupancy(stats, pending = 0) {
 // `occupancy`); at 1 every core already has a runnable thread that will not
 // yield, and a new analysis can only wait.
 //
-// `physical_cpus` rather than the logical count `/_/info` reports: slots are
+// `physical_cpus` rather than the logical core count: slots are
 // sized on physical cores, and using logical would halve the apparent pressure
 // on any host with SMT — which is every host where this matters most. A worker
 // too old to report it contributes no host term rather than a guess.

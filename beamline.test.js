@@ -3150,7 +3150,7 @@ async function mockBackend(opts) {
         if (out.status && out.status !== 200) return send(res, out.status, { error: { code: "boom" } });
         return send(res, 200, out, opts.v1Headers || {});
       }
-      if (url.pathname === "/status") {
+      if (url.pathname === "/v1/status") {
         hits.status += 1;
         const out = typeof opts.status === "function" ? opts.status(url) : opts.status;
         return send(res, 200, out || { state: "unknown" });

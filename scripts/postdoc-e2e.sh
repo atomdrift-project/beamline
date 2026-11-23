@@ -17,14 +17,18 @@ set -eu
 bin=${POSTDOC_BIN:-postdoc}
 port=${POSTDOC_PORT:-49989}
 log=$(mktemp)
+# postdoc has no unauthenticated mode: give it a throwaway token.
+tokfile=$(mktemp)
+token=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
+printf '%s\n' "$token" >"$tokfile"
 
 # Not SCAN_NO_ANALYSIS_CACHE: it also turns off the verdict index.
 # shellcheck disable=SC2086 # POSTDOC_ARGS is a flag list, split on purpose
 env -u SCAN_HOPPER CLEAVE_SKIP_CACHE=1 CLEAVE_SKIP_YARA_CACHE=0 \
   POSTDOC_SCANNERS="${POSTDOC_SCANNERS:-none}" \
-  "$bin" --no-update ${POSTDOC_ARGS:-} serve --bind "127.0.0.1:$port" >"$log" 2>&1 &
+  "$bin" --no-update ${POSTDOC_ARGS:-} serve --bind "127.0.0.1:$port" --token-file "$tokfile" >"$log" 2>&1 &
 pid=$!
-trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f "$log"' EXIT INT TERM
+trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; rm -f "$log" "$tokfile"' EXIT INT TERM
 
 # 503 until the model and rules have loaded.
 i=0
@@ -43,4 +47,4 @@ until curl -fsS "http://127.0.0.1:$port/_/health" >/dev/null 2>&1; do
   sleep 1
 done
 
-POSTDOC_URL="http://127.0.0.1:$port" node --test scripts/postdoc-e2e.test.mjs
+POSTDOC_URL="http://127.0.0.1:$port" POSTDOC_TOKEN="$token" node --test scripts/postdoc-e2e.test.mjs
