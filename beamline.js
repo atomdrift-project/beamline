@@ -148,6 +148,7 @@ const scanBreakers = new Map();
  * @property {Org|null} org
  * @property {string|null} pin - X-Beamline-Pin: force one worker
  * @property {string|null} filename
+ * @property {string|null} origin - Atomdrift-Origin: who the request is on behalf of
  * @property {boolean} refresh
  * @property {(promise: Promise<unknown>) => void} [waitUntil]
  * @property {AbortSignal} [signal]
@@ -770,6 +771,7 @@ async function dispatch(request, env, host, caller) {
     pin: cleanId(request.headers.get("x-beamline-pin")) || null,
     // eslint-disable-next-line no-control-regex
     filename: filename && filename.length <= 255 && !/[\x00-\x1f\x7f]/.test(filename) ? filename : null,
+    origin: originOf(request.headers.get("atomdrift-origin"), request.headers.get("user-agent")),
     // A refresh is a cache-read policy, not part of an artifact's identity. It
     // therefore bypasses Beamline's Cache API/KV reads while retaining the
     // ordinary canonical key for the result Scan returns and we write back.
@@ -2580,6 +2582,7 @@ async function handleV1Analyze(request, env, ctx, url) {
     rid: ctx.rid,
     ...v1LocatorIds(ctx.rid, null, locator ? [locator] : []),
     bytes: bytes ? bytes.byteLength : undefined,
+    origin: ctx.origin || undefined,
     follow: follow.value,
     full: full || undefined,
   };
@@ -4967,10 +4970,46 @@ function backoff(base, attempt, cap) {
  */
 function scanHeaders(env, ctx) {
   const token = (env.SCAN_TOKEN || "").trim();
-  const headers = { "x-request-id": ctx.rid };
+  const headers = { "x-request-id": ctx.rid, "user-agent": USER_AGENT };
   if (token) headers.authorization = `Bearer ${token}`;
   if (ctx.filename) headers["x-filename"] = ctx.filename;
+  if (ctx.origin) headers["atomdrift-origin"] = ctx.origin;
   return headers;
+}
+
+// How beamline names itself to a scan worker. A worker that receives no
+// Atomdrift-Origin takes one from this, so an analysis nobody can be named
+// for is still filed in hopper as beamline's rather than as the worker's own.
+const USER_AGENT = "beamline/1";
+
+// Who a request is on behalf of: the Atomdrift-Origin a scan worker sends with
+// every artifact the analysis files in hopper, which records the upload as
+// `upload:<origin>`. A caller that names one — another relay, or a client
+// saying so outright — is believed, sanitized; otherwise it is the product
+// token of the caller's User-Agent, and every browser is the website. Null
+// when neither names anything, and then nothing is forwarded.
+//
+// Mirrors scan's `upload::Origin::from_request`, which the worker applies
+// again on receipt: the two must agree, or a name would change on the hop.
+/**
+ * @param {string|null} header - the caller's Atomdrift-Origin
+ * @param {string|null} userAgent - the caller's User-Agent
+ * @returns {string|null} 1-32 characters of [a-z0-9-], or null
+ */
+function originOf(header, userAgent) {
+  const named = cleanOrigin(header);
+  if (named) return named;
+  const ua = String(userAgent || "").trim();
+  if (/^mozilla\//i.test(ua)) return "website";
+  return cleanOrigin(ua.split(/[\s/]/, 1)[0]);
+}
+
+/**
+ * @param {string|null|undefined} raw
+ * @returns {string|null}
+ */
+function cleanOrigin(raw) {
+  return String(raw || "").replace(/[^A-Za-z0-9-]/g, "").toLowerCase().slice(0, 32) || null;
 }
 
 // One coordinate, one spelling.
@@ -5494,6 +5533,7 @@ export const _test = {
   cleanPurl,
   v1CacheAliasPaths,
   numEnv,
+  originOf,
   reset() {
     scanBreakers.clear();
     getCache.memory = null;

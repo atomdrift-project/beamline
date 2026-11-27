@@ -536,6 +536,7 @@ There is no `503` for a package we could not reach a worker for. That is a
 | header | |
 | --- | --- |
 | `X-Request-Id` | Send your own to correlate with our logs. |
+| `Atomdrift-Origin` | Request. Who an analysis is on behalf of: a short name, `[a-z0-9-]`, at most 32 characters. Recorded with every artifact the analysis files in the corpus. Optional: without it, the product token of your `User-Agent` is used, and a browser is `website`. |
 | `X-Beamline-Source` | `cache`, `kv`, `scan:index`, `scan:cached`, `scan:bloom`, `scan:replica`, `scan:primary`, `scan:analysis`, `none`. Operators only. |
 | `X-Cache-Layer` | How deep the answer came from, `0`–`6`. Absent when nothing answered. Operators only. |
 | `X-Beamline-Worker` | Which worker answered; a batch split across the fleet lists each, comma-separated. For operators. |

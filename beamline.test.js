@@ -553,6 +553,72 @@ test("v1 analyze: follow is normalized and forwarded", async () => {
   }
 });
 
+test("origin: a caller is named by Atomdrift-Origin, else by its User-Agent", () => {
+  const { originOf } = _test;
+  // The product token, lowercased: everything before the version or a comment.
+  assert.equal(originOf(null, "poppy/1 (+https://github.com/atomdrift-project/poppy)"), "poppy");
+  assert.equal(originOf(null, "Poppy/0.3.1"), "poppy");
+  assert.equal(originOf(null, "postdoc"), "postdoc");
+  assert.equal(originOf(null, "atomdrift-scan/3.1.0"), "atomdrift-scan");
+  assert.equal(originOf(null, "my-tool (+https://example.test)"), "my-tool");
+  // Every browser is the website, whatever it goes on to claim.
+  assert.equal(originOf(null, "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15"), "website");
+  // A relay's header is believed over the UA of whoever sent it.
+  assert.equal(originOf("poppy", "beamline/1"), "poppy");
+  assert.equal(originOf("Website", "Mozilla/5.0"), "website");
+  // Sanitized to [a-z0-9-] and bounded, never refused outright.
+  assert.equal(originOf("Po_ppy!\u00e9", null), "poppy");
+  assert.equal(originOf("a".repeat(40), null), "a".repeat(32));
+  assert.equal(originOf(null, `${"b".repeat(40)}/1`), "b".repeat(32));
+  // A header with nothing usable in it is no header.
+  assert.equal(originOf("!!!", "curl/8.4.0"), "curl");
+  // Neither names anything: nothing to forward.
+  assert.equal(originOf(null, null), null);
+  assert.equal(originOf("", ""), null);
+  assert.equal(originOf("  ", "/1.0"), null);
+  assert.equal(originOf(null, "___/1"), null);
+});
+
+test("v1 analyze: the caller's origin reaches scan", async () => {
+  const scan = await mockBackend({
+    analyzeStream: ['{"decision":"allow","fires_at":-1,"purl":"pkg:npm/app@1.0.0"}'],
+  });
+  const env = testEnv(DEAD, { SCAN_URL: scan.url });
+  // A fresh version each time, so no answer cached by the last one stands in
+  // for the worker.
+  let version = 0;
+  const analyze = async (headers) => {
+    version += 1;
+    const res = await handle(
+      new Request(`http://beamline/v1/analyze?purl=pkg%3Anpm%2Fapp%40${version}.0.0`, { method: "POST", headers }),
+      env,
+      waitCtx().ctx,
+    );
+    assert.equal(res.status, 200);
+    await res.text();
+    const sent = scan.auths.filter((a) => a.path === "/v1/analyze");
+    assert.equal(sent.length, version, "every analysis reached the worker");
+    return sent.pop();
+  };
+  try {
+    // Derived from the caller's User-Agent.
+    let sent = await analyze({ "user-agent": "poppy/1 (+https://github.com/atomdrift-project/poppy)" });
+    assert.equal(sent.origin, "poppy");
+    sent = await analyze({ "user-agent": "Mozilla/5.0 (X11; Linux x86_64)" });
+    assert.equal(sent.origin, "website");
+    // Passed through, sanitized, ahead of the User-Agent.
+    sent = await analyze({ "atomdrift-origin": "Dash", "user-agent": "Mozilla/5.0" });
+    assert.equal(sent.origin, "dash");
+    // Nobody to name: no header, and beamline names itself as the agent so the
+    // worker files the upload as beamline's.
+    sent = await analyze({ "user-agent": "" });
+    assert.equal(sent.origin, null);
+    assert.equal(sent.ua, "beamline/1");
+  } finally {
+    await scan.close();
+  }
+});
+
 // A version 8 body, as scan's `full=1` sends it: the header, the artifact's
 // line, one member's, and the artifact's report line.
 const FULL_RESULT = [
@@ -3113,6 +3179,8 @@ async function mockBackend(opts) {
         path: url.pathname,
         authorization: req.headers.authorization || "",
         rid: req.headers["x-request-id"] || "",
+        origin: req.headers["atomdrift-origin"] ?? null,
+        ua: req.headers["user-agent"] || "",
       });
       const body = await readReq(req);
       if (opts.route) {
