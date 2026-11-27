@@ -455,8 +455,9 @@ const ANONYMOUS_QUOTA = 512;
 // outlive the names — `business` is Basic, `oem` is Critical — because
 // renaming one would rewrite every `tok:` row. `poc` is the exception: it is
 // not sold, only hand-written legacy rows carry it, and it keeps Basic's quota
-// as it always kept Business's. A tier beamline does not know is held to the
-// floor rather than refused.
+// as it always kept Business's. `internal` is the Atomdrift Project's own
+// tools: never sold, granted by team id in dash. A tier beamline does not know
+// is held to the floor rather than refused.
 const TIER_QUOTAS = {
   free: { name: "community", limit: 1_024 },
   supporter: { name: "supporter", limit: 2_048 },
@@ -465,6 +466,7 @@ const TIER_QUOTAS = {
   poc: { name: "poc", limit: 20_000 },
   enhanced: { name: "enhanced", limit: 100_000 },
   oem: { name: "critical", limit: 1_000_000 },
+  internal: { name: "internal", limit: 1_000_000 },
 };
 
 /**
@@ -485,9 +487,9 @@ async function enforceQuota(request, env, caller, rid) {
     subject = `org:${caller.org.oid}`;
     limit = tier.limit;
     label = tier.name;
-    // There is no tier above critical to send anyone to.
+    // There is no tier above critical, or internal, to send anyone to.
     message =
-      tier === TIER_QUOTAS.oem
+      tier === TIER_QUOTAS.oem || tier === TIER_QUOTAS.internal
         ? `${tier.name}-tier quota exceeded, contact ${QUOTA_SUPPORT}`
         : `${tier.name}-tier quota exceeded, visit ${QUOTA_DASH} to upgrade`;
   } else {

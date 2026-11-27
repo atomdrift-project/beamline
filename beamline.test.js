@@ -5815,8 +5815,8 @@ test("quota: each tier is counted per org at its own limit, and told how to upgr
     assert.equal(error.code, "quota_exceeded");
     assert.equal(
       error.message,
-      tier === "oem"
-        ? "critical-tier quota exceeded, contact support@isotope13.io"
+      tier === "oem" || tier === "internal"
+        ? `${want.name}-tier quota exceeded, contact support@isotope13.io`
         : `${want.name}-tier quota exceeded, visit https://dash.isotope13.io/ to upgrade`,
     );
     const retry = Number(res.headers.get("retry-after"));
@@ -5824,7 +5824,16 @@ test("quota: each tier is counted per org at its own limit, and told how to upgr
   }
   assert.deepEqual(
     Object.fromEntries(Object.entries(_test.TIER_QUOTAS).map(([k, v]) => [k, v.limit])),
-    { free: 1_024, supporter: 2_048, superfan: 4_096, business: 20_000, poc: 20_000, enhanced: 100_000, oem: 1_000_000 },
+    {
+      free: 1_024,
+      supporter: 2_048,
+      superfan: 4_096,
+      business: 20_000,
+      poc: 20_000,
+      enhanced: 100_000,
+      oem: 1_000_000,
+      internal: 1_000_000,
+    },
   );
 });
 

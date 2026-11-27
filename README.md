@@ -111,8 +111,9 @@ The tier is also the daily quota, counted per UTC day by the `Quota` Durable
 Object bound as `QUOTA` in `wrangler.toml`: 512 requests without a token,
 then 1,024 / 2,048 / 4,096 / 20,000 / 100,000 / 1,000,000 for free
 (Community), supporter, superfan, business (Basic), enhanced and oem
-(Critical), and 20,000 for `poc`, which dash does not sell and only
-hand-written legacy tokens carry.
+(Critical), 20,000 for `poc`, which dash does not sell and only
+hand-written legacy tokens carry, and 1,000,000 for `internal`, which dash
+grants by team id to the Atomdrift Project's own tools.
 Customers are counted per org, everyone else per address, and our own
 `BEAMLINE_TOKEN` not at all. The limiter fails open: if the object cannot
 answer within a second, the request is served and `quota_unavailable` logged.
