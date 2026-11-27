@@ -450,7 +450,7 @@ const QUOTA_DASH = "https://dash.isotope13.io/";
 const QUOTA_SUPPORT = "support@isotope13.io";
 // Half of Community, so a free token is always worth getting. Public uploads
 // are 5 a day without a token, on paper only: nothing counts uploads yet.
-const ANONYMOUS_QUOTA = 512;
+const ANONYMOUS_QUOTA = 1_024;
 // Keyed by the tier dash writes into `tok:`, named as dash shows it, and the
 // same numbers dash draws usage against: change one, change both. The keys
 // outlive the names — `business` is Basic, `oem` is Critical — because
@@ -460,9 +460,9 @@ const ANONYMOUS_QUOTA = 512;
 // tools: never sold, granted by team id in dash. A tier beamline does not know
 // is held to the floor rather than refused.
 const TIER_QUOTAS = {
-  free: { name: "community", limit: 1_024 },
-  supporter: { name: "supporter", limit: 2_048 },
-  superfan: { name: "superfan", limit: 4_096 },
+  free: { name: "community", limit: 2_048 },
+  supporter: { name: "supporter", limit: 4_096 },
+  superfan: { name: "superfan", limit: 8_192 },
   business: { name: "basic", limit: 20_000 },
   poc: { name: "poc", limit: 20_000 },
   enhanced: { name: "enhanced", limit: 100_000 },

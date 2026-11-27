@@ -46,10 +46,10 @@ are not counted, and neither is a refused request.
 
 | caller | requests per day |
 | --- | --- |
-| No token | 512 |
-| Community | 1,024 |
-| Supporter | 2,048 |
-| Superfan | 4,096 |
+| No token | 1,024 |
+| Community | 2,048 |
+| Supporter | 4,096 |
+| Superfan | 8,192 |
 | Basic | 20,000 |
 | POC | 20,000 |
 | Enhanced | 100,000 |

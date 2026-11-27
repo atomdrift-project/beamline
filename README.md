@@ -108,8 +108,8 @@ latency: a token deleted in the dashboard keeps working in whichever colos
 already hold it, for up to a minute.
 
 The tier is also the daily quota, counted per UTC day by the `Quota` Durable
-Object bound as `QUOTA` in `wrangler.toml`: 512 requests without a token,
-then 1,024 / 2,048 / 4,096 / 20,000 / 100,000 / 1,000,000 for free
+Object bound as `QUOTA` in `wrangler.toml`: 1,024 requests without a token,
+then 2,048 / 4,096 / 8,192 / 20,000 / 100,000 / 1,000,000 for free
 (Community), supporter, superfan, business (Basic), enhanced and oem
 (Critical), 20,000 for `poc`, which dash does not sell and only
 hand-written legacy tokens carry, and 1,000,000 for `internal`, which dash

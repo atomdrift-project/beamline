@@ -5893,9 +5893,9 @@ test("quota: each tier is counted per org at its own limit, and told how to upgr
   assert.deepEqual(
     Object.fromEntries(Object.entries(_test.TIER_QUOTAS).map(([k, v]) => [k, v.limit])),
     {
-      free: 1_024,
-      supporter: 2_048,
-      superfan: 4_096,
+      free: 2_048,
+      supporter: 4_096,
+      superfan: 8_192,
       business: 20_000,
       poc: 20_000,
       enhanced: 100_000,
@@ -5911,7 +5911,7 @@ test("quota: anonymous callers are counted by address and told to get a token", 
   const res = await handle(quotaRequest({ "cf-connecting-ip": "2001:db8:1:2::7" }), env, {});
   assert.equal(res.status, 429);
   assert.deepEqual(QUOTA.asked, [{ name: "ip:2001:db8:1:2::/64", limit: _test.ANONYMOUS_QUOTA }]);
-  assert.equal(_test.ANONYMOUS_QUOTA, 512);
+  assert.equal(_test.ANONYMOUS_QUOTA, 1_024);
   assert.equal(
     (await res.json()).error.message,
     "anonymous quota exceeded, visit https://dash.isotope13.io/ for a token",
